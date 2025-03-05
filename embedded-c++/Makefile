@@ -20,7 +20,7 @@ prepare-build:
 
 bm_performance: clean prepare-build
 	cd build && cmake .. && make
-	build/improved_deletions --benchmark_out=bm_vss_deletion_time_hmm.json --benchmark_out_format=json
+	build/benchmark_deletions --benchmark_out=bm_vss_deletion_time_hmm.json --benchmark_out_format=json
 
 	
 #build/benchmark_search --benchmark_out=bm_vss_search_time_hmm.json --benchmark_out_format=json
