@@ -17,15 +17,12 @@ else()
 endif()
 
 add_executable(example main.cpp)
-#add_executable(benchmark_search benchmark_search.cpp)
-#add_executable(benchmark_deletions benchmark_deletions.cpp)
-add_executable(improved_deletions improved_deletions.cpp)
+add_executable(benchmark_deletions benchmark_deletions.cpp)
+
 
 add_executable(results get_results.cpp)
 
 # Linking libraries
 target_link_libraries(example duckdb)
-#target_link_libraries(benchmark_search duckdb ${BENCHMARK_LIB})
-#target_link_libraries(benchmark_deletions duckdb ${BENCHMARK_LIB})
-target_link_libraries(improved_deletions duckdb ${BENCHMARK_LIB})
+target_link_libraries(benchmark_deletions duckdb ${BENCHMARK_LIB})
 target_link_libraries(results duckdb ${BENCHMARK_LIB})
