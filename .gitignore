@@ -8,3 +8,6 @@ test/python/__pycache__/
 .Rhistory
 raw.db
 results.db
+python/data/raw/*.hdf5
+.editorconfig
+.vscode
