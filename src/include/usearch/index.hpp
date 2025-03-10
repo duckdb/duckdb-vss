@@ -83,6 +83,8 @@
 #include <stdexcept> // `std::runtime_exception`
 #include <thread>    // `std::thread`
 #include <utility>   // `std::pair`
+#include <iostream>
+#include <fstream>
 
 // Prefetching
 #if defined(USEARCH_DEFINED_GCC)
@@ -989,6 +991,7 @@ class ring_gt {
     std::size_t head_{};
     std::size_t tail_{};
     bool empty_{true};
+    bool full_{false};  // Add a flag to track when the buffer is full
     allocator_t allocator_{};
 
   public:
@@ -1015,13 +1018,17 @@ class ring_gt {
     ~ring_gt() noexcept { reset(); }
 
     bool empty() const noexcept { return empty_; }
+    bool full() const noexcept { return full_; }
     size_t capacity() const noexcept { return capacity_; }
     size_t size() const noexcept {
         if (empty_)
             return 0;
+        else if (full_)
+            return capacity_;
         else if (head_ >= tail_)
             return head_ - tail_;
         else
+            // return capacity_ - (tail_ - head_) + head_;
             return capacity_ - (tail_ - head_);
     }
 
@@ -1029,6 +1036,7 @@ class ring_gt {
         head_ = 0;
         tail_ = 0;
         empty_ = true;
+        full_ = false;
     }
 
     void reset() noexcept {
@@ -1039,6 +1047,7 @@ class ring_gt {
         head_ = 0;
         tail_ = 0;
         empty_ = true;
+        full_ = false;
     }
 
     bool reserve(std::size_t n) noexcept {
@@ -1046,21 +1055,49 @@ class ring_gt {
             return false; // prevent data loss
         if (n <= capacity())
             return true;
+        
         n = (std::max<std::size_t>)(ceil2(n), 64u);
         element_t* elements = allocator_.allocate(n);
         if (!elements)
             return false;
-
+        
+        // Improved transfer logic that works even when the buffer is full
         std::size_t i = 0;
-        while (try_pop(elements[i]))
-            i++;
-
-        reset();
+        std::size_t current_size = size();
+        
+        // Get the current position
+        std::size_t current_head = head_;
+        std::size_t current_tail = tail_;
+        bool was_full = full_;
+        
+        // Copy elements directly based on position logic
+        if (was_full || current_head > current_tail) {
+            // When the buffer has wrapped around or is full
+            for (std::size_t pos = current_tail; pos < capacity_; ++pos) {
+                elements[i++] = elements_[pos];
+            }
+            for (std::size_t pos = 0; pos < current_head; ++pos) {
+                elements[i++] = elements_[pos]; 
+            }
+        } else {
+            // Simple case - elements are in sequence
+            for (std::size_t pos = current_tail; pos < current_head; ++pos) {
+                elements[i++] = elements_[pos];
+            }
+        }
+        
+        // Clean up old allocation if it exists
+        if (elements_)
+            allocator_.deallocate(elements_, capacity_);
+        
+        // Update internal state
         elements_ = elements;
         capacity_ = n;
-        head_ = i;
-        tail_ = 0;
-        empty_ = (i == 0);
+        head_ = current_size; // New head position is after all copied elements
+        tail_ = 0;  // New tail starts at beginning
+        empty_ = (current_size == 0);
+        full_ = false; // Cannot be full after resize
+        
         return true;
     }
 
@@ -1068,13 +1105,17 @@ class ring_gt {
         elements_[head_] = value;
         head_ = (head_ + 1) % capacity_;
         empty_ = false;
+        // If tail ahead of head by 1, then the buffer is full
+        if (head_ == tail_){
+            full_ = true;
+        }
     }
 
     bool try_push(element_t const& value) noexcept {
         if (head_ == tail_ && !empty_)
             return false; // elements_ is full
 
-        return push(value);
+        push(value);
         return true;
     }
 
@@ -1084,7 +1125,9 @@ class ring_gt {
 
         value = std::move(elements_[tail_]);
         tail_ = (tail_ + 1) % capacity_;
-        empty_ = head_ == tail_;
+        full_ = false;  // After popping, we're definitely not full
+        empty_ = head_ == tail_ && !full_;
+        // empty_ = head_ == tail_;
         return true;
     }
 
@@ -3143,6 +3186,108 @@ class index_gt {
 
         // At the end report the latest numbers, because the reporter thread may be finished earlier
         progress(processed.load(), nodes_count);
+    }
+
+    /**
+     *  @brief  Logs unreachable and isolated nodes.
+     *
+     *  @param[in] executor Thread-pool to execute the job in parallel.
+     *  @param[in] progress Callback to report the execution progress.
+     */
+    template <                                        //
+    typename executor_at = dummy_executor_t,      //
+    typename progress_at = dummy_progress_t       //
+    >
+    void log_links(                               //
+    executor_at&& executor = executor_at{}, //
+    progress_at&& progress = progress_at{}) noexcept {
+
+    // Progress status
+    std::atomic<bool> do_tasks{true};
+    std::atomic<std::size_t> processed{0};
+
+    // Track in-edges and out-edges for each node using maps
+    using edge_map_t = std::unordered_map<std::size_t, std::size_t>;
+    edge_map_t in_edges;
+    edge_map_t out_edges;
+    std::mutex map_mutex; // Add mutex to protect map access
+
+    std::size_t nodes_count = size();
+    executor.dynamic(nodes_count, [&](std::size_t thread_idx, std::size_t node_idx) {
+        node_t node = node_at_(node_idx);
+        std::size_t local_out_edges = 0; // Track local counts
+        
+        for (level_t level = 0; level <= node.level(); ++level) {
+            neighbors_ref_t neighbors = neighbors_(node, level);
+            local_out_edges += neighbors.size();
+            
+            // Record incoming edges for each neighbor
+            for (std::size_t j = 0; j < neighbors.size(); j++) {
+                compressed_slot_t neighbor_slot = neighbors[j];
+                
+                // Update in_edges count with mutex protection
+                {
+                    std::lock_guard<std::mutex> lock(map_mutex);
+                    in_edges[neighbor_slot]++;
+                }
+            }
+        }
+        
+        // Update out_edges count with mutex protection
+        {
+            std::lock_guard<std::mutex> lock(map_mutex);
+            out_edges[node_idx] += local_out_edges;
+        }
+        
+        ++processed;
+        if (thread_idx == 0)
+            do_tasks = progress(processed.load(), nodes_count);
+        return do_tasks.load();
+    });
+
+    // // Print connectivity information
+    // std::cout << "\n=== GRAPH CONNECTIVITY SUMMARY ===" << std::endl;
+    // std::cout << "Total nodes: " << nodes_count << std::endl;
+
+    // Count nodes without incoming edges
+    std::size_t no_in_edges_count = 0;
+    std::size_t orphaned_count = 0;
+    std::size_t unreachable_count = 0;
+    
+    for (std::size_t i = 0; i < nodes_count; ++i) {
+        if (in_edges.find(i) == in_edges.end()) {
+            no_in_edges_count++;
+            
+            // Get the key for this node
+            auto node_key = node_at_(i).key();
+            
+            // Classify the node
+            if (out_edges.find(i) != out_edges.end() && out_edges[i] > 0) {
+                unreachable_count++;
+                // std::cout << "⚠️ Node " << i << " (key: " << node_key << ") has NO INCOMING EDGES but "
+                //         << out_edges[i] << " outgoing edges" << std::endl;
+            } else {
+                orphaned_count++;
+                // std::cout << "⚠️ Node " << i << " (key: " << node_key << ") is COMPLETELY ISOLATED "
+                //         << "(no incoming or outgoing edges)" << std::endl;
+            }
+        }
+    }
+    
+    // std::cout << "Nodes with no incoming edges: " << no_in_edges_count << " (" 
+    //         << (no_in_edges_count * 100.0 / nodes_count) << "%)" << std::endl;
+    // std::cout << "  - Unreachable nodes (out-edges only): " << unreachable_count << std::endl;
+    // std::cout << "  - Isolated nodes (no connections): " << orphaned_count << std::endl;
+    // std::cout << "===================================" << std::endl;
+
+    // Append number of unreachable and isolated points to csv
+    std::ofstream csv_file("connectivity_summary.csv", std::ios::app);
+    csv_file << nodes_count << "," << unreachable_count << "," << orphaned_count << std::endl;
+    csv_file.close();
+
+
+    // At the end report the latest numbers
+    progress(processed.load(), nodes_count);
     }
 
   private:
