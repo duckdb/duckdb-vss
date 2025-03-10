@@ -446,6 +446,9 @@ void HNSWIndex::Construct(DataChunk &input, Vector &row_ids, idx_t thread_idx) {
 			}
 		}
 	}
+
+	// Log links between nodes in index
+	index.log_links();
 }
 
 void HNSWIndex::Compact() {
