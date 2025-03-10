@@ -4,8 +4,10 @@ project(example-c++)
 set(CMAKE_CXX_STANDARD 11)
 
 add_compile_options(-O3)
+# add_compile_options(-g) # for debug -- SLOW
 
 include_directories(../duckdb/src/include include)
+# link_directories(../build/debug/src) # for debug
 link_directories(../build/release/src)
 
 set(BENCHMARK_LIB_PATH "${CMAKE_SOURCE_DIR}/include/benchmark")
@@ -16,13 +18,9 @@ else()
     message(STATUS "Benchmark library found: ${BENCHMARK_LIB}")
 endif()
 
-add_executable(example main.cpp)
 add_executable(benchmark_deletions benchmark_deletions.cpp)
-
-
-add_executable(results get_results.cpp)
+add_executable(recall recall.cpp)
 
 # Linking libraries
-target_link_libraries(example duckdb)
 target_link_libraries(benchmark_deletions duckdb ${BENCHMARK_LIB})
-target_link_libraries(results duckdb ${BENCHMARK_LIB})
+target_link_libraries(recall duckdb ${BENCHMARK_LIB})
