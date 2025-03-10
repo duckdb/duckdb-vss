@@ -11,6 +11,7 @@
 #include <numeric>    // `std::iota`
 #include <thread>     // `std::thread`
 #include <vector>     // `std::vector`
+#include <iostream>   // `std::cerr`
 
 #include <usearch/index.hpp>
 #include <usearch/index_plugins.hpp>
@@ -1233,24 +1234,37 @@ class index_dense_gt {
         if (matching_slots.first == matching_slots.second)
             return result;
 
+        // std::cout << "Index size: " << size() << std::endl;
+        // std::cout << "Removing " << std::distance(matching_slots.first, matching_slots.second) << " entries" << std::endl;
+        // std::cout << "Free keys size: " << free_keys_.size() << std::endl;
+    
         // Grow the removed entries ring, if needed
         std::size_t matching_count = std::distance(matching_slots.first, matching_slots.second);
         std::unique_lock<std::mutex> free_lock(free_keys_mutex_);
         if (!free_keys_.reserve(free_keys_.size() + matching_count))
             return result.failed("Can't allocate memory for a free-list");
-
+    
         // A removed entry would be:
         // - present in `free_keys_`
         // - missing in the `slot_lookup_`
         // - marked in the `typed_` index with a `free_key_`
         for (auto slots_it = matching_slots.first; slots_it != matching_slots.second; ++slots_it) {
-            compressed_slot_t slot = (*slots_it).slot;
-            free_keys_.push(slot);
+            key_and_slot_t key_and_slot = *slots_it;
+            compressed_slot_t slot = key_and_slot.slot;
+            
+            // Mark the node as deleted in the index
             typed_->at(slot).key = free_key_;
+            
+            // Add the freed slot to the free_keys_ ring buffer
+            free_keys_.push(slot);
         }
+    
+        // Remove all entries with this key from the lookup table
         slot_lookup_.erase(key);
         result.completed = matching_count;
-
+    
+        // std::cout << "Removed " << result.completed << " entries" << std::endl;
+        // std::cout << "Free keys size after removal: " << free_keys_.size() << std::endl;
         return result;
     }
 
@@ -1435,6 +1449,28 @@ class index_dense_gt {
             return std::move(*this);
         }
     };
+
+    /**
+     *  @brief Logs status of links for nodes at each level
+     *  @param executor The executor parallel processing. Default ::dummy_executor_t single-threaded.
+     *  @param progress The progress tracker instance to use. Default ::dummy_progress_t reports nothing.
+     *  @return The ::compaction_result_t indicating the result of the compaction operation.
+     *          `result.pruned_edges` will contain the number of edges that were removed.
+     *          `result.error` will contain an error message if an error occurred during the compaction operation.
+     */
+    template <typename executor_at = dummy_executor_t, typename progress_at = dummy_progress_t>
+    compaction_result_t log_links(executor_at&& executor = executor_at{}, progress_at&& progress = progress_at{}) {
+        compaction_result_t result;
+        std::atomic<std::size_t> pruned_edges;
+        // auto disallow = [&](member_cref_t const& member) noexcept {
+        //     bool freed = member.key == free_key_;
+        //     pruned_edges += freed;
+        //     return freed;
+        // };
+        typed_->log_links(std::forward<executor_at>(executor), std::forward<progress_at>(progress));
+        result.pruned_edges = pruned_edges;
+        return result;
+    }
 
     /**
      *  @brief Performs compaction on the index, pruning links to removed entries.
