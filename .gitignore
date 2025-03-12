@@ -11,3 +11,8 @@ results.db
 python/data/raw/*.hdf5
 .editorconfig
 .vscode
+plots/
+
+python/data/results/
+
+embedded-c++/*.csv
