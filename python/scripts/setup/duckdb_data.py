@@ -6,10 +6,10 @@ import os
 dataset = 'all'
 
 dataset_dict = {
-    "fashion_mnist": "../data/raw/fashion-mnist-784-euclidean.hdf5",
-    "mnist": "../data/raw/mnist-784-euclidean.hdf5",
-    "sift": "../data/raw/sift-128-euclidean.hdf5",
-    "gist": "../data/raw/gist-960-euclidean.hdf5",
+    "fashion_mnist": "data/raw/fashion-mnist-784-euclidean.hdf5",
+    "mnist": "data/raw/mnist-784-euclidean.hdf5",
+    "sift": "data/raw/sift-128-euclidean.hdf5",
+    "gist": "data/raw/gist-960-euclidean.hdf5",
 }
 
 def get_train():
@@ -41,7 +41,7 @@ def transform_data(data, column_name):
     return df_transformed
 
 def create_tables():
-    con = duckdb.connect(database="../../embedded-c++/raw.db")
+    con = duckdb.connect(database="../embedded-c++/raw.db")
 
     # Load the df
     train = transform_data(get_train(), "vec")

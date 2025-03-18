@@ -4,14 +4,18 @@ RUN_CMD :=
 
 # Define directories
 ROOT_DIR := scripts/
-BENCHMARK_DIR := setup
+SETUP_DIR := setup
 PLOTS_DIR := plots
 
 # Collect scripts
-BENCHMARKS := $(wildcard ${ROOT_DIR}$(BENCHMARK_DIR)/*.py)
+SETUPS := $(wildcard ${ROOT_DIR}$(SETUP_DIR)/*.py)
 PLOTS := $(wildcard ${ROOT_DIR}$(PLOTS_DIR)/*.py)
 
-.PHONY: install plots clean
+.PHONY: install setup install clean
+
+
+all: install setup plots clean
+
 
 install:
 	@echo "Setting up environment..."
@@ -24,6 +28,12 @@ requirements.txt: pyproject.toml poetry.lock
 plots:
 	@echo "Generating plots..."
 	@for script in $(PLOTS); do \
+		$(PYTHON) $$script; \
+	done
+
+setup:
+	@echo "Setting up benchmarks..."
+	@for script in $(SETUPS); do \
 		$(PYTHON) $$script; \
 	done
 
