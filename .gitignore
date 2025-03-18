@@ -16,3 +16,4 @@ python/plots
 python/data/results/
 
 embedded-c++/*.csv
+.venv
