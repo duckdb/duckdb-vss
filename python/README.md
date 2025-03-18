@@ -74,7 +74,7 @@ This will run all the plotting scripts in the `scripts/plots/` directory.
 To populate the persistent raw.db file used in c++ experiments:
 
 ```
-make benchmark
+make setup
 ```
 
 ### Clean Environment

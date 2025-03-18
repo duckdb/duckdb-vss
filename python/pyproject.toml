@@ -3,6 +3,8 @@ name = "duckdb_vss_python_scripts"
 version = "0.1.0"
 description = "Python scripts to support experiments with DuckDB and VSS"
 authors = ["Vigdis", "Thomas"]
+package-mode = false
+
 
 
 [tool.poetry.dependencies]
