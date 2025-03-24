@@ -57,6 +57,7 @@ public:
 	void Construct(DataChunk &input, Vector &row_ids, idx_t thread_idx);
 	void PersistToDisk();
 	void Compact();
+	void LogNodeMetrics();
 
 	unique_ptr<HNSWIndexStats> GetStats();
 

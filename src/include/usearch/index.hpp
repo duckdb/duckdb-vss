@@ -969,6 +969,22 @@ class growing_hash_set_gt {
         count_ = new_count;
         return true;
     }
+
+    // Get access to the internal array (for iteration)
+    element_t* data() const noexcept { return slots_; }
+    std::size_t capacity() const noexcept { return capacity_; }
+    
+    // Method to iterate through all values in the set
+    template <typename Callback>
+    void for_each(Callback&& callback) const {
+        if (!slots_) return;
+        
+        for (std::size_t i = 0; i < capacity_; ++i) {
+            if (slots_[i] != default_free_value<element_t>()) {
+                callback(slots_[i]);
+            }
+        }
+    }
 };
 
 /**
@@ -991,7 +1007,6 @@ class ring_gt {
     std::size_t head_{};
     std::size_t tail_{};
     bool empty_{true};
-    bool full_{false};  // Add a flag to track when the buffer is full
     allocator_t allocator_{};
 
   public:
@@ -1018,17 +1033,13 @@ class ring_gt {
     ~ring_gt() noexcept { reset(); }
 
     bool empty() const noexcept { return empty_; }
-    bool full() const noexcept { return full_; }
     size_t capacity() const noexcept { return capacity_; }
     size_t size() const noexcept {
         if (empty_)
             return 0;
-        else if (full_)
-            return capacity_;
         else if (head_ >= tail_)
             return head_ - tail_;
         else
-            // return capacity_ - (tail_ - head_) + head_;
             return capacity_ - (tail_ - head_);
     }
 
@@ -1036,7 +1047,6 @@ class ring_gt {
         head_ = 0;
         tail_ = 0;
         empty_ = true;
-        full_ = false;
     }
 
     void reset() noexcept {
@@ -1047,7 +1057,6 @@ class ring_gt {
         head_ = 0;
         tail_ = 0;
         empty_ = true;
-        full_ = false;
     }
 
     bool reserve(std::size_t n) noexcept {
@@ -1055,49 +1064,21 @@ class ring_gt {
             return false; // prevent data loss
         if (n <= capacity())
             return true;
-        
         n = (std::max<std::size_t>)(ceil2(n), 64u);
         element_t* elements = allocator_.allocate(n);
-        if (!elements)
+        if (!elements){
             return false;
-        
-        // Improved transfer logic that works even when the buffer is full
-        std::size_t i = 0;
-        std::size_t current_size = size();
-        
-        // Get the current position
-        std::size_t current_head = head_;
-        std::size_t current_tail = tail_;
-        bool was_full = full_;
-        
-        // Copy elements directly based on position logic
-        if (was_full || current_head > current_tail) {
-            // When the buffer has wrapped around or is full
-            for (std::size_t pos = current_tail; pos < capacity_; ++pos) {
-                elements[i++] = elements_[pos];
-            }
-            for (std::size_t pos = 0; pos < current_head; ++pos) {
-                elements[i++] = elements_[pos]; 
-            }
-        } else {
-            // Simple case - elements are in sequence
-            for (std::size_t pos = current_tail; pos < current_head; ++pos) {
-                elements[i++] = elements_[pos];
-            }
         }
-        
-        // Clean up old allocation if it exists
-        if (elements_)
-            allocator_.deallocate(elements_, capacity_);
-        
-        // Update internal state
+        std::size_t i = 0;
+        while (try_pop(elements[i]))
+            i++;
+
+        reset();
         elements_ = elements;
         capacity_ = n;
-        head_ = current_size; // New head position is after all copied elements
-        tail_ = 0;  // New tail starts at beginning
-        empty_ = (current_size == 0);
-        full_ = false; // Cannot be full after resize
-        
+        head_ = i;
+        tail_ = 0;
+        empty_ = (i == 0);
         return true;
     }
 
@@ -1105,17 +1086,13 @@ class ring_gt {
         elements_[head_] = value;
         head_ = (head_ + 1) % capacity_;
         empty_ = false;
-        // If tail ahead of head by 1, then the buffer is full
-        if (head_ == tail_){
-            full_ = true;
-        }
     }
 
     bool try_push(element_t const& value) noexcept {
         if (head_ == tail_ && !empty_)
             return false; // elements_ is full
 
-        push(value);
+        return push(value);
         return true;
     }
 
@@ -1125,9 +1102,7 @@ class ring_gt {
 
         value = std::move(elements_[tail_]);
         tail_ = (tail_ + 1) % capacity_;
-        full_ = false;  // After popping, we're definitely not full
-        empty_ = head_ == tail_ && !full_;
-        // empty_ = head_ == tail_;
+        empty_ = head_ == tail_;
         return true;
     }
 
@@ -1935,6 +1910,9 @@ class index_gt {
         std::default_random_engine level_generator{};
         std::size_t iteration_cycles{};
         std::size_t computed_distances_count{};
+        // std::vector<std::vector<std::size_t>> visited_nodes_at_levels{};
+        // std::size_t start_entry_key{};
+        // std::size_t base_entry_key{};
 
         template <typename value_at, typename metric_at, typename entry_at> //
         inline distance_t measure(value_at const& first, entry_at const& second, metric_at&& metric) noexcept {
@@ -2233,6 +2211,12 @@ class index_gt {
         std::size_t visited_members{};
         /** @brief  Number of times the distances were computed. */
         std::size_t computed_distances{};
+        // /** @brief  Keys of graph nodes traversed at each level. */
+        // std::vector<std::vector<std::size_t>> visited_nodes_at_levels{};
+        // /** @brief  Key of entry point at highest level */
+        // std::size_t start_entry_key{};
+        // /**  @brief Key of entry point at base level */
+        // std::size_t base_entry_key{};
         error_t error{};
 
         inline search_result_t() noexcept {}
@@ -2552,6 +2536,7 @@ class index_gt {
             search_exact_(query, metric, predicate, wanted, context);
         } else {
             next_candidates_t& next = context.next_candidates;
+            // How many candidates considered at each step of search (higher -> better recall but req increased computation, slower)
             std::size_t expansion = (std::max)(config.expansion, wanted);
             usearch_assert_m(expansion > 0, "Expansion factor can't be a zero!");
             if (!next.reserve(expansion))
@@ -2569,10 +2554,20 @@ class index_gt {
         top.sort_ascending();
         top.shrink(wanted);
 
+        // node_t entry_node = node_at_(entry_slot_.slot);
+        // vector_key_t entry_node_key = entry_node.key();
+
+        // node_t closest_node = node_at_(closest_slot.slot);
+        // vector_key_t closest_node_key = closest_node.key();
+
         // Normalize stats
         result.computed_distances = context.computed_distances_count - result.computed_distances;
         result.visited_members = context.iteration_cycles - result.visited_members;
         result.count = top.size();
+        // Other stats
+        // result.start_entry_key = entry_node_key;
+        // result.base_entry_key = closest_node_key
+        // result.visited_nodes_at_levels = context.visited_nodes_at_levels;
         return result;
     }
 
@@ -3189,105 +3184,200 @@ class index_gt {
     }
 
     /**
-     *  @brief  Logs unreachable and isolated nodes.
+     *  @brief  Logs unreachable and isolated nodes with level-specific connectivity metrics.
      *
      *  @param[in] executor Thread-pool to execute the job in parallel.
      *  @param[in] progress Callback to report the execution progress.
      */
-    template <                                        //
-    typename executor_at = dummy_executor_t,      //
-    typename progress_at = dummy_progress_t       //
-    >
-    void log_links(                               //
-    executor_at&& executor = executor_at{}, //
-    progress_at&& progress = progress_at{}) noexcept {
+    template <typename executor_at = dummy_executor_t, typename progress_at = dummy_progress_t>
+    void log_links(executor_at&& executor = executor_at{}, progress_at&& progress = progress_at{}) noexcept {
+        // Progress status
+        std::atomic<bool> do_tasks{true};
+        std::atomic<std::size_t> processed{0};
 
-    // Progress status
-    std::atomic<bool> do_tasks{true};
-    std::atomic<std::size_t> processed{0};
+        // Track in-edges and out-edges for each node using maps
+        // For in-edges, we'll track them per level
+        std::vector<std::unordered_map<std::size_t, std::size_t>> in_edges_per_level(max_level() + 1);
+        using edge_map_t = std::unordered_map<std::size_t, std::size_t>;
+        edge_map_t out_edges;
+        std::mutex map_mutex; // Add mutex to protect map access
 
-    // Track in-edges and out-edges for each node using maps
-    using edge_map_t = std::unordered_map<std::size_t, std::size_t>;
-    edge_map_t in_edges;
-    edge_map_t out_edges;
-    std::mutex map_mutex; // Add mutex to protect map access
-
-    std::size_t nodes_count = size();
-    executor.dynamic(nodes_count, [&](std::size_t thread_idx, std::size_t node_idx) {
-        node_t node = node_at_(node_idx);
-        std::size_t local_out_edges = 0; // Track local counts
+        // Track connectivity
+        std::atomic<std::size_t> disconnected_nodes{0};
+        std::atomic<std::size_t> total_connections{0};
         
-        for (level_t level = 0; level <= node.level(); ++level) {
-            neighbors_ref_t neighbors = neighbors_(node, level);
-            local_out_edges += neighbors.size();
+        // Track per-level connectivity
+        std::vector<std::atomic<std::size_t>> level_connections(max_level() + 1);
+        std::vector<std::atomic<std::size_t>> level_node_counts(max_level() + 1);
+
+        std::size_t nodes_count = size();
+        executor.dynamic(nodes_count, [&](std::size_t thread_idx, std::size_t node_idx) {
+            node_t node = node_at_(node_idx);
+            std::size_t local_out_edges = 0; // Track local counts
             
-            // Record incoming edges for each neighbor
-            for (std::size_t j = 0; j < neighbors.size(); j++) {
-                compressed_slot_t neighbor_slot = neighbors[j];
+            // First, check if this node has connections at any level
+            bool has_connections = false;
+            for (level_t level = 0; level <= node.level(); ++level) {
+                neighbors_ref_t neighbors = neighbors_(node, level);
+                if (neighbors.size() > 0) {
+                    has_connections = true;
+                    break;
+                }
+            }
+            
+            if (!has_connections) {
+                disconnected_nodes++;
+            }
+            
+            // Process each level
+            for (level_t level = 0; level <= node.level(); ++level) {
+                neighbors_ref_t neighbors = neighbors_(node, level);
+                std::size_t connections = neighbors.size();
                 
-                // Update in_edges count with mutex protection
-                {
-                    std::lock_guard<std::mutex> lock(map_mutex);
-                    in_edges[neighbor_slot]++;
+                // Update level-specific stats
+                level_connections[level] += connections;
+                level_node_counts[level]++;
+                
+                local_out_edges += connections;
+                total_connections += connections;
+                
+                // Record incoming edges for each neighbor, tracking the level
+                for (std::size_t j = 0; j < neighbors.size(); j++) {
+                    compressed_slot_t neighbor_slot = neighbors[j];
+                    
+                    // Update in_edges count with mutex protection
+                    {
+                        std::lock_guard<std::mutex> lock(map_mutex);
+                        in_edges_per_level[level][neighbor_slot]++;
+                    }
+                }
+            }
+            
+            // Update out_edges count with mutex protection
+            {
+                std::lock_guard<std::mutex> lock(map_mutex);
+                out_edges[node_idx] = local_out_edges;
+            }
+            
+            ++processed;
+            if (thread_idx == 0)
+                do_tasks = progress(processed.load(), nodes_count);
+            return do_tasks.load();
+        });
+
+        // Output per-level connectivity statistics
+        std::vector<double> avg_connections_per_level;
+        std::vector<std::size_t> level_node_count_values;
+        for (level_t level = 0; level <= max_level(); ++level) {
+            std::size_t level_node_count = level_node_counts[level].load();
+            level_node_count_values.push_back(level_node_count);
+            double avg_connections = level_node_count > 0 ? 
+                (double)level_connections[level].load() / level_node_count : 0;
+            avg_connections_per_level.push_back(avg_connections);
+        }
+
+        // Count nodes without incoming edges at ANY level
+        std::size_t no_in_edges_count = 0;
+        std::size_t orphaned_count = 0;
+        std::size_t unreachable_count = 0;
+        
+        // Modified: Only count as unreachable if the node has no incoming edges at ANY level
+        for (std::size_t i = 0; i < nodes_count; ++i) {
+            bool has_incoming_edges = false;
+            
+            // Check if this node has incoming edges at ANY level
+            for (level_t level = 0; level <= max_level(); ++level) {
+                if (in_edges_per_level[level].find(i) != in_edges_per_level[level].end()) {
+                    has_incoming_edges = true;
+                    break;
+                }
+            }
+            
+            if (!has_incoming_edges) {
+                no_in_edges_count++;
+                // Classify the node
+                if (out_edges.find(i) != out_edges.end() && out_edges[i] > 0) {
+                    // Unreachable: has outgoing edges but no incoming edges across ALL levels
+                    unreachable_count++;
+                } else {
+                    // Orphaned: has neither incoming nor outgoing edges
+                    orphaned_count++;
                 }
             }
         }
         
-        // Update out_edges count with mutex protection
-        {
-            std::lock_guard<std::mutex> lock(map_mutex);
-            out_edges[node_idx] += local_out_edges;
+        // Count and output level-specific unreachable nodes (for analysis, not for unreachable_count)
+        std::vector<std::size_t> unreachable_per_level;
+        for (level_t level = 0; level <= max_level(); ++level) {
+            std::size_t level_unreachable = 0;
+            for (std::size_t i = 0; i < nodes_count; ++i) {
+                // Check if node exists at this level
+                node_t node = node_at_(i);
+                if (node.level() >= level) {
+                    // Node exists at this level - check if it has incoming edges at this specific level
+                    if (in_edges_per_level[level].find(i) == in_edges_per_level[level].end()) {
+                        level_unreachable++;
+                    }
+                }
+            }
+            unreachable_per_level.push_back(level_unreachable);
+        }
+
+        // TODO: Add these as tructured output / attributes of index class and use this func to update
+        // Append statistics to CSV
+        std::ofstream csv_file("node_connectivity.csv", std::ios::app);
+        
+        // TODO: Also add header row if amount of levels in index has changed (ensure # of columns match)
+        // Add header if file is new/empty
+        std::ifstream test_file("node_connectivity.csv");
+        bool file_exists_with_content = test_file.peek() != std::ifstream::traits_type::eof();
+        test_file.close();
+
+        if (!file_exists_with_content) {
+            csv_file << "nodes_count,unreachable_count,orphaned_count,avg_connections,disconnected_nodes";
+            
+            // Add per-level connectivity columns
+            for (level_t level = 0; level <= max_level(); ++level) {
+                csv_file << ",avg_conn_l" << level;
+            }
+            
+            // Add per-level unreachable columns
+            for (level_t level = 0; level <= max_level(); ++level) {
+                csv_file << ",unreachable_l" << level;
+            }
+            
+            // Add per-level node count columns
+            for (level_t level = 0; level <= max_level(); ++level) {
+                csv_file << ",nodes_l" << level;
+            }
+            
+            csv_file << std::endl;
         }
         
-        ++processed;
-        if (thread_idx == 0)
-            do_tasks = progress(processed.load(), nodes_count);
-        return do_tasks.load();
-    });
-
-    // // Print connectivity information
-    // std::cout << "\n=== GRAPH CONNECTIVITY SUMMARY ===" << std::endl;
-    // std::cout << "Total nodes: " << nodes_count << std::endl;
-
-    // Count nodes without incoming edges
-    std::size_t no_in_edges_count = 0;
-    std::size_t orphaned_count = 0;
-    std::size_t unreachable_count = 0;
-    
-    for (std::size_t i = 0; i < nodes_count; ++i) {
-        if (in_edges.find(i) == in_edges.end()) {
-            no_in_edges_count++;
-            
-            // Get the key for this node
-            auto node_key = node_at_(i).key();
-            
-            // Classify the node
-            if (out_edges.find(i) != out_edges.end() && out_edges[i] > 0) {
-                unreachable_count++;
-                // std::cout << "⚠️ Node " << i << " (key: " << node_key << ") has NO INCOMING EDGES but "
-                //         << out_edges[i] << " outgoing edges" << std::endl;
-            } else {
-                orphaned_count++;
-                // std::cout << "⚠️ Node " << i << " (key: " << node_key << ") is COMPLETELY ISOLATED "
-                //         << "(no incoming or outgoing edges)" << std::endl;
-            }
+        // Write the data row
+        csv_file << nodes_count << "," << unreachable_count << "," << orphaned_count << "," 
+                << (double)total_connections.load() / size() << "," << disconnected_nodes;
+        
+        // Add per-level connectivity values
+        for (auto avg_conn : avg_connections_per_level) {
+            csv_file << "," << avg_conn;
         }
-    }
-    
-    // std::cout << "Nodes with no incoming edges: " << no_in_edges_count << " (" 
-    //         << (no_in_edges_count * 100.0 / nodes_count) << "%)" << std::endl;
-    // std::cout << "  - Unreachable nodes (out-edges only): " << unreachable_count << std::endl;
-    // std::cout << "  - Isolated nodes (no connections): " << orphaned_count << std::endl;
-    // std::cout << "===================================" << std::endl;
+        
+        // Add per-level unreachable values
+        for (auto unreachable : unreachable_per_level) {
+            csv_file << "," << unreachable;
+        }
+        
+        // Add per-level node count values
+        for (auto node_count : level_node_count_values) {
+            csv_file << "," << node_count;
+        }
 
-    // Append number of unreachable and isolated points to csv
-    std::ofstream csv_file("connectivity_summary.csv", std::ios::app);
-    csv_file << nodes_count << "," << unreachable_count << "," << orphaned_count << std::endl;
-    csv_file.close();
+        csv_file << std::endl;
+        csv_file.close();
 
-
-    // At the end report the latest numbers
-    progress(processed.load(), nodes_count);
+        // At the end report the latest numbers
+        progress(processed.load(), nodes_count);
     }
 
   private:
@@ -3533,17 +3623,27 @@ class index_gt {
         visits_hash_set_t& visits = context.visits;
         visits.clear();
 
+        // std::vector<std::vector<std::size_t>>& visited_nodes_at_levels = context.visited_nodes_at_levels;
+        // visited_nodes_at_levels.clear();
+        // visited_nodes_at_levels.resize(begin_level + 1);
+
+        // std::size_t& start_entry_key = context.start_entry_key;
+        // start_entry_key = 0;
+
         // Optional prefetching
         if (!is_dummy<prefetch_at>())
             prefetch(citerator_at(closest_slot), citerator_at(closest_slot + 1));
 
         distance_t closest_dist = context.measure(query, citerator_at(closest_slot), metric);
+        // start_entry_key = node_at_(closest_slot).key();
         for (level_t level = begin_level; level > end_level; --level) {
             bool changed;
             do {
                 changed = false;
                 node_lock_t closest_lock = node_lock_(closest_slot);
                 neighbors_ref_t closest_neighbors = neighbors_non_base_(node_at_(closest_slot), level);
+                // Add node key to visited at this level
+                // visited_nodes_at_levels[level].push_back(node_at_(closest_slot).key());
 
                 // Optional prefetching
                 if (!is_dummy<prefetch_at>()) {
@@ -3654,7 +3754,10 @@ class index_gt {
         next_candidates_t& next = context.next_candidates; // pop min, push
         top_candidates_t& top = context.top_candidates;    // pop max, push
         std::size_t const top_limit = expansion;
+        // std::vector<std::vector<std::size_t>>& visited_nodes_at_levels = context.visited_nodes_at_levels;
+        // std::size_t& base_entry_key = context.base_entry_key;
 
+        // base_entry_key = 0;
         visits.clear();
         next.clear();
         top.clear();
@@ -3669,6 +3772,7 @@ class index_gt {
         usearch_assert_m(next.capacity(), "The `max_heap_gt` must have been reserved in the search entry point");
         next.insert_reserved({-radius, static_cast<compressed_slot_t>(start_slot)});
         visits.set(static_cast<compressed_slot_t>(start_slot));
+        // base_entry_key = node_at_(start_slot).key();
 
         // Don't populate the top list if the predicate is not satisfied
         if (is_dummy<predicate_at>() || predicate(member_cref_t{node_at_(start_slot).ckey(), start_slot})) {
@@ -3680,6 +3784,7 @@ class index_gt {
         while (!next.empty()) {
 
             candidate_t candidate = next.top();
+            // Stop if the current candidate is further than the furthest neighbor found so far
             if ((-candidate.distance) > radius)
                 break;
 
@@ -3699,19 +3804,46 @@ class index_gt {
                 return false;
 
             for (compressed_slot_t successor_slot : candidate_neighbors) {
+                // Skip if node already visited
                 if (visits.set(successor_slot))
                     continue;
 
                 distance_t successor_dist = context.measure(query, citerator_at(successor_slot), metric);
+                // Successor inserted if either 
+                //      (1) the current result set hasn't reached its capacity limit yet (top.size() < top_limit), or 
+                //      (2) the successor is closer to the query than the current furthest result (successor_dist < radius).
                 if (top.size() < top_limit || successor_dist < radius) {
                     // This can substantially grow our priority queue:
-                    next.insert({-successor_dist, successor_slot});
+                    next.insert({-successor_dist, successor_slot}); // next queue with negated dist as priority --> controls which nodes to explore next (closest node to query first in priority) --> greedy best-first search
                     if (is_dummy<predicate_at>() ||
                         predicate(member_cref_t{node_at_(successor_slot).ckey(), successor_slot}))
+                        // Maintain K-nearest neighbors found so far
                         top.insert({successor_dist, successor_slot}, top_limit);
+                    // Update search radius to the furthest neighbor found so far
+                    // --> dynamically narrows search space as better candidates are found
                     radius = top.top().distance;
                 }
             }
+
+            // visits.for_each([&](compressed_slot_t visited_slot) {
+            //     visited_nodes_at_levels[0].push_back(node_at_(visited_slot).key());
+            // });
+
+            // // Debugging local minima - after processing neighbors
+            // if (next.size() == 0 && top.size() < top_limit) {
+            //     std::cout << "Local minimum detected after " << context.iteration_cycles << " iterations!" << std::endl;
+            //     std::cout << "  - Results found: " << top.size() << "/" << top_limit << std::endl;
+
+            //     node_t candidate_ref = node_at_(candidate.slot);
+            //     vector_key_t candidate_key = candidate_ref.key();
+
+            //     std::cout << top.size() << ", " << top_limit << ", " << context.iteration_cycles << ", "  << visits.size() << ", " << candidate_key << ", " << candidate_neighbors.size() << std::endl;
+            //     // Append stats to csv for early terminated run
+            //     std::ofstream csv_file("base_layer_early_termination.csv", std::ios::app);
+            //     // top n neighbors, top limit, iteration cycles, visits, last node expanded, nr of candidate neighbors of last node 
+            //     csv_file << top.size() << "," << top_limit << "," << context.iteration_cycles << ","  << visits.size() << "," << candidate_key << "," << candidate_neighbors.size() << std::endl;
+            //     csv_file.close();
+            // }
         }
 
         return true;

@@ -6,6 +6,7 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "hnsw/hnsw.hpp"
+#include <iostream>
 
 namespace duckdb {
 //------------------------------------------------------------------------------
@@ -446,9 +447,14 @@ void HNSWIndex::Construct(DataChunk &input, Vector &row_ids, idx_t thread_idx) {
 			}
 		}
 	}
+}
 
+void HNSWIndex::LogNodeMetrics() {
 	// Log links between nodes in index
-	index.log_links();
+	{
+		auto lock = rwlock.GetExclusiveLock();
+		index.log_links();
+	}
 }
 
 void HNSWIndex::Compact() {

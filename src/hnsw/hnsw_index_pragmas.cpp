@@ -190,11 +190,55 @@ static void CompactIndexPragma(ClientContext &context, const FunctionParameters 
 }
 
 //-------------------------------------------------------------------------
+// LogNodeMetrics PRAGMA
+//-------------------------------------------------------------------------
+
+static void LogNodeMetricsIndexPragma(ClientContext &context, const FunctionParameters &parameters) {
+	if (parameters.values.size() != 1) {
+		throw BinderException("Expected one argument for hnsw_log_node_metrics");
+	}
+	auto &param = parameters.values[0];
+	if (param.type() != LogicalType::VARCHAR) {
+		throw BinderException("Expected a string argument for hnsw_log_node_metrics");
+	}
+	auto index_name = param.GetValue<string>();
+
+	auto qname = QualifiedName::Parse(index_name);
+
+	// look up the index name in the catalog
+	Binder::BindSchemaOrCatalog(context, qname.catalog, qname.schema);
+	auto &index_entry = Catalog::GetEntry(context, CatalogType::INDEX_ENTRY, qname.catalog, qname.schema, qname.name)
+	                        .Cast<IndexCatalogEntry>();
+	auto &table_entry = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, qname.catalog, index_entry.GetSchemaName(),
+	                                      index_entry.GetTableName())
+	                        .Cast<TableCatalogEntry>();
+
+	auto &storage = table_entry.GetStorage();
+	bool found_index = false;
+
+	auto &table_info = *storage.GetDataTableInfo();
+	table_info.GetIndexes().BindAndScan<HNSWIndex>(context, table_info, [&](HNSWIndex &hnsw_index) {
+		if (index_entry.name == index_name) {
+			hnsw_index.LogNodeMetrics();
+			found_index = true;
+			return true;
+		}
+		return false;
+	});
+
+	if (!found_index) {
+		throw BinderException("Index %s not found", index_name);
+	}
+}
+
+//-------------------------------------------------------------------------
 // Register
 //-------------------------------------------------------------------------
 void HNSWModule::RegisterIndexPragmas(DatabaseInstance &db) {
 	ExtensionUtil::RegisterFunction(
 	    db, PragmaFunction::PragmaCall("hnsw_compact_index", CompactIndexPragma, {LogicalType::VARCHAR}));
+	ExtensionUtil::RegisterFunction(
+		db, PragmaFunction::PragmaCall("hnsw_log_node_metrics", LogNodeMetricsIndexPragma, {LogicalType::VARCHAR}));
 
 	// TODO: This is kind of ugly and maybe should just take a parameter instead...
 	TableFunction info_function("pragma_hnsw_index_info", {}, HNSWIndexInfoExecute, HNSWindexInfoBind,

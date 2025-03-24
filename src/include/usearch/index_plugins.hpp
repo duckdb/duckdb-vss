@@ -1826,6 +1826,7 @@ class flat_hash_multi_set_gt {
     char* data_ = nullptr;
     std::size_t buckets_ = 0;
     std::size_t populated_slots_ = 0;
+    std::size_t deleted_slots_ = 0;
     /// @brief  Number of slots
     std::size_t capacity_slots_ = 0;
 
@@ -1863,6 +1864,7 @@ class flat_hash_multi_set_gt {
 
   public:
     std::size_t size() const noexcept { return populated_slots_; }
+    std::size_t deleted_size() const noexcept { return deleted_slots_; } 
     std::size_t capacity() const noexcept { return capacity_slots_; }
 
     flat_hash_multi_set_gt() noexcept {}
@@ -1884,6 +1886,7 @@ class flat_hash_multi_set_gt {
         // Copy metadata
         buckets_ = other.buckets_;
         populated_slots_ = other.populated_slots_;
+        deleted_slots_ = other.deleted_slots_;
         capacity_slots_ = other.capacity_slots_;
 
         // Initialize new buckets to empty
@@ -1924,6 +1927,7 @@ class flat_hash_multi_set_gt {
         // Copy metadata
         buckets_ = other.buckets_;
         populated_slots_ = other.populated_slots_;
+        deleted_slots_ = other.deleted_slots_;
         capacity_slots_ = other.capacity_slots_;
 
         // Initialize new buckets to empty
@@ -1953,6 +1957,7 @@ class flat_hash_multi_set_gt {
         if (data_)
             std::memset(data_, 0, buckets_ * bytes_per_bucket());
         populated_slots_ = 0;
+        deleted_slots_ = 0;
     }
 
     void reset() noexcept {
@@ -1961,6 +1966,7 @@ class flat_hash_multi_set_gt {
             allocator_t{}.deallocate(data_, buckets_ * bytes_per_bucket());
         buckets_ = 0;
         populated_slots_ = 0;
+        deleted_slots_ = 0;
         capacity_slots_ = 0;
     }
 
@@ -2130,6 +2136,7 @@ class flat_hash_multi_set_gt {
                     // Found a match, mark as deleted
                     slot.header.deleted |= slot.mask;
                     --populated_slots_;
+                    ++deleted_slots_;
                     popped_value = slot.element;
                     return true; // Successfully removed
                 }
@@ -2165,6 +2172,7 @@ class flat_hash_multi_set_gt {
                     // Found a match, mark as deleted
                     slot.header.deleted |= slot.mask;
                     --populated_slots_;
+                    ++deleted_slots_;
                     ++count; // Increment count of elements removed
                 }
             } else {
