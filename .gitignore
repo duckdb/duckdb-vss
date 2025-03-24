@@ -17,3 +17,17 @@ python/data/results/
 
 embedded-c++/*.csv
 .venv
+*.csv
+*.pyc
+# Packages
+/dist/*
+# Unit test / coverage reports
+.coverage
+.pytest_cache
+.idea/*
+.python-version
+.vscode/*
+/docs/site/*
+.mypy_cache
+.venv
+/poetry.toml
