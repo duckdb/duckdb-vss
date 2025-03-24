@@ -573,6 +573,103 @@ void IndexOperations::runTestQueries(Connection& con, index_dense_gt<row_t>& ind
 }
 
 /**
+ * Runs exact search on the index in parallel
+ * 
+ * @param con The DuckDB connection
+ * @param index The USearch index to query
+ * @param test_vectors The result set containing test vectors
+ */
+TestVectorData IndexOperations::parallelExactSearch(Connection& con, index_dense_gt<row_t>& index,
+    const unique_ptr<MaterializedQueryResult>& test_vectors) {
+    
+    TestVectorData data;
+
+    try {
+        // Extract all test vectors upfront to avoid DB access in threads
+        std::vector<std::vector<float>> test_vecs;
+        std::vector<int> test_vector_indices;
+
+        test_vecs.reserve(test_vectors->RowCount());
+        test_vector_indices.reserve(test_vectors->RowCount());
+
+        for (idx_t i = 0; i < test_vectors->RowCount(); i++) {
+            test_vecs.push_back(ExtractFloatVector(test_vectors->GetValue(1, i)));
+            test_vector_indices.push_back(test_vectors->GetValue(0, i).GetValue<int>());
+        }
+
+        // Thread-safe containers for results
+        std::mutex results_mutex;
+
+        data.test_vecs = test_vecs;  // Copy vectors to result
+        data.test_vector_indices = test_vector_indices;  // Copy indices to result
+        data.neighbor_ids_values.reserve(test_vectors->RowCount());
+
+        std::size_t executor_threads = std::min(std::thread::hardware_concurrency(), 
+                                              static_cast<unsigned int>(test_vectors->RowCount()));
+        executor_default_t executor(executor_threads);
+        
+        std::cout << "Starting parallel exact search with " << executor_threads << " threads" << std::endl;
+        
+        auto batch_start = std::chrono::high_resolution_clock::now();
+        
+        executor.fixed(test_vecs.size(), [&](std::size_t thread, std::size_t task) {
+            try {
+                auto& test_vec = test_vecs[task];
+                int test_query_vector_index_int = test_vector_indices[task];
+
+                auto results = index.search(test_vec.data(), 100, thread, true); // Get 100 nearest neighbors
+
+                if(results.size() != 0) {
+                    // Create result value directly
+                    std::vector<Value> id_values;
+                    id_values.reserve(results.size());
+                    
+                    for (std::size_t j = 0; j < results.size(); ++j) {
+                        size_t key = static_cast<size_t>(results[j].member.key);
+                        id_values.push_back(Value::INTEGER(key));
+                    }
+                    
+                    Value result_list_value = Value::LIST(LogicalType::INTEGER, std::move(id_values));
+
+                    // Thread-safe collection of results
+                    {
+                        std::lock_guard<std::mutex> lock(results_mutex);
+                        
+                        // Store neighbor IDs for this vector
+                        // Use task as index to ensure we put values in the right position
+                        if (task >= data.neighbor_ids_values.size()) {
+                            data.neighbor_ids_values.resize(task + 1);
+                        }
+                        data.neighbor_ids_values[task] = result_list_value;
+                    }
+                } else {
+                    std::lock_guard<std::mutex> lock(results_mutex);
+                    std::cerr << "No results returned for test vector " << task << " during exact search" << std::endl;
+                    
+                    // Add an empty entry for this vector
+                    if (task >= data.neighbor_ids_values.size()) {
+                        data.neighbor_ids_values.resize(task + 1);
+                    }
+                    data.neighbor_ids_values[task] = Value();  // Empty value
+                }
+            } catch (const std::exception& e) {
+                std::lock_guard<std::mutex> lock(results_mutex);
+                std::cerr << "Error processing test vector " << task << ": " << e.what() << std::endl;
+            }
+        });
+        
+        auto batch_end = std::chrono::high_resolution_clock::now();
+        auto batch_duration = std::chrono::duration<double>(batch_end - batch_start).count();
+        std::cout << "Parallel exact search completed in " << batch_duration << "s" << std::endl;
+
+    } catch (const std::exception& e) {
+        std::cerr << "Error in parallel exact search: " << e.what() << std::endl;
+    }
+    
+    return data;
+}
+
+/**
  * Runs test queries on the index in parallel
  * 
  * @param con The DuckDB connection
@@ -587,45 +684,31 @@ void IndexOperations::runTestQueries(Connection& con, index_dense_gt<row_t>& ind
  */
 void IndexOperations::parallelRunTestQueries(Connection& con, index_dense_gt<row_t>& index, const std::string& table_name,
     const unique_ptr<MaterializedQueryResult>& test_vectors, Appender& appender, Appender& search_appender, 
-    Appender& early_term_appender, int iteration, int dataset_size) {
+    Appender& early_term_appender, int iteration, int dataset_size, bool get_neighbors) {
     std::cout << "🧪 RUNNING TEST QUERIES 🧪" << std::endl;
 
     try {
         // Extract all test vectors upfront to avoid DB access in threads
         std::vector<std::vector<float>> test_vecs;
-        std::vector<std::vector<size_t>> test_neighbor_ids_vec;
         std::vector<int> test_vector_indices;
         std::vector<Value> neighbor_ids_values;
 
         test_vecs.reserve(test_vectors->RowCount());
-        test_neighbor_ids_vec.reserve(test_vectors->RowCount());
         test_vector_indices.reserve(test_vectors->RowCount());
         neighbor_ids_values.reserve(test_vectors->RowCount());
 
-        for (idx_t i = 0; i < test_vectors->RowCount(); i++) {
-            test_vecs.push_back(ExtractFloatVector(test_vectors->GetValue(1, i)));
-
-            // Extract neighbor IDs and filter to include only those present in the index
-            auto original_neighbors = ExtractSizeVector(test_vectors->GetValue(2, i));
-            std::vector<size_t> filtered_neighbors;
-            filtered_neighbors.reserve(original_neighbors.size());
-            // Filter neighbors to only include IDs that exist in the index
-            for (auto& neighbor_id : original_neighbors) {
-                if (index.contains(neighbor_id)) {
-                    filtered_neighbors.push_back(neighbor_id);
-                }
+        // For new data scenario we have to get the neighbors for each iteration
+        if (get_neighbors) {
+            TestVectorData data = parallelExactSearch(con, index, test_vectors);
+            test_vecs = data.test_vecs;
+            test_vector_indices = data.test_vector_indices;
+            neighbor_ids_values = data.neighbor_ids_values;
+        } else {
+            for (idx_t i = 0; i < test_vectors->RowCount(); i++) {
+                test_vecs.push_back(ExtractFloatVector(test_vectors->GetValue(1, i)));
+                test_vector_indices.push_back(test_vectors->GetValue(0, i).GetValue<int>());
+                neighbor_ids_values.push_back(test_vectors->GetValue(2, i));
             }
-            // Convert filtered neighbors back to DuckDB Value
-            std::vector<Value> filtered_values;
-            filtered_values.reserve(filtered_neighbors.size());
-            for (auto& id : filtered_neighbors) {
-                filtered_values.push_back(Value::INTEGER(id));
-            }
-            // Store the filtered neighbor IDs
-            Value filtered_list_value = Value::LIST(LogicalType::INTEGER, std::move(filtered_values));
-            test_neighbor_ids_vec.push_back(filtered_neighbors);
-            test_vector_indices.push_back(test_vectors->GetValue(0, i).GetValue<int>());
-            neighbor_ids_values.push_back(filtered_list_value);
         }
 
         // Thread-safe containers for results
@@ -645,7 +728,6 @@ void IndexOperations::parallelRunTestQueries(Connection& con, index_dense_gt<row
         executor.fixed(test_vecs.size(), [&](std::size_t thread, std::size_t task) {
             try {
                 auto& test_vec = test_vecs[task];
-                auto& test_neighbor_ids = test_neighbor_ids_vec[task];
                 int test_query_vector_index_int = test_vector_indices[task];
                 const Value& neighbor_ids = neighbor_ids_values[task];
 
