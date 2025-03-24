@@ -1910,9 +1910,6 @@ class index_gt {
         std::default_random_engine level_generator{};
         std::size_t iteration_cycles{};
         std::size_t computed_distances_count{};
-        // std::vector<std::vector<std::size_t>> visited_nodes_at_levels{};
-        // std::size_t start_entry_key{};
-        // std::size_t base_entry_key{};
 
         template <typename value_at, typename metric_at, typename entry_at> //
         inline distance_t measure(value_at const& first, entry_at const& second, metric_at&& metric) noexcept {
@@ -2211,12 +2208,6 @@ class index_gt {
         std::size_t visited_members{};
         /** @brief  Number of times the distances were computed. */
         std::size_t computed_distances{};
-        // /** @brief  Keys of graph nodes traversed at each level. */
-        // std::vector<std::vector<std::size_t>> visited_nodes_at_levels{};
-        // /** @brief  Key of entry point at highest level */
-        // std::size_t start_entry_key{};
-        // /**  @brief Key of entry point at base level */
-        // std::size_t base_entry_key{};
         error_t error{};
 
         inline search_result_t() noexcept {}
@@ -2554,20 +2545,10 @@ class index_gt {
         top.sort_ascending();
         top.shrink(wanted);
 
-        // node_t entry_node = node_at_(entry_slot_.slot);
-        // vector_key_t entry_node_key = entry_node.key();
-
-        // node_t closest_node = node_at_(closest_slot.slot);
-        // vector_key_t closest_node_key = closest_node.key();
-
         // Normalize stats
         result.computed_distances = context.computed_distances_count - result.computed_distances;
         result.visited_members = context.iteration_cycles - result.visited_members;
         result.count = top.size();
-        // Other stats
-        // result.start_entry_key = entry_node_key;
-        // result.base_entry_key = closest_node_key
-        // result.visited_nodes_at_levels = context.visited_nodes_at_levels;
         return result;
     }
 
@@ -3623,28 +3604,17 @@ class index_gt {
         visits_hash_set_t& visits = context.visits;
         visits.clear();
 
-        // std::vector<std::vector<std::size_t>>& visited_nodes_at_levels = context.visited_nodes_at_levels;
-        // visited_nodes_at_levels.clear();
-        // visited_nodes_at_levels.resize(begin_level + 1);
-
-        // std::size_t& start_entry_key = context.start_entry_key;
-        // start_entry_key = 0;
-
         // Optional prefetching
         if (!is_dummy<prefetch_at>())
             prefetch(citerator_at(closest_slot), citerator_at(closest_slot + 1));
 
         distance_t closest_dist = context.measure(query, citerator_at(closest_slot), metric);
-        // start_entry_key = node_at_(closest_slot).key();
         for (level_t level = begin_level; level > end_level; --level) {
             bool changed;
             do {
                 changed = false;
                 node_lock_t closest_lock = node_lock_(closest_slot);
                 neighbors_ref_t closest_neighbors = neighbors_non_base_(node_at_(closest_slot), level);
-                // Add node key to visited at this level
-                // visited_nodes_at_levels[level].push_back(node_at_(closest_slot).key());
-
                 // Optional prefetching
                 if (!is_dummy<prefetch_at>()) {
                     candidates_range_t missing_candidates{*this, closest_neighbors, visits};
@@ -3754,10 +3724,7 @@ class index_gt {
         next_candidates_t& next = context.next_candidates; // pop min, push
         top_candidates_t& top = context.top_candidates;    // pop max, push
         std::size_t const top_limit = expansion;
-        // std::vector<std::vector<std::size_t>>& visited_nodes_at_levels = context.visited_nodes_at_levels;
-        // std::size_t& base_entry_key = context.base_entry_key;
 
-        // base_entry_key = 0;
         visits.clear();
         next.clear();
         top.clear();
@@ -3772,7 +3739,6 @@ class index_gt {
         usearch_assert_m(next.capacity(), "The `max_heap_gt` must have been reserved in the search entry point");
         next.insert_reserved({-radius, static_cast<compressed_slot_t>(start_slot)});
         visits.set(static_cast<compressed_slot_t>(start_slot));
-        // base_entry_key = node_at_(start_slot).key();
 
         // Don't populate the top list if the predicate is not satisfied
         if (is_dummy<predicate_at>() || predicate(member_cref_t{node_at_(start_slot).ckey(), start_slot})) {
@@ -3824,26 +3790,6 @@ class index_gt {
                     radius = top.top().distance;
                 }
             }
-
-            // visits.for_each([&](compressed_slot_t visited_slot) {
-            //     visited_nodes_at_levels[0].push_back(node_at_(visited_slot).key());
-            // });
-
-            // // Debugging local minima - after processing neighbors
-            // if (next.size() == 0 && top.size() < top_limit) {
-            //     std::cout << "Local minimum detected after " << context.iteration_cycles << " iterations!" << std::endl;
-            //     std::cout << "  - Results found: " << top.size() << "/" << top_limit << std::endl;
-
-            //     node_t candidate_ref = node_at_(candidate.slot);
-            //     vector_key_t candidate_key = candidate_ref.key();
-
-            //     std::cout << top.size() << ", " << top_limit << ", " << context.iteration_cycles << ", "  << visits.size() << ", " << candidate_key << ", " << candidate_neighbors.size() << std::endl;
-            //     // Append stats to csv for early terminated run
-            //     std::ofstream csv_file("base_layer_early_termination.csv", std::ios::app);
-            //     // top n neighbors, top limit, iteration cycles, visits, last node expanded, nr of candidate neighbors of last node 
-            //     csv_file << top.size() << "," << top_limit << "," << context.iteration_cycles << ","  << visits.size() << "," << candidate_key << "," << candidate_neighbors.size() << std::endl;
-            //     csv_file.close();
-            // }
         }
 
         return true;
