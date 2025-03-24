@@ -1,8 +1,6 @@
-.PHONY: clean prepare-build duckdb-vss duckdb-vss-debug bm_performance recall recall-debug
+.PHONY: clean prepare-build duckdb-vss duckdb-vss-debug bm_performance recall recall-debug usearch_random usearch_full_coverage usearch_new_data
 
-all: duckdb-vss recall
-
-all-debug: duckdb-vss-debug recall-debug
+all-usearch: usearch_full_coverage usearch_random usearch_new_data
 
 clean:
 	rm -rf build
@@ -16,14 +14,14 @@ duckdb-vss:
 duckdb-vss-debug:
 	cd ../ && make debug
 
-bm_performance: clean prepare-build
+usearch_random: clean prepare-build
 	cd build && cmake .. && make
-	build/benchmark_deletions --benchmark_out=bm_delete_insert.json --benchmark_out_format=json
+	build/usearch_random
 
-recall: clean prepare-build
+usearch_full_coverage: clean prepare-build
 	cd build && cmake .. && make
-	build/recall
+	build/usearch_full_coverage
 
-recall-debug: clean prepare-build
-	cd build && cmake -DCMAKE_BUILD_TYPE=Debug .. && make
-	build/recall
+usearch_new_data: clean prepare-build
+	cd build && cmake .. && make
+	build/usearch_new_data
