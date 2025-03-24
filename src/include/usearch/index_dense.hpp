@@ -1470,7 +1470,8 @@ class index_dense_gt {
 
         csv_file.close();
     
-        typed_->log_links(std::forward<executor_at>(executor), std::forward<progress_at>(progress));
+        metric_proxy_t metric{*this};
+        typed_->log_links(metric, std::forward<executor_at>(executor), std::forward<progress_at>(progress));
     }
 
     /**

@@ -3166,12 +3166,14 @@ class index_gt {
 
     /**
      *  @brief  Logs unreachable and isolated nodes with level-specific connectivity metrics.
+     *          Also logs distance statistics between connected nodes per level.
      *
      *  @param[in] executor Thread-pool to execute the job in parallel.
      *  @param[in] progress Callback to report the execution progress.
      */
-    template <typename executor_at = dummy_executor_t, typename progress_at = dummy_progress_t>
-    void log_links(executor_at&& executor = executor_at{}, progress_at&& progress = progress_at{}) noexcept {
+    template <typename metric_at, typename executor_at = dummy_executor_t, typename progress_at = dummy_progress_t>
+    void log_links(metric_at&& metric, executor_at&& executor = executor_at{}, progress_at&& progress = progress_at{}) noexcept {
+        
         // Progress status
         std::atomic<bool> do_tasks{true};
         std::atomic<std::size_t> processed{0};
@@ -3190,9 +3192,21 @@ class index_gt {
         // Track per-level connectivity
         std::vector<std::atomic<std::size_t>> level_connections(max_level() + 1);
         std::vector<std::atomic<std::size_t>> level_node_counts(max_level() + 1);
-
+        
+        // Track per-level distance statistics
+        struct level_distance_stats_t {
+            std::mutex mutex;
+            std::vector<double> min_distances;
+            std::vector<double> max_distances;
+            std::vector<double> sum_distances;
+            std::vector<size_t> distance_counts;
+        };
+        
+        std::vector<level_distance_stats_t> level_distance_stats(max_level() + 1);
+        
         std::size_t nodes_count = size();
         executor.dynamic(nodes_count, [&](std::size_t thread_idx, std::size_t node_idx) {
+            context_t& context = contexts_[thread_idx];
             node_t node = node_at_(node_idx);
             std::size_t local_out_edges = 0; // Track local counts
             
@@ -3222,14 +3236,36 @@ class index_gt {
                 local_out_edges += connections;
                 total_connections += connections;
                 
-                // Record incoming edges for each neighbor, tracking the level
-                for (std::size_t j = 0; j < neighbors.size(); j++) {
-                    compressed_slot_t neighbor_slot = neighbors[j];
+                // Calculate distances to neighbors
+                if (connections > 0) {
+                    distance_t min_distance = std::numeric_limits<distance_t>::max();
+                    distance_t max_distance = 0.0;
+                    double sum_distance = 0.0;  // Keep this as double for precision in the sum
                     
-                    // Update in_edges count with mutex protection
+                    for (std::size_t j = 0; j < neighbors.size(); j++) {
+                        compressed_slot_t neighbor_slot = neighbors[j];
+                        
+                        // Calculate distance
+                        distance_t distance = context.measure(citerator_at(neighbor_slot), citerator_at(node_idx), metric);
+
+                        min_distance = std::min(min_distance, distance);
+                        max_distance = std::max(max_distance, distance);
+                        sum_distance += distance;
+                        
+                        // Update in_edges count with mutex protection
+                        {
+                            std::lock_guard<std::mutex> lock(map_mutex);
+                            in_edges_per_level[level][neighbor_slot]++;
+                        }
+                    }
+                    
+                    // Store the distance stats for this node at this level
                     {
-                        std::lock_guard<std::mutex> lock(map_mutex);
-                        in_edges_per_level[level][neighbor_slot]++;
+                        std::lock_guard<std::mutex> lock(level_distance_stats[level].mutex);
+                        level_distance_stats[level].min_distances.push_back(static_cast<double>(min_distance));
+                        level_distance_stats[level].max_distances.push_back(static_cast<double>(max_distance));
+                        level_distance_stats[level].sum_distances.push_back(sum_distance);
+                        level_distance_stats[level].distance_counts.push_back(connections);
                     }
                 }
             }
@@ -3249,12 +3285,44 @@ class index_gt {
         // Output per-level connectivity statistics
         std::vector<double> avg_connections_per_level;
         std::vector<std::size_t> level_node_count_values;
+        
+        // Compute aggregate distance statistics per level
+        std::vector<double> min_distance_per_level;
+        std::vector<double> max_distance_per_level;
+        std::vector<double> avg_distance_per_level;
+        
         for (level_t level = 0; level <= max_level(); ++level) {
             std::size_t level_node_count = level_node_counts[level].load();
             level_node_count_values.push_back(level_node_count);
             double avg_connections = level_node_count > 0 ? 
                 (double)level_connections[level].load() / level_node_count : 0;
             avg_connections_per_level.push_back(avg_connections);
+            
+            // Process distance statistics
+            double level_min_distance = std::numeric_limits<double>::max();
+            double level_max_distance = 0.0;
+            double level_total_distance = 0.0;
+            size_t level_total_connections = 0;
+            
+            // Find global min/max and sum for this level
+            for (size_t i = 0; i < level_distance_stats[level].min_distances.size(); i++) {
+                level_min_distance = std::min(level_min_distance, level_distance_stats[level].min_distances[i]);
+                level_max_distance = std::max(level_max_distance, level_distance_stats[level].max_distances[i]);
+                level_total_distance += level_distance_stats[level].sum_distances[i];
+                level_total_connections += level_distance_stats[level].distance_counts[i];
+            }
+            
+            // Guard against division by zero
+            double level_avg_distance = level_total_connections > 0 ? 
+                level_total_distance / level_total_connections : 0;
+            
+            // Handle edge case of no connections
+            if (level_min_distance == std::numeric_limits<double>::max())
+                level_min_distance = 0;
+            
+            min_distance_per_level.push_back(level_min_distance);
+            max_distance_per_level.push_back(level_max_distance);
+            avg_distance_per_level.push_back(level_avg_distance);
         }
 
         // Count nodes without incoming edges at ANY level
@@ -3304,11 +3372,9 @@ class index_gt {
             unreachable_per_level.push_back(level_unreachable);
         }
 
-        // TODO: Add these as tructured output / attributes of index class and use this func to update
         // Append statistics to CSV
         std::ofstream csv_file("node_connectivity.csv", std::ios::app);
         
-        // TODO: Also add header row if amount of levels in index has changed (ensure # of columns match)
         // Add header if file is new/empty
         std::ifstream test_file("node_connectivity.csv");
         bool file_exists_with_content = test_file.peek() != std::ifstream::traits_type::eof();
@@ -3332,6 +3398,19 @@ class index_gt {
                 csv_file << ",nodes_l" << level;
             }
             
+            // Add per-level distance columns
+            for (level_t level = 0; level <= max_level(); ++level) {
+                csv_file << ",min_dist_l" << level;
+            }
+            
+            for (level_t level = 0; level <= max_level(); ++level) {
+                csv_file << ",avg_dist_l" << level;
+            }
+            
+            for (level_t level = 0; level <= max_level(); ++level) {
+                csv_file << ",max_dist_l" << level;
+            }
+            
             csv_file << std::endl;
         }
         
@@ -3352,6 +3431,19 @@ class index_gt {
         // Add per-level node count values
         for (auto node_count : level_node_count_values) {
             csv_file << "," << node_count;
+        }
+        
+        // Add per-level distance values
+        for (auto min_dist : min_distance_per_level) {
+            csv_file << "," << min_dist;
+        }
+        
+        for (auto avg_dist : avg_distance_per_level) {
+            csv_file << "," << avg_dist;
+        }
+        
+        for (auto max_dist : max_distance_per_level) {
+            csv_file << "," << max_dist;
         }
 
         csv_file << std::endl;
