@@ -11,11 +11,7 @@ results.db
 python/data/raw/*.hdf5
 .editorconfig
 .vscode
-python/plots
 
-python/data/results/
-
-embedded-c++/*.csv
 .venv
 *.csv
 *.pyc
@@ -29,5 +25,4 @@ embedded-c++/*.csv
 .vscode/*
 /docs/site/*
 .mypy_cache
-.venv
 /poetry.toml
