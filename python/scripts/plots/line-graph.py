@@ -54,7 +54,7 @@ def plot_line_csv_graphs(dataset_folder):
 def main():
     # Example usage
     # File path to the CSV data
-    csv_filepath = "data/results/"  # Update this to your file path
+    csv_filepath = "../embedded-c++/usearch/results/"
     experiments = ["fullcoverage", "newdata", "random"]
     
 
