@@ -26,3 +26,4 @@ python/data/raw/*.hdf5
 /docs/site/*
 .mypy_cache
 /poetry.toml
+*.png
