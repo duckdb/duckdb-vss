@@ -574,7 +574,6 @@ void HNSWLibIndexOperations::parallelRunTestQueries(Connection& con, Hierarchica
                                                 static_cast<unsigned int>(test_vectors->RowCount()));
         
         
-        std::cout << "Starting parallel search with " << executor_threads << " threads" << std::endl;
         
         auto batch_start = std::chrono::high_resolution_clock::now();
         
@@ -588,7 +587,6 @@ void HNSWLibIndexOperations::parallelRunTestQueries(Connection& con, Hierarchica
         std::cout << "Parallel search completed in " << batch_duration << "s" << std::endl;
 
         // Bulk append all results
-        std::cout << "Appending " << search_results.size() << " search results" << std::endl;
         for (const auto& result : search_results) {
             try {
                 appender.AppendRow(

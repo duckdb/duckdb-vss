@@ -52,7 +52,6 @@ HNSWLibRandomRunner(int iterations = 200, int threads = 64) : db(nullptr), con(d
 
             auto dataset_cardinality = con.Query("SELECT COUNT(*) FROM " + dataset.name + "_train;")->GetValue<int64_t>(0, 0);
             L2Space space(dataset.dimensions);
-            std::cout << "Dataset size: " << dataset_cardinality << std::endl;
             HierarchicalNSW<float> index(&space, dataset_cardinality, dataset.m, dataset.ef_construction, 100, true);
 
             std::vector<int> ids;
@@ -80,7 +79,6 @@ HNSWLibRandomRunner(int iterations = 200, int threads = 64) : db(nullptr), con(d
             };
 
             std::unordered_map<size_t, size_t> index_map;
-            std::cout << "Mapping index of size " << ids.size() << std::endl;
             for (size_t i = 0; i < ids.size(); ++i) {
                 index_map[i] = ids[i];
             }
@@ -131,10 +129,6 @@ HNSWLibRandomRunner(int iterations = 200, int threads = 64) : db(nullptr), con(d
                 }
 
                 std::vector<size_t> delete_indices(delete_indices_set.begin(), delete_indices_set.end());
-
-
-                std::cout << "size of test_vectors is: " << dataset_vectors->RowCount() << std::endl;
-
 
                 std::vector<std::vector<float>> deleted_vectors(delete_indices.size(), std::vector<float>(dataset.dimensions));
 

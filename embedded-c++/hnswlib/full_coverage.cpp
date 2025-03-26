@@ -50,7 +50,6 @@ HNSWLibFullCoverageRunner(int iterations = 100, int threads = 8) : db(nullptr), 
 
             auto dataset_cardinality = con.Query("SELECT COUNT(*) FROM " + dataset.name + "_train;")->GetValue<int64_t>(0, 0);
             L2Space space(dataset.dimensions);
-            std::cout << "Dataset size: " << dataset_cardinality << std::endl;
             HierarchicalNSW<float> index(&space, dataset_cardinality, dataset.m, dataset.ef_construction, 100, true);
             
             std::vector<int> ids;
@@ -60,7 +59,6 @@ HNSWLibFullCoverageRunner(int iterations = 100, int threads = 8) : db(nullptr), 
 
             auto dataset_vectors = con.Query("SELECT * FROM " + dataset.name + "_train;");
         
-            std::cout << "Adding vectors from duckdb database..." << std::endl;
             for (idx_t i = 0; i < dataset_cardinality; i++) {
                 ids.push_back(dataset_vectors->GetValue<int>(0, i));
                 vectors.push_back(ExtractFloatVector(dataset_vectors->GetValue(1, i)));
@@ -77,7 +75,6 @@ HNSWLibFullCoverageRunner(int iterations = 100, int threads = 8) : db(nullptr), 
                 }
             };
             std::unordered_map<size_t, size_t> index_map;
-            std::cout << "Mapping index of size " << ids.size() << std::endl;
             for (size_t i = 0; i < ids.size(); ++i) {
                 index_map[i] = ids[i];
             }
@@ -119,7 +116,6 @@ HNSWLibFullCoverageRunner(int iterations = 100, int threads = 8) : db(nullptr), 
                 std::vector<size_t> delete_indices(delete_indices_set.begin(), delete_indices_set.end());
 
 
-                std::cout << "size of test_vectors is: " << dataset_vectors->RowCount() << std::endl;
                 // save the vectors being deleted before deleting them
                 std::vector<std::vector<float>> deleted_vectors(delete_indices.size(), std::vector<float>(dataset.dimensions));
                 for (size_t i = 0; i < delete_indices.size(); ++i) {

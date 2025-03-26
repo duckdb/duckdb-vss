@@ -52,7 +52,6 @@ HNSWLibNewDataRunner(int iterations = 100, int threads = 64) : db(nullptr), con(
 
             auto dataset_cardinality = con.Query("SELECT COUNT(*) FROM " + dataset.name + "_train;")->GetValue<int64_t>(0, 0);
             L2Space space(dataset.dimensions);
-            std::cout << "Dataset size: " << dataset_cardinality << std::endl;
             HierarchicalNSW<float> index(&space, dataset_cardinality, dataset.m, dataset.ef_construction, 100, true);
 
             // Partition dataset into 20
@@ -91,7 +90,6 @@ HNSWLibNewDataRunner(int iterations = 100, int threads = 64) : db(nullptr), con(
             }
 
             std::unordered_map<size_t, size_t> index_map;
-            std::cout << "Mapping index of size " << ids.size() << std::endl;
             for (size_t i = 0; i < ids.size(); ++i) {
                 index_map[i] = ids[i];
             }
