@@ -145,7 +145,7 @@ HNSWLibNewDataRunner(int iterations = 100, int threads = 64) : db(nullptr), con(
              
 
                 // Run test queries (multi-threaded)
-                HNSWLibIndexOperations::parallelRunTestQueries(con, index, dataset.name, test_vectors, appender, search_bm_appender, early_termination_appender, 0, dataset_cardinality, index_map);
+                HNSWLibIndexOperations::parallelRunTestQueries(con, index, dataset.name, test_vectors, appender, search_bm_appender, early_termination_appender, iteration, dataset_cardinality, index_map);
 
 
                 std::cout << "✅ FINISHED ITERATION " << iteration << " ✅" << std::endl;
@@ -212,16 +212,16 @@ int main() {
         fm_runner.runTest(0);
 
         // mnist
-        HNSWLibNewDataRunner m_runner(max_iterations, threads);
-        m_runner.runTest(1);
+        //HNSWLibNewDataRunner m_runner(max_iterations, threads);
+        //m_runner.runTest(1);
 
-        // sift
-        HNSWLibNewDataRunner s_runner(max_iterations, threads);
-        s_runner.runTest(2);
+          // sift
+        //HNSWLibRandomRunner s_runner(max_iterations, threads);
+        //s_runner.runTest(2);
 
         // gist
-        HNSWLibNewDataRunner g_runner(max_iterations, threads);
-        g_runner.runTest(3);
+        //HNSWLibRandomRunner g_runner(max_iterations, threads);
+        //g_runner.runTest(3);
 
         return 0;
     } catch (std::exception& e) {

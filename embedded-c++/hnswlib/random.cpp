@@ -225,16 +225,16 @@ int main() {
         fm_runner.runTest(0);
 
         // mnist
-        HNSWLibRandomRunner m_runner(max_iterations, threads);
-        m_runner.runTest(1);
+        //HNSWLibRandomRunner m_runner(max_iterations, threads);
+        //m_runner.runTest(1);
 
         // sift
-        HNSWLibRandomRunner s_runner(max_iterations, threads);
-        s_runner.runTest(2);
+        //HNSWLibRandomRunner s_runner(max_iterations, threads);
+        //s_runner.runTest(2);
 
         // gist
-        HNSWLibRandomRunner g_runner(max_iterations, threads);
-        g_runner.runTest(3);
+        //HNSWLibRandomRunner g_runner(max_iterations, threads);
+        //g_runner.runTest(3);
 
         return 0;
     } catch (std::exception& e) {

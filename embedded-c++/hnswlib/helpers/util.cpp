@@ -28,17 +28,20 @@ void util::query_hnsw(hnswlib::HierarchicalNSW<float>& alg_hnsw, const std::vect
             auto duration = std::chrono::duration<double>(end_time - start_time).count();
         
             unique_ptr<MaterializedQueryResult> result_ids = nullptr;
+
+            // add for each neighbor_ids map it onto the correct idx
+
+
+            //ADD CODE HERE FOR THIS TODO: 
             
             if(result.neighbors.size() != 0) {
                 std::vector<size_t> result_vec_ids;
                 result_vec_ids.reserve(result.neighbors.size());
 
-                std::cout << "Results size: " << result.neighbors.size() << std::endl;
                 auto neighbors_size = result.neighbors.size();
                 for (std::size_t j = 0; j < neighbors_size; ++j) {
                     size_t key = static_cast<size_t>(result.neighbors.top().second);
                     result.neighbors.pop();
-                    std::cout << j << ". Neighboor ID: " << key << std::endl;
                     result_vec_ids.push_back(key);
                 }
                 results[row] = result_vec_ids;
@@ -52,7 +55,6 @@ void util::query_hnsw(hnswlib::HierarchicalNSW<float>& alg_hnsw, const std::vect
                 for (std::size_t j = 0; j < result_vec_ids.size(); ++j) {
                     size_t key = static_cast<size_t>(result_vec_ids[j]);
                     // get original key from index_map
-                    id_values.push_back(Value::INTEGER(key));
                 }
                 
                 result_list_value =  Value::LIST(LogicalType::INTEGER, std::move(id_values));
