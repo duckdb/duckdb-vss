@@ -200,7 +200,7 @@ int main() {
      * and performance.
      */
     
-    int max_iterations = 100;
+    int max_iterations = 2;
     int threads = 8;
 
     try {

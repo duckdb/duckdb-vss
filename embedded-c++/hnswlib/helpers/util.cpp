@@ -55,6 +55,7 @@ void util::query_hnsw(hnswlib::HierarchicalNSW<float>& alg_hnsw, const std::vect
                 for (std::size_t j = 0; j < result_vec_ids.size(); ++j) {
                     size_t key = static_cast<size_t>(result_vec_ids[j]);
                     // get original key from index_map
+                    id_values.push_back(Value::INTEGER(key));
                 }
                 
                 result_list_value =  Value::LIST(LogicalType::INTEGER, std::move(id_values));

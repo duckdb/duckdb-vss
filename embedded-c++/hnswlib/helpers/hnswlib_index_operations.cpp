@@ -555,7 +555,8 @@ void HNSWLibIndexOperations::parallelRunTestQueries(Connection& con, Hierarchica
             std::vector<Value> filtered_values;
             filtered_values.reserve(filtered_neighbors.size());
             for (auto& id : filtered_neighbors) {
-                filtered_values.push_back(Value::INTEGER(id));
+                auto idx = index_map.at(id);
+                filtered_values.push_back(Value::INTEGER(idx));
             }
             // Store the filtered neighbor IDs
             Value filtered_list_value = Value::LIST(LogicalType::INTEGER, std::move(filtered_values));
