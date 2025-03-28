@@ -68,8 +68,9 @@ HNSWLibNewDataRunner(int iterations = 100, int threads = 64) : db(nullptr), con(
             ids.reserve(half_count);
             vectors.reserve(half_count);
 
+            std::cout << "🔍 POPULATING INDEX WITH FIRST HALF 🔍" << std::endl;
             // Populate index with first half
-            for (idx_t i = 0; i < 10; i++) {
+            for (idx_t i = 0; i < 20; i++) {
                 auto& partition = partitions[i];
                 for (idx_t j = 0; j < partition->RowCount(); j++) {
                     ids.push_back(partition->GetValue<int>(0, j));
@@ -77,23 +78,28 @@ HNSWLibNewDataRunner(int iterations = 100, int threads = 64) : db(nullptr), con(
                 }
             }
 
-            for (std::size_t task = 0; task < half_count; ++task) {
+            for (std::size_t task = 0; task < dataset_cardinality; ++task) {             
                 try {
                     int id = ids[task];
                     auto& vec = vectors[task];
-                    
-                    index.addPoint(vec.data(), id);
+                    if (task < half_count){
+                        index.addPoint(vec.data(), id);
+                    }
                 }
                 catch (const std::exception& e) {
                     std::cerr << "Error adding vector " << task << ": " << e.what() << std::endl;
                 }
             }
+            
+            
 
             std::unordered_map<size_t, size_t> index_map;
             for (size_t i = 0; i < ids.size(); ++i) {
                 index_map[i] = ids[i];
             }
                           
+            // Log initial index stats
+            index.log_links();
 
             // Get test vectors
             auto test_vectors = con.Query("SELECT * FROM " + dataset.name + "_test;");
@@ -111,7 +117,7 @@ HNSWLibNewDataRunner(int iterations = 100, int threads = 64) : db(nullptr), con(
 
             // Run iteration
             
-            for (int iteration = 1; iteration <= 10; iteration++) {
+            for (int iteration = 1; iteration <= max_iterations; iteration++) {
                 std::cout << "▶️ ITERATION " << iteration << " ▶️" << std::endl;
 
                 // Get vectors from partition
@@ -142,7 +148,7 @@ HNSWLibNewDataRunner(int iterations = 100, int threads = 64) : db(nullptr), con(
                     iteration, add_bm_appender, threads);
 
                 // Log index stats
-             
+                index.log_links();
 
                 // Run test queries (multi-threaded)
                 HNSWLibIndexOperations::parallelRunTestQueries(con, index, dataset.name, test_vectors, appender, search_bm_appender, early_termination_appender, iteration, dataset_cardinality, index_map);
@@ -203,7 +209,7 @@ int main() {
      * The final index consists of the second half data points.
      */
     
-    int max_iterations = 10;
+    int max_iterations = 1;
     int threads = 32;
 
     try {

@@ -10,6 +10,10 @@
 #include <list>
 #include <memory>
 
+
+#include <shared_mutex> // `std::shared_mutex`
+
+
 namespace hnswlib {
 typedef unsigned int tableint;
 typedef unsigned int linklistsizeint;
@@ -1266,6 +1270,119 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         return cur_c;
     }
 
+    template <typename executor_at = std::function<void(std::function<void()>)>, 
+          typename progress_at = std::function<void(size_t, size_t)>>
+void log_links(executor_at&& executor = [](auto f) { f(); }, 
+               progress_at&& progress = [](size_t, size_t) {}) {
+    // Use the first label operation lock for synchronization
+    std::lock_guard<std::mutex> lock(label_op_locks_[0]);
+
+    // Collect memory and index statistics directly from existing members
+    size_t index_size = cur_element_count;
+    size_t index_capacity = max_elements_;
+    size_t num_deleted = num_deleted_;
+    
+    // Estimate memory usage based on existing memory allocations
+    size_t index_mem_usage = 0;
+    
+    // Memory for level 0 data
+    index_mem_usage += max_elements_ * size_data_per_element_;
+    
+    // Memory for link lists
+    for (tableint i = 0; i < cur_element_count; i++) {
+        if (element_levels_[i] > 0) {
+            index_mem_usage += size_links_per_element_;
+        }
+    }
+
+    // Open CSV file for appending
+    std::ofstream csv_file("hnswlib_memory_stats.csv", std::ios::app);
+    
+    // Check if file is empty and add header if needed
+    std::ifstream test_file("hnswlib_memory_stats.csv");
+    bool file_exists_with_content = test_file.peek() != std::ifstream::traits_type::eof();
+    test_file.close();
+    
+    if (!file_exists_with_content) {
+        csv_file << "timestamp,index_size,index_capacity,num_deleted,index_mem_usage,max_level,ef_construction" << std::endl;
+    }
+    
+    // Write the data row with timestamp
+    auto now = std::chrono::system_clock::now();
+    auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()
+    ).count();
+    
+    csv_file << timestamp << "," 
+             << index_size << "," 
+             << index_capacity << "," 
+             << num_deleted << "," 
+             << index_mem_usage << "," 
+             << maxlevel_ << "," 
+             << ef_construction_ << std::endl;
+    
+    csv_file.close();
+
+    // Optional: Analyze graph structure
+    executor([this, &progress]() {
+        size_t total_connections = 0;
+        size_t max_connections_per_element = 0;
+        size_t non_zero_level_elements = 0;
+
+        // Open graph stats file
+        std::ofstream graph_stats_file("hnswlib_graph_stats.csv", std::ios::app);
+        
+        // Check if file is empty and add header if needed
+        std::ifstream graph_test_file("hnswlib_graph_stats.csv");
+        bool graph_file_exists_with_content = graph_test_file.peek() != std::ifstream::traits_type::eof();
+        graph_test_file.close();
+        
+        if (!graph_file_exists_with_content) {
+            graph_stats_file << "timestamp,total_connections,max_connections_per_element,avg_connections_per_element,elements_with_multilevel" << std::endl;
+        }
+
+        // Analyze connections
+        for (tableint i = 0; i < cur_element_count; i++) {
+            size_t element_connections = 0;
+            
+            // Check level 0 connections
+            linklistsizeint* ll_size = (linklistsizeint*)(linkLists_[i]);
+            if (ll_size && *ll_size > 0) {
+                element_connections = *ll_size;
+                total_connections += element_connections;
+                max_connections_per_element = std::max(max_connections_per_element, element_connections);
+            }
+
+            // Count multi-level elements
+            if (element_levels_[i] > 0) {
+                non_zero_level_elements++;
+            }
+            
+            // Optional progress reporting
+            if (progress) {
+                progress(i, cur_element_count);
+            }
+        }
+
+        // Calculate average connections
+        double avg_connections = total_connections / static_cast<double>(std::max(1UL, static_cast<size_t>(cur_element_count)));
+
+        // Write graph structure stats
+        auto now = std::chrono::system_clock::now();
+        auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch()
+        ).count();
+
+        graph_stats_file << timestamp << "," 
+                         << total_connections << "," 
+                         << max_connections_per_element << "," 
+                         << avg_connections << "," 
+                         << non_zero_level_elements << std::endl;
+        
+        graph_stats_file.close();
+    });
+}
+
     
 
     typename AlgorithmInterface<dist_t>::KnnSearchResult 
@@ -1424,5 +1541,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         }
         std::cout << "integrity ok, checked " << connections_checked << " connections\n";
     }
+
+
+    
 };
 }  // namespace hnswlib

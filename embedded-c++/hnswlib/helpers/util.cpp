@@ -122,7 +122,8 @@ void util::query_hnsw(hnswlib::HierarchicalNSW<float>& alg_hnsw, const std::vect
                     iteration,
                     duration
                 });
-                
+            if (result.neighbors.size() < 100) {
+
                 early_term_results.push_back({
                     table_name,
                     iteration,
@@ -134,6 +135,7 @@ void util::query_hnsw(hnswlib::HierarchicalNSW<float>& alg_hnsw, const std::vect
                     result.visited_members,
                     result.count
                 });
+            }
             }
         } catch (const std::exception& e) {
             std::lock_guard<std::mutex> lock(results_mutex);
