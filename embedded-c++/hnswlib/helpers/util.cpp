@@ -29,10 +29,6 @@ void util::query_hnsw(hnswlib::HierarchicalNSW<float>& alg_hnsw, const std::vect
         
             unique_ptr<MaterializedQueryResult> result_ids = nullptr;
 
-            // add for each neighbor_ids map it onto the correct idx
-
-
-            //ADD CODE HERE FOR THIS TODO: 
             
             if(result.neighbors.size() != 0) {
                 std::vector<size_t> result_vec_ids;
@@ -89,20 +85,21 @@ void util::query_hnsw(hnswlib::HierarchicalNSW<float>& alg_hnsw, const std::vect
 
                     // Handle early termination case
                     if (result.neighbors.size() < 100) {
-                        early_term_results.push_back({
-                            table_name,
-                            iteration,
-                            test_query_vector_index_int,
-                            neighbor_ids,
-                            result_list_value,
-                            Value::FLOAT(0.0), // recall (calculated later)
-                            result.computed_distances,
-                            result.visited_members,
-                            result.count
-                        });
+                            early_term_results.push_back({
+                                table_name,
+                                iteration,
+                                test_query_vector_index_int,
+                                neighbor_ids,
+                                result_list_value,
+                                Value::FLOAT(0.0), // recall (calculated later)
+                                result.computed_distances,
+                                result.visited_members,
+                                result.count
+                            });
                     }
                 }
             } else {
+                std::cout << "0 results returned" << std::endl;
                 // Handle empty results case
                 std::lock_guard<std::mutex> lock(results_mutex);
                 search_results.push_back({
@@ -123,7 +120,6 @@ void util::query_hnsw(hnswlib::HierarchicalNSW<float>& alg_hnsw, const std::vect
                     duration
                 });
             if (result.neighbors.size() < 100) {
-
                 early_term_results.push_back({
                     table_name,
                     iteration,

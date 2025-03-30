@@ -546,11 +546,14 @@ void HNSWLibIndexOperations::parallelRunTestQueries(Connection& con, Hierarchica
             filtered_neighbors.reserve(original_neighbors.size());
             // Filter neighbors to only include IDs that exist in the index
             for (auto& neighbor_id : original_neighbors) {
-                if (index.getDataByInternalId(neighbor_id)) {
+                auto idx = index_map.at(neighbor_id);
+                auto label = index.label_lookup_.find(static_cast<hnswlib::labeltype>(idx));
+                if (label != index.label_lookup_.end()) {
                     auto idx = index_map.find(neighbor_id);
                     filtered_neighbors.push_back(idx->first);
                 }
             }
+
             // Convert filtered neighbors back to DuckDB Value
             std::vector<Value> filtered_values;
             filtered_values.reserve(filtered_neighbors.size());
@@ -610,6 +613,9 @@ void HNSWLibIndexOperations::parallelRunTestQueries(Connection& con, Hierarchica
         if (early_term_results.size() > 0) {
             std::cout << "Appending " << early_term_results.size() << " early termination results" << std::endl;
             for (const auto& result : early_term_results) {
+                
+                
+                
                 try {
                     early_term_appender.AppendRow(
                         Value(std::get<0>(result)),                // dataset name

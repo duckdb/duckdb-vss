@@ -81,7 +81,7 @@ void DatabaseSetup::initializeBMTable(Connection& con, const std::string& table_
 void DatabaseSetup::intializeEarlyTermTable(Connection& con) {
     std::string results_query = "CREATE OR REPLACE TABLE early_terminated_queries (" +
             std::string("dataset VARCHAR, iteration INT, test_vec_id INT, ") +
-            std::string("neighbor_vec_ids INTEGER[100], result_vec_ids INTEGER[], recall FLOAT, ") +
+            std::string("neighbor_vec_ids INTEGER[], result_vec_ids INTEGER[], recall FLOAT, ") +
             std::string("computed_distances INT, visited_members INT, results_count INT);");
     con.Query(results_query);
 }
