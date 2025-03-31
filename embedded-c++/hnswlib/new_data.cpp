@@ -46,22 +46,14 @@ HNSWLibNewDataRunner(int iterations = 100, int threads = 64) : db(nullptr), con(
             DatabaseSetup::intializeEarlyTermTable(con);
             DatabaseSetup::setupFullDataset(con, dataset);
 
-           
-
             // Create the hnswlib index
-
             auto dataset_cardinality = con.Query("SELECT COUNT(*) FROM " + dataset.name + "_train;")->GetValue<int64_t>(0, 0);
             L2Space space(dataset.dimensions);
             HierarchicalNSW<float> index(&space, dataset_cardinality, dataset.m, dataset.ef_construction, 100, true);
 
             // Partition dataset into 20
             auto partitions = QueryRunner::partitionDataset(con, dataset.name, 20);
-
             auto half_count = dataset_cardinality / 2;
-
-            
-            
-            
 
             std::vector<int> ids;
             std::vector<std::vector<float>> vectors;
@@ -91,16 +83,15 @@ HNSWLibNewDataRunner(int iterations = 100, int threads = 64) : db(nullptr), con(
                 }
             }
             
-            
-
             std::unordered_map<size_t, size_t> index_map;
             for (size_t i = 0; i < ids.size(); ++i) {
                 index_map[i] = ids[i];
             }
-                          
-            // Log initial index stats
-            index.log_links();
-
+                        
+             // Log initial index stats
+             index.log_memory_stats();
+             index.log_connectivity_stats(&space);
+            
             // Get test vectors
             auto test_vectors = con.Query("SELECT * FROM " + dataset.name + "_test;");
             auto test_vectors_count = test_vectors->RowCount();
@@ -124,19 +115,15 @@ HNSWLibNewDataRunner(int iterations = 100, int threads = 64) : db(nullptr), con(
                 auto& partitions_to_remove = partitions[iteration-1];
                 auto& partitions_to_add = partitions[9 + iteration];
 
-
                 std::vector<size_t> delete_indices;
                 for (idx_t i = 0; i < partitions_to_remove->RowCount(); i++) {
                     delete_indices.push_back(partitions_to_remove->GetValue<int>(0, i));
                 }
 
-                
-                
                 // Delete vectors from first half
                 size_t removed = HNSWLibIndexOperations::singleRemove(index, delete_indices, index_map, dataset.name, 
                                                           iteration, del_bm_appender);
                 
-
                 std::vector<size_t> new_indices(partitions_to_add->RowCount());
                 std::vector<std::vector<float>> new_vectors;
                 for (idx_t i = 0; i < partitions_to_add->RowCount(); i++) {
@@ -148,11 +135,11 @@ HNSWLibNewDataRunner(int iterations = 100, int threads = 64) : db(nullptr), con(
                     iteration, add_bm_appender, threads);
 
                 // Log index stats
-                index.log_links();
-
+                index.log_memory_stats();
+                index.log_connectivity_stats(&space);
+           
                 // Run test queries (multi-threaded)
                 HNSWLibIndexOperations::parallelRunTestQueries(con, index, dataset.name, test_vectors, appender, search_bm_appender, early_termination_appender, iteration, dataset_cardinality, index_map);
-
 
                 std::cout << "✅ FINISHED ITERATION " << iteration << " ✅" << std::endl;
             }
@@ -209,7 +196,7 @@ int main() {
      * The final index consists of the second half data points.
      */
     
-    int max_iterations = 1;
+    int max_iterations = 10;
     int threads = 32;
 
     try {
@@ -218,16 +205,16 @@ int main() {
         fm_runner.runTest(0);
 
         // mnist
-        //HNSWLibNewDataRunner m_runner(max_iterations, threads);
-        //m_runner.runTest(1);
+        HNSWLibNewDataRunner m_runner(max_iterations, threads);
+        fm_runner.runTest(1);
 
           // sift
-        //HNSWLibRandomRunner s_runner(max_iterations, threads);
-        //s_runner.runTest(2);
+          HNSWLibNewDataRunner s_runner(max_iterations, threads);
+        fm_runner.runTest(2);
 
         // gist
-        //HNSWLibRandomRunner g_runner(max_iterations, threads);
-        //g_runner.runTest(3);
+        HNSWLibNewDataRunner g_runner(max_iterations, threads);
+        fm_runner.runTest(3);
 
         return 0;
     } catch (std::exception& e) {

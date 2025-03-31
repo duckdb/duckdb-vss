@@ -310,8 +310,15 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
 
     // bare_bone_search means there is no check for deletions and stop condition is ignored in return of extra performance
+
+    struct SearchBaseLayerResult {
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
+        size_t base_metric_distance_computations;
+        size_t base_metric_hops;
+    };
+
     template <bool bare_bone_search = true, bool collect_metrics = false>
-    std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
+    SearchBaseLayerResult
     searchBaseLayerST(
         tableint ep_id,
         const void *data_point,
@@ -321,6 +328,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         VisitedList *vl = visited_list_pool_->getFreeVisitedList();
         vl_type *visited_array = vl->mass;
         vl_type visited_array_tag = vl->curV;
+        size_t base_metric_distance_computations = 0;
+        size_t base_metric_hops = 0;
+
+        SearchBaseLayerResult result;
 
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidate_set;
@@ -370,6 +381,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 metric_hops++;
                 metric_distance_computations+=size;
             }
+            base_metric_hops++;
+            base_metric_distance_computations+=size;
 
 #ifdef USE_SSE
             _mm_prefetch((char *) (visited_array + *(data + 1)), _MM_HINT_T0);
@@ -440,7 +453,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         }
 
         visited_list_pool_->releaseVisitedList(vl);
-        return top_candidates;
+
+        result.top_candidates = top_candidates;
+        result.base_metric_distance_computations = base_metric_distance_computations;
+        result.base_metric_hops = base_metric_hops;
+        return result;
     }
 
 
@@ -1270,118 +1287,195 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         return cur_c;
     }
 
-    template <typename executor_at = std::function<void(std::function<void()>)>, 
-          typename progress_at = std::function<void(size_t, size_t)>>
-void log_links(executor_at&& executor = [](auto f) { f(); }, 
-               progress_at&& progress = [](size_t, size_t) {}) {
-    // Use the first label operation lock for synchronization
-    std::lock_guard<std::mutex> lock(label_op_locks_[0]);
-
-    // Collect memory and index statistics directly from existing members
-    size_t index_size = cur_element_count;
-    size_t index_capacity = max_elements_;
-    size_t num_deleted = num_deleted_;
+    void log_memory_stats() {
+        size_t index_size = cur_element_count;
+        size_t index_capacity = max_elements_;
     
-    // Estimate memory usage based on existing memory allocations
-    size_t index_mem_usage = 0;
+        // Approximate memory usage: storage per element * capacity
+        size_t index_mem_usage = size_links_per_element_ * index_capacity;
     
-    // Memory for level 0 data
-    index_mem_usage += max_elements_ * size_data_per_element_;
+        // slot_lookup equivalents (approximation for hnswlib):
+        size_t slot_lookup_total_slots = element_levels_.size();
+        size_t slot_lookup_populated_slots = cur_element_count;
+        size_t slot_lookup_deleted_slots = slot_lookup_total_slots - slot_lookup_populated_slots;
     
-    // Memory for link lists
-    for (tableint i = 0; i < cur_element_count; i++) {
-        if (element_levels_[i] > 0) {
-            index_mem_usage += size_links_per_element_;
+        // CSV Logging
+        std::ofstream csv_file("memory_stats.csv", std::ios::app);
+    
+        // Check if file exists and has content
+        std::ifstream test_file("memory_stats.csv");
+        bool file_exists = test_file.peek() != std::ifstream::traits_type::eof();
+        test_file.close();
+    
+        if (!file_exists) {
+            csv_file << "index_size,index_capacity,index_mem_usage,slot_lookup_total_slots,slot_lookup_populated_slots,slot_lookup_deleted_slots" << std::endl;
         }
-    }
-
-    // Open CSV file for appending
-    std::ofstream csv_file("hnswlib_memory_stats.csv", std::ios::app);
     
-    // Check if file is empty and add header if needed
-    std::ifstream test_file("hnswlib_memory_stats.csv");
-    bool file_exists_with_content = test_file.peek() != std::ifstream::traits_type::eof();
-    test_file.close();
+        csv_file << index_size << ","
+                 << index_capacity << ","
+                 << index_mem_usage << ","
+                 << slot_lookup_total_slots << ","
+                 << slot_lookup_populated_slots << ","
+                 << slot_lookup_deleted_slots << std::endl;
     
-    if (!file_exists_with_content) {
-        csv_file << "timestamp,index_size,index_capacity,num_deleted,index_mem_usage,max_level,ef_construction" << std::endl;
+        csv_file.close();
     }
     
-    // Write the data row with timestamp
-    auto now = std::chrono::system_clock::now();
-    auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
-        now.time_since_epoch()
-    ).count();
-    
-    csv_file << timestamp << "," 
-             << index_size << "," 
-             << index_capacity << "," 
-             << num_deleted << "," 
-             << index_mem_usage << "," 
-             << maxlevel_ << "," 
-             << ef_construction_ << std::endl;
-    
-    csv_file.close();
 
-    // Optional: Analyze graph structure
-    executor([this, &progress]() {
-        size_t total_connections = 0;
-        size_t max_connections_per_element = 0;
-        size_t non_zero_level_elements = 0;
+    void log_connectivity_stats(SpaceInterface<dist_t>* space) {
+        size_t nodes_count = cur_element_count;
+        size_t max_level = maxlevel_ + 1; // Dynamically obtained max level (inclusive)
 
-        // Open graph stats file
-        std::ofstream graph_stats_file("hnswlib_graph_stats.csv", std::ios::app);
-        
-        // Check if file is empty and add header if needed
-        std::ifstream graph_test_file("hnswlib_graph_stats.csv");
-        bool graph_file_exists_with_content = graph_test_file.peek() != std::ifstream::traits_type::eof();
-        graph_test_file.close();
-        
-        if (!graph_file_exists_with_content) {
-            graph_stats_file << "timestamp,total_connections,max_connections_per_element,avg_connections_per_element,elements_with_multilevel" << std::endl;
+        std::vector<std::unordered_map<size_t, size_t>> in_edges_per_level(max_level);
+        std::unordered_map<size_t, size_t> out_edges;
+        std::mutex map_mutex;
+
+        std::atomic<size_t> disconnected_nodes{0};
+        std::atomic<size_t> total_connections{0};
+
+        std::vector<std::atomic<size_t>> level_connections(max_level);
+        std::vector<std::atomic<size_t>> level_node_counts(max_level);
+
+        struct DistanceStats {
+            std::mutex mutex;
+            std::vector<float> distances;
+        };
+
+        std::vector<DistanceStats> dist_stats(max_level);
+
+        #pragma omp parallel for schedule(dynamic)
+        for (size_t node_idx = 0; node_idx < nodes_count; ++node_idx) {
+            size_t node_level = element_levels_[node_idx];
+
+            bool has_connections = false;
+            size_t local_out_edges = 0;
+
+            for (size_t level = 0; level <= node_level; ++level) {
+                linklistsizeint* link_list_ptr = get_linklist_at_level(node_idx, level);
+                size_t neighbor_count = getListCount(link_list_ptr);
+
+                if (neighbor_count > 0) has_connections = true;
+
+                local_out_edges += neighbor_count;
+                total_connections += neighbor_count;
+                level_connections[level] += neighbor_count;
+                level_node_counts[level]++;
+
+                std::vector<float> local_distances;
+
+                for (size_t j = 0; j < neighbor_count; ++j) {
+                    size_t neighbor_id = *(reinterpret_cast<tableint*>((char*)link_list_ptr + sizeof(linklistsizeint) + j * sizeof(tableint)));
+
+                    {
+                        std::lock_guard<std::mutex> lock(map_mutex);
+                        in_edges_per_level[level][neighbor_id]++;
+                    }
+
+                    float dist = space->get_dist_func()(
+                        getDataByInternalId(node_idx),
+                        getDataByInternalId(neighbor_id),
+                        space->get_dist_func_param());
+
+                    local_distances.push_back(dist);
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(dist_stats[level].mutex);
+                    dist_stats[level].distances.insert(
+                        dist_stats[level].distances.end(),
+                        local_distances.begin(), local_distances.end());
+                }
+            }
+
+            if (!has_connections) disconnected_nodes++;
+
+            {
+                std::lock_guard<std::mutex> lock(map_mutex);
+                out_edges[node_idx] = local_out_edges;
+            }
         }
 
-        // Analyze connections
-        for (tableint i = 0; i < cur_element_count; i++) {
-            size_t element_connections = 0;
-            
-            // Check level 0 connections
-            linklistsizeint* ll_size = (linklistsizeint*)(linkLists_[i]);
-            if (ll_size && *ll_size > 0) {
-                element_connections = *ll_size;
-                total_connections += element_connections;
-                max_connections_per_element = std::max(max_connections_per_element, element_connections);
+        size_t unreachable_count = 0, orphaned_count = 0;
+
+        for (size_t i = 0; i < nodes_count; ++i) {
+            bool has_incoming = false;
+            for (size_t level = 0; level < max_level; ++level) {
+                if (in_edges_per_level[level].count(i) > 0) {
+                    has_incoming = true;
+                    break;
+                }
             }
 
-            // Count multi-level elements
-            if (element_levels_[i] > 0) {
-                non_zero_level_elements++;
-            }
-            
-            // Optional progress reporting
-            if (progress) {
-                progress(i, cur_element_count);
+            if (!has_incoming) {
+                if (out_edges[i] > 0) unreachable_count++;
+                else orphaned_count++;
             }
         }
 
-        // Calculate average connections
-        double avg_connections = total_connections / static_cast<double>(std::max(1UL, static_cast<size_t>(cur_element_count)));
+        // CSV Output
+        std::ofstream csv_file("node_connectivity.csv", std::ios::app);
+        std::ifstream test_file("node_connectivity.csv");
+        bool file_exists = test_file.peek() != std::ifstream::traits_type::eof();
+        test_file.close();
 
-        // Write graph structure stats
-        auto now = std::chrono::system_clock::now();
-        auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
-            now.time_since_epoch()
-        ).count();
+        if (!file_exists) {
+            csv_file << "nodes_count,unreachable_count,orphaned_count,avg_connections,disconnected_nodes";
+            for (size_t l = 0; l < max_level; l++) csv_file << ",avg_conn_l" << l;
+            for (size_t l = 0; l < max_level; l++) csv_file << ",unreachable_l" << l;
+            for (size_t l = 0; l < max_level; l++) csv_file << ",nodes_l" << l;
+            for (size_t l = 0; l < max_level; l++) csv_file << ",min_dist_l" << l;
+            for (size_t l = 0; l < max_level; l++) csv_file << ",avg_dist_l" << l;
+            for (size_t l = 0; l < max_level; l++) csv_file << ",max_dist_l" << l;
+            csv_file << "\n";
+        }
 
-        graph_stats_file << timestamp << "," 
-                         << total_connections << "," 
-                         << max_connections_per_element << "," 
-                         << avg_connections << "," 
-                         << non_zero_level_elements << std::endl;
-        
-        graph_stats_file.close();
-    });
-}
+        csv_file << nodes_count << "," << unreachable_count << "," << orphaned_count << ","
+                << (double)total_connections / nodes_count << "," << disconnected_nodes;
+
+        // Avg connections per level
+        for (size_t l = 0; l < max_level; l++) {
+            double avg_conn = level_node_counts[l] > 0 ? (double)level_connections[l] / level_node_counts[l] : 0;
+            csv_file << "," << avg_conn;
+        }
+
+        // Unreachable nodes per level
+        for (size_t l = 0; l < max_level; l++) {
+            size_t unreachable = 0;
+            for (size_t i = 0; i < nodes_count; i++) {
+                if (element_levels_[i] >= l && !in_edges_per_level[l].count(i)) unreachable++;
+            }
+            csv_file << "," << unreachable;
+        }
+
+        // Nodes per level
+        for (size_t l = 0; l < max_level; l++)
+            csv_file << "," << level_node_counts[l];
+
+        // Min distance per level
+        for (size_t l = 0; l < max_level; l++) {
+            auto& distances = dist_stats[l].distances;
+            csv_file << "," << (distances.empty() ? 0.0 : *std::min_element(distances.begin(), distances.end()));
+        }
+
+        // Avg distance per level
+        for (size_t l = 0; l < max_level; l++) {
+            auto& distances = dist_stats[l].distances;
+            csv_file << "," << (distances.empty() ? 0.0 : std::accumulate(distances.begin(), distances.end(), 0.0) / distances.size());
+        }
+
+        // Max distance per level
+        for (size_t l = 0; l < max_level; l++) {
+            auto& distances = dist_stats[l].distances;
+            csv_file << "," << (distances.empty() ? 0.0 : *std::max_element(distances.begin(), distances.end()));
+        }
+
+        csv_file << "\n";
+        csv_file.close();
+    }
+
+    
+
+    
 
     
 
@@ -1389,7 +1483,6 @@ void log_links(executor_at&& executor = [](auto f) { f(); },
     searchKnn(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr) const override {
         typename AlgorithmInterface<dist_t>::KnnSearchResult  result;
       
-        
         if (cur_element_count == 0) return result;
     
         tableint currObj = enterpoint_node_;
@@ -1425,16 +1518,22 @@ void log_links(executor_at&& executor = [](auto f) { f(); },
                 }
             }
         }
-    
+        
+        SearchBaseLayerResult base_result;
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
         bool bare_bone_search = !num_deleted_ && !isIdAllowed;
         if (bare_bone_search) {
-            top_candidates = searchBaseLayerST<true>(
+            base_result = searchBaseLayerST<true>(
                     currObj, query_data, std::max(ef_, k), isIdAllowed);
         } else {
-            top_candidates = searchBaseLayerST<false>(
+            base_result = searchBaseLayerST<false>(
                     currObj, query_data, std::max(ef_, k), isIdAllowed);
         }
+
+        // Update metrics during base layer traversal
+        metric_hops += base_result.base_metric_distance_computations;
+        metric_distance_computations += base_result.base_metric_distance_computations;
+        top_candidates = base_result.top_candidates;
     
         while (top_candidates.size() > k) {
             top_candidates.pop();

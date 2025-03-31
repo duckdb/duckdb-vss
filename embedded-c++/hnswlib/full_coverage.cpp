@@ -94,6 +94,11 @@ HNSWLibFullCoverageRunner(int iterations = 100, int threads = 8) : db(nullptr), 
 
             auto partitions = QueryRunner::partitionDataset(con, dataset.name, 100);
 
+             // Log initial index stats
+             index.log_memory_stats();
+             index.log_connectivity_stats(&space);
+            
+
             // Run iterations
             size_t last_idx = 0;
             for (int iteration = 1; iteration <= partitions.size(); iteration++) {
@@ -114,7 +119,6 @@ HNSWLibFullCoverageRunner(int iterations = 100, int threads = 8) : db(nullptr), 
                 }
 
                 std::vector<size_t> delete_indices(delete_indices_set.begin(), delete_indices_set.end());
-
 
                 // save the vectors being deleted before deleting them
                 std::vector<std::vector<float>> deleted_vectors(delete_indices.size(), std::vector<float>(dataset.dimensions));
@@ -140,10 +144,12 @@ HNSWLibFullCoverageRunner(int iterations = 100, int threads = 8) : db(nullptr), 
                 size_t added = HNSWLibIndexOperations::parallelAdd(index, deleted_vectors, new_indices,  dataset.name, 
                                                         iteration, add_bm_appender, threads);
 
-
+                // Log index stats
+                index.log_memory_stats();
+                index.log_connectivity_stats(&space);
+           
                 // Run test queries (multi-threaded)
                 HNSWLibIndexOperations::parallelRunTestQueries(con, index, dataset.name, test_vectors, appender, search_bm_appender, early_termination_appender, iteration, dataset_cardinality, index_map);
-
 
                 std::cout << "✅ FINISHED ITERATION " << iteration << " ✅" << std::endl;
 
@@ -200,7 +206,7 @@ int main() {
      * and performance.
      */
     
-    int max_iterations = 2;
+    int max_iterations = 100;
     int threads = 8;
 
     try {
@@ -209,16 +215,16 @@ int main() {
         fm_runner.runTest(0);
 
         // mnist
-        //HNSWLibFullCoverageRunner m_runner(max_iterations, threads);
-        //m_runner.runTest(1);
+        HNSWLibFullCoverageRunner m_runner(max_iterations, threads);
+        fm_runner.runTest(1);
 
           // sift
-        //HNSWLibRandomRunner s_runner(max_iterations, threads);
-        //s_runner.runTest(2);
+        HNSWLibFullCoverageRunner s_runner(max_iterations, threads);
+        fm_runner.runTest(2);
 
         // gist
-        //HNSWLibRandomRunner g_runner(max_iterations, threads);
-        //g_runner.runTest(3);
+        HNSWLibFullCoverageRunner g_runner(max_iterations, threads);
+        fm_runner.runTest(3);
 
         return 0;
     } catch (std::exception& e) {

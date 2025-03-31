@@ -6,10 +6,6 @@
 #include <vector>
 #include <string>
 
-
-
-
-
 void util::query_hnsw(hnswlib::HierarchicalNSW<float>& alg_hnsw, const std::vector<std::vector<float>>& queries, int k, int num_threads, std::vector<std::vector<size_t>>& results,  std::vector<std::tuple<std::string, int, int, Value, Value, Value, int, int, int>>& search_results,
     std::vector<std::tuple<std::string, int, int, Value, Value, Value, int, int, int>>& early_term_results,
     std::vector<std::tuple<std::string, int, double>>& search_benchmarks , std::mutex& results_mutex, const std::string& table_name, int iteration, std::vector<std::vector<std::size_t>>& test_neighbor_ids_vec,
@@ -18,7 +14,6 @@ void util::query_hnsw(hnswlib::HierarchicalNSW<float>& alg_hnsw, const std::vect
     results.resize(num_queries, std::vector<size_t>(k));
     ParallelFor(0, num_queries, num_threads, [&](size_t row, size_t threadId) {
         try {
-
             auto& test_neighbor_ids = test_neighbor_ids_vec[row];
             int test_query_vector_index_int = test_vector_indices[row];
             const Value& neighbor_ids = neighbor_ids_values[row];
@@ -29,7 +24,8 @@ void util::query_hnsw(hnswlib::HierarchicalNSW<float>& alg_hnsw, const std::vect
         
             unique_ptr<MaterializedQueryResult> result_ids = nullptr;
 
-            
+            size_t original_neighbors_size = result.neighbors.size(); // Store size before popping
+
             if(result.neighbors.size() != 0) {
                 std::vector<size_t> result_vec_ids;
                 result_vec_ids.reserve(result.neighbors.size());
@@ -56,9 +52,6 @@ void util::query_hnsw(hnswlib::HierarchicalNSW<float>& alg_hnsw, const std::vect
                 
                 result_list_value =  Value::LIST(LogicalType::INTEGER, std::move(id_values));
 
-                // cast neighbor ids with index_map
-                
-            
                 // Thread-safe collection of results
                 {
                     std::lock_guard<std::mutex> lock(results_mutex);
@@ -84,7 +77,7 @@ void util::query_hnsw(hnswlib::HierarchicalNSW<float>& alg_hnsw, const std::vect
                     });
 
                     // Handle early termination case
-                    if (result.neighbors.size() < 100) {
+                    if (original_neighbors_size < 100) {
                             early_term_results.push_back({
                                 table_name,
                                 iteration,
@@ -119,7 +112,7 @@ void util::query_hnsw(hnswlib::HierarchicalNSW<float>& alg_hnsw, const std::vect
                     iteration,
                     duration
                 });
-            if (result.neighbors.size() < 100) {
+            if (original_neighbors_size < 100) {
                 early_term_results.push_back({
                     table_name,
                     iteration,

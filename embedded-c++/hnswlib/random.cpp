@@ -84,7 +84,9 @@ HNSWLibRandomRunner(int iterations = 200, int threads = 64) : db(nullptr), con(d
             }
 
             // Log initial index stats
-            //index.log_links();
+            index.log_memory_stats();
+            index.log_connectivity_stats(&space);
+           
 
             // Get test vectors
             auto test_vectors = con.Query("SELECT * FROM " + dataset.name + "_test;");
@@ -155,7 +157,8 @@ HNSWLibRandomRunner(int iterations = 200, int threads = 64) : db(nullptr), con(d
                     iteration, add_bm_appender, threads);                       
 
                 // Log index stats
-                //index.log_links();
+                index.log_memory_stats();
+                index.log_connectivity_stats(&space);
 
                 // Run test queries (multi-threaded)
                 HNSWLibIndexOperations::parallelRunTestQueries(con, index, dataset.name, test_vectors, appender, 
@@ -225,16 +228,16 @@ int main() {
         fm_runner.runTest(0);
 
         // mnist
-        //HNSWLibRandomRunner m_runner(max_iterations, threads);
-        //m_runner.runTest(1);
+        HNSWLibRandomRunner m_runner(max_iterations, threads);
+        m_runner.runTest(1);
 
         // sift
-        //HNSWLibRandomRunner s_runner(max_iterations, threads);
-        //s_runner.runTest(2);
+        HNSWLibRandomRunner s_runner(max_iterations, threads);
+        s_runner.runTest(2);
 
         // gist
-        //HNSWLibRandomRunner g_runner(max_iterations, threads);
-        //g_runner.runTest(3);
+        HNSWLibRandomRunner g_runner(max_iterations, threads);
+        g_runner.runTest(3);
 
         return 0;
     } catch (std::exception& e) {
