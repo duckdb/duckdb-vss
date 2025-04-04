@@ -12,7 +12,7 @@ VENV_DIR := .venv
 SETUPS := $(wildcard ${ROOT_DIR}$(SETUP_DIR)/*.py)
 PLOTS := $(wildcard ${ROOT_DIR}$(PLOTS_DIR)/*.py)
 
-.PHONY: all venv install setup plots clean
+.PHONY: all venv install setup plots clean clean-images
 
 all: venv install setup plots
 
@@ -34,15 +34,17 @@ requirements.txt: pyproject.toml poetry.lock
 
 plots:
 	@echo "Generating plots..."
-	@for script in $(PLOTS); do \
-		$(VENV_DIR)/bin/$(PYTHON) $$script; \
-	done
+	@PYTHONPATH=. $(VENV_DIR)/bin/$(PYTHON) -m scripts.plots.generate_plots
 
 setup:
 	@echo "Setting up benchmarks..."
 	@for script in $(SETUPS); do \
 		$(VENV_DIR)/bin/$(PYTHON) $$script; \
 	done
+
+clean-images:
+	@echo "Cleaning images directories in experiment results..."
+	@find ../embedded-c++ -type d -path "*/results/*/images" -exec rm -rf {} +
 
 clean:
 	@echo "Cleaning up..."
