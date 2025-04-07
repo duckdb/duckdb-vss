@@ -212,6 +212,7 @@ size_t IndexOperations::parallelAdd(
         std::mutex bench_mutex;
         std::vector<std::tuple<std::string, int, double>> benchmarks;
         std::atomic<size_t> success_count(0);
+        std::atomic<size_t> error_count{0};
         
         // Multi-threaded execution
         std::size_t executor_threads = std::min(std::thread::hardware_concurrency(), 
@@ -229,23 +230,26 @@ size_t IndexOperations::parallelAdd(
         auto batch_start = std::chrono::high_resolution_clock::now();
         
         executor.fixed(vectors.size(), [&](std::size_t thread, std::size_t task) {
-            try {
-                int id = ids[task];
-                auto& vec = vectors[task];
-                
-                auto start_time = std::chrono::high_resolution_clock::now();
-                index.add(id, vec.data(), thread);
-                auto end_time = std::chrono::high_resolution_clock::now();
-                auto duration = std::chrono::duration<double>(end_time - start_time).count();
-                
+            int id = ids[task];
+            auto& vec = vectors[task];
+            
+            auto start_time = std::chrono::high_resolution_clock::now();
+            auto result = index.add(id, vec.data(), thread);
+            auto end_time = std::chrono::high_resolution_clock::now();
+            auto duration = std::chrono::duration<double>(end_time - start_time).count();
+
+            if (result) {
                 success_count++;
                 
                 std::lock_guard<std::mutex> lock(bench_mutex);
                 benchmarks.push_back({dataset_name, iteration, duration});
-            }
-            catch (const std::exception& e) {
+            } else {
+                error_count++;
+                
                 std::lock_guard<std::mutex> lock(bench_mutex);
-                std::cerr << "Error adding vector " << task << ": " << e.what() << std::endl;
+                std::cerr << "Error adding vector " << task << " with ID " << id 
+                        << ": " << (result.error.what() ? result.error.what() : "Unknown error")
+                        << std::endl;
             }
         });
         
@@ -901,5 +905,3 @@ void IndexOperations::parallelRunTestQueries(Connection& con, index_dense_gt<row
         std::cerr << "Error in parallel search: " << e.what() << std::endl;
     }
 }
-    
-
