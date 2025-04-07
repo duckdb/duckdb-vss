@@ -9,6 +9,8 @@
 using namespace duckdb;
 using namespace unum::usearch;
 
+std::string experiment;
+
 // ==================== Main New Data USearch Runner ====================
 class USearchNewDataRunner {
 private:
@@ -58,48 +60,16 @@ USearchNewDataRunner(int iterations = 100, int threads = 64) : db(nullptr), con(
             // Set M and efConstruction based on dataset
             config.expansion_add = dataset.ef_construction;
             config.connectivity = dataset.m;
-		    config.connectivity_base = config.connectivity * 2;
 
             auto index = index_dense_gt<row_t>::make(metric, config);
 
             auto dataset_cardinality = con.Query("SELECT COUNT(*) FROM " + dataset.name + "_train;")->GetValue<int64_t>(0, 0);
-
             // Partition dataset into 20
             auto partitions = QueryRunner::partitionDataset(con, dataset.name, 20);
 
-            auto half_count = dataset_cardinality / 2;
-
-            std::size_t executor_threads = std::min(std::thread::hardware_concurrency(),
-                                                static_cast<unsigned int>(half_count));
-            executor_default_t executor(executor_threads);
-            
-            index.reserve(index_limits_t {NextPowerOfTwo(half_count), executor.size()});
-
-            std::vector<int> ids;
-            std::vector<std::vector<float>> vectors;
-            ids.reserve(half_count);
-            vectors.reserve(half_count);
-
-            // Populate index with first half
-            for (idx_t i = 0; i < 10; i++) {
-                auto& partition = partitions[i];
-                for (idx_t j = 0; j < partition->RowCount(); j++) {
-                    ids.push_back(partition->GetValue<int>(0, j));
-                    vectors.push_back(ExtractFloatVector(partition->GetValue(1, j)));
-                }
-            }
-
-            executor.fixed(half_count, [&](std::size_t thread, std::size_t task) {
-                try {
-                    int id = ids[task];
-                    auto& vec = vectors[task];
-                    
-                    index.add(id, vec.data(), thread);
-                }
-                catch (const std::exception& e) {
-                    std::cerr << "Error adding vector " << task << ": " << e.what() << std::endl;
-                }
-            });
+            // Load half index (first 10 partitions)
+            std::string path = "usearch/indexes/" + dataset.name + "_index_half.usearch";
+            index.load(path.c_str());
 
             // Log initial index stats
             index.log_links();
@@ -162,7 +132,7 @@ USearchNewDataRunner(int iterations = 100, int threads = 64) : db(nullptr), con(
 
             // Output experiment results to CSV
             // dir name: usearch/results/{experiment}/{dataset_name}_{num_queries}q_{num_iterations}i_{partition_size}p/
-            std::string output_dir = "usearch/results/newdata/" + dataset.name + "_" + std::to_string(test_vectors_count) + "q_" + std::to_string(max_iterations) + "i_" + std::to_string(dataset_cardinality/partitions.size()) + "p/";
+            std::string output_dir = "usearch/results/newdata/" + experiment + dataset.name + "_" + std::to_string(test_vectors_count) + "q_" + std::to_string(max_iterations) + "i_" + std::to_string(dataset_cardinality/partitions.size()) + "p/";
             // Create the directory if it doesn't exist
             std::filesystem::create_directories(output_dir);
             FileOperations::cleanupOutputFiles(output_dir);
@@ -178,6 +148,11 @@ USearchNewDataRunner(int iterations = 100, int threads = 64) : db(nullptr), con(
 
             // Cleanup intermediate files
             FileOperations::cleanupOutputFiles(std::filesystem::current_path());
+
+            // Save the final index
+            std::string s_path = output_dir + "new_data_" + dataset.name + "_index.usearch";
+            index.save(s_path.c_str());
+            std::cout << "Index saved to: " << s_path << std::endl;
 
         } catch (std::exception& e) {
             std::cerr << "Error running test: " << e.what() << std::endl;
@@ -199,6 +174,10 @@ int main() {
     
     int max_iterations = 10;
     int threads = 32;
+    
+    // original - no changes to fixed-size ring buffer, tests original USearch implementation w/o changing source code
+    // no_rb_cap - ring buffer cap increased to ceil2(50000) (highest expected add/del batch so all add followed by del replace 100% of deleted nodes). (!!) Requires changing index.hpp reserve ring buffer implementation min val
+    experiment = "original_";
 
     try {
         // fashion_mnist

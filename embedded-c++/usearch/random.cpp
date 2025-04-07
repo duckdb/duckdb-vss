@@ -9,6 +9,8 @@
 using namespace duckdb;
 using namespace unum::usearch;
 
+std::string experiment;
+
 // ==================== Main Random USearch Runner ====================
 class USearchRandomRunner {
 private:
@@ -58,7 +60,6 @@ USearchRandomRunner(int iterations = 200, int threads = 64) : db(nullptr), con(d
             // Set M and efConstruction based on dataset
             config.expansion_add = dataset.ef_construction;
             config.connectivity = dataset.m;
-		    config.connectivity_base = config.connectivity * 2;
 
             auto index = index_dense_gt<row_t>::make(metric, config);
 
@@ -67,32 +68,9 @@ USearchRandomRunner(int iterations = 200, int threads = 64) : db(nullptr), con(d
             std::size_t executor_threads = std::min(std::thread::hardware_concurrency(),
                                                 static_cast<unsigned int>(dataset_cardinality));
             executor_default_t executor(executor_threads);
-            
-            index.reserve(index_limits_t {NextPowerOfTwo(dataset_cardinality), executor.size()});
 
-            std::vector<int> ids;
-            std::vector<std::vector<float>> vectors;
-            ids.reserve(dataset_cardinality);
-            vectors.reserve(dataset_cardinality);
-
-            auto dataset_vectors = con.Query("SELECT * FROM " + dataset.name + "_train;");
-            
-            for (idx_t i = 0; i < dataset_cardinality; i++) {
-                ids.push_back(dataset_vectors->GetValue<int>(0, i));
-                vectors.push_back(ExtractFloatVector(dataset_vectors->GetValue(1, i)));
-            }
-
-            executor.fixed(dataset_cardinality, [&](std::size_t thread, std::size_t task) {
-                try {
-                    int id = ids[task];
-                    auto& vec = vectors[task];
-                    
-                    index.add(id, vec.data(), thread);
-                }
-                catch (const std::exception& e) {
-                    std::cerr << "Error adding vector " << task << ": " << e.what() << std::endl;
-                }
-            });
+            std::string path = "usearch/indexes/" + dataset.name + "_index.usearch";
+            index.load(path.c_str());
 
             // Log initial index stats
             index.log_links();
@@ -123,9 +101,9 @@ USearchRandomRunner(int iterations = 200, int threads = 64) : db(nullptr), con(d
                 std::cout << "▶️ ITERATION " << iteration << " ▶️" << std::endl;
 
                 // Get sample vectors to delete and re-add
-                auto sample_vecs = QueryRunner::getSampleVectors(con, dataset.name, 1);
+                auto sample_vecs = QueryRunner::getSampleVectors(con, dataset.name, sample_size);
 
-                // Delete sample vectors (multi-threaded)
+                // Delete sample vectors
                 size_t removed = IndexOperations::singleRemove(index, sample_vecs, dataset.name, 
                                                             iteration, del_bm_appender);
                 
@@ -161,7 +139,7 @@ USearchRandomRunner(int iterations = 200, int threads = 64) : db(nullptr), con(d
 
             // Output experiment results to CSV
             // dir name: usearch/results/{experiment}/{dataset_name}_{num_queries}q_{num_iterations}i_{sample_fraction}s/
-            std::string output_dir = "usearch/results/random/" + dataset.name + "_" + std::to_string(test_vectors_count) + "q_" + std::to_string(max_iterations) + "i_" + perc_formatted + "s/";
+            std::string output_dir = "usearch/results/random/" + experiment + dataset.name + "_" + std::to_string(test_vectors_count) + "q_" + std::to_string(max_iterations) + "i_" + perc_formatted + "s/";
             // Create the directory if it doesn't exist
             std::filesystem::create_directories(output_dir);
             FileOperations::cleanupOutputFiles(output_dir);
@@ -177,6 +155,11 @@ USearchRandomRunner(int iterations = 200, int threads = 64) : db(nullptr), con(d
 
             // Cleanup intermediate files
             FileOperations::cleanupOutputFiles(std::filesystem::current_path());
+
+            // Save the final index
+            std::string s_path = output_dir + "random_" + dataset.name + "_index.usearch";
+            index.save(s_path.c_str());
+            std::cout << "Index saved to: " << s_path << std::endl;
 
         } catch (std::exception& e) {
             std::cerr << "Error running test: " << e.what() << std::endl;
@@ -197,6 +180,10 @@ int main() {
     
     int max_iterations = 200;
     int threads = 32;
+    
+    // original - no changes to fixed-size ring buffer, tests original USearch implementation w/o changing source code
+    // no_rb_cap - ring buffer cap increased to ceil2(50000) (highest expected add/del batch so all add followed by del replace 100% of deleted nodes). (!!) Requires changing index.hpp reserve ring buffer implementation min val
+    experiment = "original_";
 
     try {
         // fashion_mnist

@@ -9,6 +9,8 @@
 using namespace duckdb;
 using namespace unum::usearch;
 
+std::string experiment;
+
 // ==================== Main Full Coverage USearch Runner ====================
 class USearchFullCoverageRunner {
 private:
@@ -58,41 +60,14 @@ USearchFullCoverageRunner(int iterations = 100, int threads = 64) : db(nullptr),
             // Set M and efConstruction based on dataset
             config.expansion_add = dataset.ef_construction;
             config.connectivity = dataset.m;
-		    config.connectivity_base = config.connectivity * 2;
 
             auto index = index_dense_gt<row_t>::make(metric, config);
 
             auto dataset_cardinality = con.Query("SELECT COUNT(*) FROM " + dataset.name + "_train;")->GetValue<int64_t>(0, 0);
 
-            std::size_t executor_threads = std::min(std::thread::hardware_concurrency(),
-                                                static_cast<unsigned int>(dataset_cardinality));
-            executor_default_t executor(executor_threads);
-            
-            index.reserve(index_limits_t {NextPowerOfTwo(dataset_cardinality), executor.size()});
-
-            std::vector<int> ids;
-            std::vector<std::vector<float>> vectors;
-            ids.reserve(dataset_cardinality);
-            vectors.reserve(dataset_cardinality);
-
-            auto dataset_vectors = con.Query("SELECT * FROM " + dataset.name + "_train;");
-            
-            for (idx_t i = 0; i < dataset_cardinality; i++) {
-                ids.push_back(dataset_vectors->GetValue<int>(0, i));
-                vectors.push_back(ExtractFloatVector(dataset_vectors->GetValue(1, i)));
-            }
-
-            executor.fixed(dataset_cardinality, [&](std::size_t thread, std::size_t task) {
-                try {
-                    int id = ids[task];
-                    auto& vec = vectors[task];
-                    
-                    index.add(id, vec.data(), thread);
-                }
-                catch (const std::exception& e) {
-                    std::cerr << "Error adding vector " << task << ": " << e.what() << std::endl;
-                }
-            });
+            // Load index
+            std::string path = "usearch/indexes/" + dataset.name + "_index.usearch";
+            index.load(path.c_str());
 
             // Log initial index stats
             index.log_links();
@@ -156,7 +131,7 @@ USearchFullCoverageRunner(int iterations = 100, int threads = 64) : db(nullptr),
 
             // Output experiment results to CSV
             // dir name: usearch/results/{experiment}/{dataset_name}_{num_queries}q_{num_iterations}i_{partition_size}p/
-            std::string output_dir = "usearch/results/fullcoverage/" + dataset.name + "_" + std::to_string(test_vectors_count) + "q_" + std::to_string(max_iterations) + "i_" + std::to_string(dataset_cardinality/partitions.size()) + "p/";
+            std::string output_dir = "usearch/results/fullcoverage/" + experiment + dataset.name + "_" + std::to_string(test_vectors_count) + "q_" + std::to_string(max_iterations) + "i_" + std::to_string(dataset_cardinality/partitions.size()) + "p/";
             // Create the directory if it doesn't exist
             std::filesystem::create_directories(output_dir);
             FileOperations::cleanupOutputFiles(output_dir);
@@ -173,6 +148,10 @@ USearchFullCoverageRunner(int iterations = 100, int threads = 64) : db(nullptr),
             // Cleanup intermediate files
             FileOperations::cleanupOutputFiles(std::filesystem::current_path());
 
+            // Save the final index
+            std::string s_path = output_dir + "full_coverage_" + dataset.name + "_index.usearch";
+            index.save(s_path.c_str());
+            std::cout << "Index saved to: " << s_path << std::endl;
         } catch (std::exception& e) {
             std::cerr << "Error running test: " << e.what() << std::endl;
         }
@@ -192,6 +171,10 @@ int main() {
     
     int max_iterations = 100;
     int threads = 32;
+    
+    // original - no changes to fixed-size ring buffer, tests original USearch implementation w/o changing source code
+    // no_rb_cap - ring buffer cap increased to ceil2(50000) (highest expected add/del batch so all add followed by del replace 100% of deleted nodes). (!!) Requires changing index.hpp reserve ring buffer implementation min val
+    experiment = "original_";
 
     try {
         // fashion_mnist
