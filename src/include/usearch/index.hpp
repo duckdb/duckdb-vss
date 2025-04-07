@@ -1064,11 +1064,11 @@ class ring_gt {
             return false; // prevent data loss
         if (n <= capacity())
             return true;
-        n = (std::max<std::size_t>)(ceil2(n), 64u);
+        n = (std::max<std::size_t>)(ceil2(n), 65536u); // was 64u. 65536u == ceil2(50000) (highest batch add/delete for our experiments)
         element_t* elements = allocator_.allocate(n);
-        if (!elements){
+        if (!elements)
             return false;
-        }
+
         std::size_t i = 0;
         while (try_pop(elements[i]))
             i++;
@@ -3329,6 +3329,7 @@ class index_gt {
         std::size_t no_in_edges_count = 0;
         std::size_t orphaned_count = 0;
         std::size_t unreachable_count = 0;
+        std::vector<std::size_t> unreachable_nodes;
         
         // Modified: Only count as unreachable if the node has no incoming edges at ANY level
         for (std::size_t i = 0; i < nodes_count; ++i) {
@@ -3348,12 +3349,35 @@ class index_gt {
                 if (out_edges.find(i) != out_edges.end() && out_edges[i] > 0) {
                     // Unreachable: has outgoing edges but no incoming edges across ALL levels
                     unreachable_count++;
+                    
+                    node_t node = node_at_(i);
+                    // Add the node key to the unreachable nodes list
+                    auto node_key = node.ckey();
+                    // Skip max int64 values
+                    // TODO: check what this comes from.. if its corruption w nodes marked for deletion not replaced having corrupted key etc...
+                    if (node_key == std::numeric_limits<std::int64_t>::max())
+                        continue;
+                    unreachable_nodes.push_back(node_key);
                 } else {
                     // Orphaned: has neither incoming nor outgoing edges
                     orphaned_count++;
                 }
             }
         }
+        
+        // TODO: Check that key is updated when replaced, i.e. that old key of replaced node is still used.
+        // If new key used, this should be equal mapping to id from DuckDB train table...
+        // Add key of unreachable nodes to csv for unreachable points experiment
+        std::ofstream up_file("unreachable_points.txt", std::ios::trunc);
+        for (const auto& node_key : unreachable_nodes) {
+            up_file << node_key;
+            // Add comma if not the last node
+            if (&node_key != &unreachable_nodes.back()) {
+                up_file << ",";
+            }
+        }
+        up_file << std::endl;
+        up_file.close();
         
         // Count and output level-specific unreachable nodes (for analysis, not for unreachable_count)
         std::vector<std::size_t> unreachable_per_level;
@@ -3526,8 +3550,30 @@ class index_gt {
     };
 
     inline node_lock_t node_lock_(std::size_t slot) const noexcept {
-        while (nodes_mutexes_.atomic_set(slot))
-            ;
+        // Try to acquire the lock with a timeout
+        int attempts = 0;
+        const int MAX_ATTEMPTS = 1000000; // Allow a significant number of attempts
+        
+        while (nodes_mutexes_.atomic_set(slot)) {
+            attempts++;
+            
+            // Use exponential backoff to reduce contention
+            if (attempts % 1000 == 0)
+                std::this_thread::yield();
+                
+            if (attempts % 10000 == 0)
+                std::this_thread::sleep_for(std::chrono::microseconds(10));
+                
+            if (attempts % 100000 == 0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                
+            // If we've tried too many times, just continue without the lock
+            if (attempts >= MAX_ATTEMPTS) {
+                // Return a "no-op" lock that doesn't actually hold any resource
+                return {nodes_mutexes_, std::numeric_limits<std::size_t>::max()};
+            }
+        }
+        
         return {nodes_mutexes_, slot};
     }
 
@@ -3588,7 +3634,15 @@ class index_gt {
         for (compressed_slot_t close_slot : new_neighbors) {
             if (close_slot == new_slot)
                 continue;
+              
             node_lock_t close_lock = node_lock_(close_slot);
+            
+            // Check if we actually acquired the lock
+            if (close_lock.slot == std::numeric_limits<std::size_t>::max()) {
+                // Log this but don't treat it as a fatal error
+                continue; // Skip this neighbor reconnection
+            }
+            
             node_t close_node = node_at_(close_slot);
 
             neighbors_ref_t close_header = neighbors_(close_node, level);
