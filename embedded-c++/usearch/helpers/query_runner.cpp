@@ -71,10 +71,25 @@ void QueryRunner::outputTableAsCSV(Connection& con, const std::string& full_tabl
     std::cout << "📤 Exported " << full_table_name << " to " << output_file_name << " 📤" << std::endl;
 }
 
-unique_ptr<MaterializedQueryResult> QueryRunner::getSampleVectors(Connection& con, const std::string& table_name, int percentage) {
+unique_ptr<MaterializedQueryResult> QueryRunner::getSampleVectors(Connection& con, const std::string& table_name, int rows) {
     return con.Query(
         "SELECT * FROM " + table_name + "_train USING SAMPLE " +
-        std::to_string(percentage) + " PERCENT (reservoir);");
+        std::to_string(rows)+ ";");
+}
+
+unique_ptr<MaterializedQueryResult> QueryRunner::getSampleNonUnreachableVectors(Connection& con, const std::string& table_name, int rows) {
+    std::string unreachable_keys;
+    // Get text from txt file unreachable_points.txt
+    std::ifstream infile("unreachable_points.txt");
+    if (infile.good())
+    {
+        string sLine;
+        getline(infile, sLine);
+        unreachable_keys = sLine;
+    }
+    return con.Query(
+        "with non_up as (SELECT * FROM " + table_name + "_train where id not in (" + unreachable_keys + ")) SELECT * FROM non_up USING SAMPLE " +
+            std::to_string(rows) + ";");
 }
 
 std::vector<unique_ptr<MaterializedQueryResult>> QueryRunner::partitionDataset(
