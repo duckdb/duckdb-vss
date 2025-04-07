@@ -28,3 +28,6 @@ python/data/raw/*.hdf5
 /poetry.toml
 *.png
 *.pdf
+*.txt
+
+*.usearch
