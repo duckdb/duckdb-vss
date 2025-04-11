@@ -120,7 +120,7 @@ def plot_node_connectivity(df: pd.DataFrame,
             fig, ax = plt.subplots(figsize=(10, 6))
             ax.plot(iterations, df[metric], color=color, linewidth=2)
 
-            ax.set_title(f'{metric.replace("_", " ").title()} Over Iterations - {filename.split("_")[0].title()} ({dataset_name})')
+            ax.set_title(f'{metric.replace("_", " ").title()} Over Iterations - {filename.split("_")[1].title()} ({dataset_name})')
             ax.set_xlabel('Iteration')
             ax.set_ylabel('Count')
             ax.grid(True, alpha=0.3)
@@ -359,7 +359,7 @@ def generate_memory_connectivity_plots(experiment_paths: Dict[str, List[str]]):
             os.makedirs(save_dir, exist_ok=True)
 
             dataset_name = os.path.basename(dataset_path)
-            dataset_name = "fashion-mnist" if dataset_name.startswith("fashion_mnist") else dataset_name.split('_')[0]
+            dataset_name = "fashion-mnist" if "fashion_mnist" in dataset_name else dataset_name.split('_')[1]
 
             # Memory stats plots
             memory_stats_path = os.path.join(dataset_path, 'memory_stats.csv')
@@ -401,7 +401,7 @@ def generate_memory_connectivity_plots(experiment_paths: Dict[str, List[str]]):
             if os.path.exists(connectivity_path):
                 connectivity_df = load_csv_data(connectivity_path)
                 dataset_name = os.path.basename(dataset_path)
-                dataset_name = "fashion-mnist" if dataset_name.startswith("fashion_mnist") else dataset_name.split('_')[0]
+                dataset_name = "fashion-mnist" if "fashion_mnist" in dataset_name else dataset_name.split('_')[1]
 
                 # Original connectivity plots
                 plot_node_connectivity(

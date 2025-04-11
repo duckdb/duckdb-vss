@@ -147,10 +147,10 @@ def generate_benchmark_plots(experiment_paths: Dict[str, List[str]]):
             # Extract dataset name from the folder path
             dataset_name = os.path.basename(dataset_path)
             # Handle special case for fashion-mnist
-            if dataset_name.startswith("fashion_mnist"):
+            if "fashion_mnist" in dataset_name:
                 dataset_name = "fashion-mnist"
             else:
-                dataset_name = dataset_name.split('_')[0]
+                dataset_name = dataset_name.split('_')[1]
 
             # Load benchmark data
             benchmark_dfs = {}

@@ -192,7 +192,7 @@ def plot_visited_vs_computed(df: pd.DataFrame,
 
     ax.set_xlabel('Mean Number of Visited Members')
     ax.set_ylabel('Mean Number of Computed Distances')
-    ax.set_title(f'Visited Members vs Computed Distances - {filename.split("_")[0].title()} ({dataset_name})')
+    ax.set_title(f'Visited Members vs Computed Distances - {filename.split("_")[1].title()} ({dataset_name})')
     ax.grid(True)
 
     # Set axis limits without forcing x-axis to start at 0
