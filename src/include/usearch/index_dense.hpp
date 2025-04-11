@@ -1226,7 +1226,7 @@ class index_dense_gt {
      *          If the key was not found in the index, `result.completed` will be `false`.
      *          If an error occurred during the removal operation, `result.error` will contain an error message.
      */
-    labeling_result_t remove(vector_key_t key) {
+    labeling_result_t remove(vector_key_t key, size_t batch_size = 1) {
         labeling_result_t result;
 
         unique_lock_t lookup_lock(slot_lookup_mutex_);
@@ -1237,7 +1237,7 @@ class index_dense_gt {
         // Grow the removed entries ring, if needed
         std::size_t matching_count = std::distance(matching_slots.first, matching_slots.second);
         std::unique_lock<std::mutex> free_lock(free_keys_mutex_);
-        if (!free_keys_.reserve(free_keys_.size() + matching_count))
+        if (!free_keys_.reserve(free_keys_.size() + batch_size))
             return result.failed("Can't allocate memory for a free-list");
     
         // A removed entry would be:
