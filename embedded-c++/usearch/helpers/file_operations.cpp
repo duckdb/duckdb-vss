@@ -3,13 +3,15 @@
 void FileOperations::cleanupOutputFiles(std::filesystem::path path = std::filesystem::current_path()) {
     try {
         std::string file_extension = ".csv";
+        std::string file_extension_txt = ".txt";
 
         for (const auto& entry : std::filesystem::directory_iterator(path)) {
             std::string file_path_string = entry.path().string();
 
             // Only remove if file ends with ".csv"
             if (file_path_string.size() >= 4 &&
-                file_path_string.substr(file_path_string.size() - 4) == file_extension) {
+                (file_path_string.substr(file_path_string.size() - 4) == file_extension) || 
+                ((file_path_string.substr(file_path_string.size() - 4) == file_extension_txt && file_path_string.substr(file_path_string.size() - 14) != "CMakeLists.txt"))) {
                 std::filesystem::remove(entry.path());
             }
         }
