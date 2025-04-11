@@ -86,7 +86,6 @@ USearchRandomUPRunner(int iterations = 3000, int threads = 64) : db(nullptr), co
             auto perc = 0.05;
             std::ostringstream perc_str;
             perc_str << std::fixed << std::setprecision(2) << perc;
-            std::string perc_formatted = perc_str.str();
             auto sample_size = perc * dataset_cardinality;
 
             // Create appender for results
@@ -141,8 +140,8 @@ USearchRandomUPRunner(int iterations = 3000, int threads = 64) : db(nullptr), co
             QueryRunner::aggregateBMStats(con, dataset.name + "_search", test_vectors_count, sample_size);
 
             // Output experiment results to CSV
-            // dir name: usearch/results/{experiment}/{dataset_name}_{num_queries}q_{num_iterations}i_{sample_fraction}s/
-            std::string output_dir = "usearch/results/unreachable_points/" + experiment + dataset.name + "_" + std::to_string(test_vectors_count) + "q_" + std::to_string(max_iterations) + "i_" + perc_formatted + "s/";
+            // dir name: usearch/results/{experiment}/{dataset_name}_{num_queries}q_{num_iterations}i_{sample_fraction}r/
+            std::string output_dir = "usearch/results/unreachable_points/" + experiment + dataset.name + "_" + std::to_string(test_vectors_count) + "q_" + std::to_string(max_iterations) + "i_" + std::to_string(sample_size) + "r/";
             // Create the directory if it doesn't exist
             std::filesystem::create_directories(output_dir);
             FileOperations::cleanupOutputFiles(output_dir);
@@ -186,8 +185,7 @@ int main() {
     int max_iterations = 3000;
     int threads = 32;
 
-    // original - no changes to fixed-size ring buffer, tests original USearch implementation w/o changing source code
-    // no_rb_cap - ring buffer cap increased to ceil2(50000) (highest expected add/del batch so all add followed by del replace 100% of deleted nodes). (!!) Requires changing index.hpp reserve ring buffer implementation min val
+    // original_ - tests original USearch implementation w/o changing source code
     experiment = "original_";
 
     try {

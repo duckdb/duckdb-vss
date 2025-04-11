@@ -130,8 +130,8 @@ USearchFullCoverageRunner(int iterations = 100, int threads = 64) : db(nullptr),
             QueryRunner::aggregateBMStats(con, dataset.name + "_search", test_vectors_count, (dataset_cardinality/partitions.size()));
 
             // Output experiment results to CSV
-            // dir name: usearch/results/{experiment}/{dataset_name}_{num_queries}q_{num_iterations}i_{partition_size}p/
-            std::string output_dir = "usearch/results/fullcoverage/" + experiment + dataset.name + "_" + std::to_string(test_vectors_count) + "q_" + std::to_string(max_iterations) + "i_" + std::to_string(dataset_cardinality/partitions.size()) + "p/";
+            // dir name: usearch/results/{experiment}/{dataset_name}_{num_queries}q_{num_iterations}i_{partition_size}r/
+            std::string output_dir = "usearch/results/fullcoverage/" + experiment + dataset.name + "_" + std::to_string(test_vectors_count) + "q_" + std::to_string(max_iterations) + "i_" + std::to_string(dataset_cardinality/partitions.size()) + "r/";
             // Create the directory if it doesn't exist
             std::filesystem::create_directories(output_dir);
             FileOperations::cleanupOutputFiles(output_dir);
@@ -144,6 +144,7 @@ USearchFullCoverageRunner(int iterations = 100, int threads = 64) : db(nullptr),
             // Move lib output files to output dir
             FileOperations::copyFileTo("node_connectivity.csv", output_dir + "node_connectivity.csv");
             FileOperations::copyFileTo("memory_stats.csv", output_dir + "memory_stats.csv");
+            FileOperations::copyFileTo("node_neighbors.csv", output_dir + "node_neighbors.csv");
 
             // Cleanup intermediate files
             FileOperations::cleanupOutputFiles(std::filesystem::current_path());
@@ -172,18 +173,17 @@ int main() {
     int max_iterations = 100;
     int threads = 32;
     
-    // original - no changes to fixed-size ring buffer, tests original USearch implementation w/o changing source code
-    // no_rb_cap - ring buffer cap increased to ceil2(50000) (highest expected add/del batch so all add followed by del replace 100% of deleted nodes). (!!) Requires changing index.hpp reserve ring buffer implementation min val
+    // original_ - tests original USearch implementation w/o changing source code
     experiment = "original_";
 
     try {
-        // fashion_mnist
-        USearchFullCoverageRunner fm_runner(max_iterations, threads);
-        fm_runner.runTest(0);
+        // // fashion_mnist
+        // USearchFullCoverageRunner fm_runner(max_iterations, threads);
+        // fm_runner.runTest(0);
 
-        // mnist
-        USearchFullCoverageRunner m_runner(max_iterations, threads);
-        m_runner.runTest(1);
+        // // mnist
+        // USearchFullCoverageRunner m_runner(max_iterations, threads);
+        // m_runner.runTest(1);
 
         // sift
         USearchFullCoverageRunner s_runner(max_iterations, threads);
