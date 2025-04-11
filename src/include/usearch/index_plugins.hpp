@@ -29,7 +29,11 @@
 #if defined(__AVX512F__)
 #define USEARCH_USE_FP16LIB 0
 #elif defined(USEARCH_DEFINED_ARM)
-#include <arm_fp16.h> // `__fp16`
+#if __has_include(<arm_fp16.h>)
+#include <arm_fp16.h> // `__fp16` 
+#elif __has_include(<arm_neon.h>)
+#include <arm_neon.h> // May provide `__fp16` on some ARM systems
+#endif
 #define USEARCH_USE_FP16LIB 0
 #else
 #define USEARCH_USE_FP16LIB 1
