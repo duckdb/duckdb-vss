@@ -298,12 +298,13 @@ size_t IndexOperations::singleRemove(
     size_t removed_count = 0;
 
     auto batch_start = std::chrono::high_resolution_clock::now();
+    size_t total_vectors = sample_vecs->RowCount();
 
     try {
         for (idx_t i = 0; i < sample_vecs->RowCount(); i++) {
             auto id = sample_vecs->GetValue<int>(0, i);
             auto start_time = std::chrono::high_resolution_clock::now();
-            index.remove(id);
+            index.remove(id, total_vectors);
             auto end_time = std::chrono::high_resolution_clock::now();
             auto duration = std::chrono::duration<double>(end_time - start_time).count();
             del_bm_appender.AppendRow(
