@@ -1488,10 +1488,6 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         tableint currObj = enterpoint_node_;
         dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(enterpoint_node_), dist_func_param_);
     
-        // Reset metrics
-        metric_hops = 0;
-        metric_distance_computations = 0;
-    
         for (int level = maxlevel_; level > 0; level--) {
             bool changed = true;
             while (changed) {
@@ -1500,9 +1496,6 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     
                 data = (unsigned int *) get_linklist(currObj, level);
                 int size = getListCount(data);
-                metric_hops++;
-                metric_distance_computations += size;
-    
                 tableint *datal = (tableint *) (data + 1);
                 for (int i = 0; i < size; i++) {
                     tableint cand = datal[i];
@@ -1530,8 +1523,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     currObj, query_data, std::max(ef_, k), isIdAllowed);
         }
 
-        // Update metrics during base layer traversal
-        metric_hops += base_result.base_metric_distance_computations;
+        metric_hops += base_result.base_metric_hops;
         metric_distance_computations += base_result.base_metric_distance_computations;
         top_candidates = base_result.top_candidates;
     
