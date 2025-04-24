@@ -24,7 +24,6 @@ set(UTILS_SOURCES
     usearch/helpers/database_setup.cpp
     usearch/helpers/file_operations.cpp
     usearch/helpers/query_runner.cpp
-    # Add any missing implementation files here
 )
 
 # Shared helper classes - built as STATIC library
@@ -43,6 +42,3 @@ target_link_libraries(usearch_full_coverage usearch_utils duckdb)
 target_link_libraries(usearch_new_data usearch_utils duckdb)
 target_link_libraries(usearch_unreachable_points usearch_utils duckdb)
 target_link_libraries(usearch_create_indexes usearch_utils duckdb)
-
-# Show verbose output during linking if there are issues
-set(CMAKE_VERBOSE_MAKEFILE ON)
