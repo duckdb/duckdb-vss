@@ -72,8 +72,6 @@ USearchFullCoverageRunner(int iterations = 100, int threads = 64) : db(nullptr),
             // Log initial index stats
             index.log_links();
 
-            return;
-
             // Get test vectors
             auto test_vectors = con.Query("SELECT * FROM " + dataset.name + "_test;");
             auto test_vectors_count = test_vectors->RowCount();
@@ -183,7 +181,6 @@ int main() {
         USearchFullCoverageRunner fm_runner(max_iterations, threads);
         fm_runner.runTest(0);
 
-        return 1;
         // mnist
         USearchFullCoverageRunner m_runner(max_iterations, threads);
         m_runner.runTest(1);
