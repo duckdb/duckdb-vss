@@ -86,7 +86,7 @@ USearchNewDataRunner(int iterations = 100, int threads = 64) : db(nullptr), con(
             Appender early_termination_appender(con, "early_terminated_queries");
 
             // Initial query run (multi-threaded)
-            IndexOperations::parallelRunTestQueries(con, index, dataset.name, test_vectors, appender, search_bm_appender, early_termination_appender, 0, dataset_cardinality, true);
+            IndexOperations::parallelRunTestQueries(con, index, dataset.name, test_vectors, appender, search_bm_appender, early_termination_appender, 0, dataset_cardinality);
 
             // Run iterations
             for (int iteration = 1; iteration <= 10; iteration++) {
@@ -110,7 +110,7 @@ USearchNewDataRunner(int iterations = 100, int threads = 64) : db(nullptr), con(
                 // Run test queries (multi-threaded)
                 IndexOperations::parallelRunTestQueries(con, index, dataset.name, test_vectors, appender, 
                                         search_bm_appender, early_termination_appender, 
-                                        iteration, dataset_cardinality, true);
+                                        iteration, dataset_cardinality);
 
                 std::cout << "✅ FINISHED ITERATION " << iteration << " ✅" << std::endl;
             }
@@ -177,16 +177,16 @@ int main() {
     int threads = 32;
     
     // original_ - tests original USearch implementation w/o changing source code
-    experiment = "original_";
+    experiment = "usearch_";
 
     try {
-        // // fashion_mnist
-        // USearchNewDataRunner fm_runner(max_iterations, threads);
-        // fm_runner.runTest(0);
+        // fashion_mnist
+        USearchNewDataRunner fm_runner(max_iterations, threads);
+        fm_runner.runTest(0);
 
-        // // mnist
-        // USearchNewDataRunner m_runner(max_iterations, threads);
-        // m_runner.runTest(1);
+        // mnist
+        USearchNewDataRunner m_runner(max_iterations, threads);
+        m_runner.runTest(1);
 
         // sift
         USearchNewDataRunner s_runner(max_iterations, threads);

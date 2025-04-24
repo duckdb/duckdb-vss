@@ -186,7 +186,7 @@ int main() {
     int threads = 32;
 
     // original_ - tests original USearch implementation w/o changing source code
-    experiment = "original_";
+    experiment = "usearch_";
 
     try {
         // fashion_mnist

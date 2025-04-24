@@ -182,16 +182,16 @@ int main() {
     int threads = 32;
     
     // original_ - tests original USearch implementation w/o changing source code
-    experiment = "original_";
+    experiment = "usearch_";
 
     try {
-        // // fashion_mnist
-        // USearchRandomRunner fm_runner(max_iterations, threads);
-        // fm_runner.runTest(0);
+        // fashion_mnist
+        USearchRandomRunner fm_runner(max_iterations, threads);
+        fm_runner.runTest(0);
 
-        // // mnist
-        // USearchRandomRunner m_runner(max_iterations, threads);
-        // m_runner.runTest(1);
+        // mnist
+        USearchRandomRunner m_runner(max_iterations, threads);
+        m_runner.runTest(1);
 
         // sift
         USearchRandomRunner s_runner(max_iterations, threads);
