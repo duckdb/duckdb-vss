@@ -1,21 +1,4 @@
-.PHONY: clean prepare-build duckdb-vss duckdb-vss-debug bm_performance recall recall-debug usearch_random usearch_full_coverage usearch_new_data usearch_create_indexes all-usearch build-usearch
-
-# Build everything once, then run all programs
-all-usearch: build-usearch
-	build/usearch_unreachable_points
-	build/usearch_full_coverage
-	build/usearch_random
-	build/usearch_new_data
-
-# Build all executables only once
-build-usearch: clean prepare-build
-	cd build && cmake .. && make
-
-clean:
-	rm -rf build
-
-prepare-build:
-	mkdir -p build
+.PHONY: clean prepare-build duckdb-vss duckdb-vss-debug build run-create-indexes run-random run-full-coverage run-new-data run-unreachable-points run-all-experiments
 
 duckdb-vss:
 	cd ../ && make
@@ -23,17 +6,31 @@ duckdb-vss:
 duckdb-vss-debug:
 	cd ../ && make debug
 
-usearch_random: build-usearch
-	build/usearch_random
+clean:
+	rm -rf build
 
-usearch_unreachable_points: build-usearch
-	build/usearch_unreachable_points
+prepare-build:
+	mkdir -p build
 
-usearch_full_coverage: build-usearch
-	build/usearch_full_coverage
+build: clean prepare-build
+	cd build && cmake .. && make
 
-usearch_new_data: build-usearch
-	build/usearch_new_data
+run-create-indexes: build
+	./build/usearch_create_indexes
+	
+run-random: build
+	./build/usearch_random
+run-full-coverage: build
+	./build/usearch_full_coverage
+run-new-data: build
+	./build/usearch_new_data
+run-unreachable-points: build
+	./build/usearch_unreachable_points
 
-usearch_create_indexes: build-usearch
-	build/usearch_create_indexes
+run-all-experiments: build
+	@echo "Running all usearch experiments..."
+	./build/usearch_random
+	./build/usearch_full_coverage
+	./build/usearch_new_data
+	./build/usearch_unreachable_points
+	@echo "All usearch experiments completed."
