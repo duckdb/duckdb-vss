@@ -10,6 +10,7 @@ from scripts.plots.plot_utils import (load_csv_data, calculate_error_bounds,
                         plot_with_error_bounds, setup_plot_style, save_plot, set_axis_limits)
 
 def plot_early_termination_analysis(
+    dataset_name: str,
     df: pd.DataFrame,
     save_dir: str,
     filename: str
@@ -24,7 +25,7 @@ def plot_early_termination_analysis(
 
 
     # Extract dataset name from the filename
-    dataset_name = df['dataset'].iloc[0]
+    # dataset_name = df['dataset'].iloc[0]
 
     # Check if required columns exist
     required_cols = ['iteration']
@@ -168,14 +169,15 @@ def plot_early_termination_analysis(
         plt.tight_layout()
         save_plot(fig, save_dir, f"{filename}_relationships")
 
-def plot_visited_vs_computed(df: pd.DataFrame,
+def plot_visited_vs_computed(dataset_name: str,
+                      df: pd.DataFrame,
                       save_dir: str,
                       filename: str):
     """Plot the relationship between visited members and computed distances."""
     setup_plot_style()
 
     # Extract dataset name from the title
-    dataset_name = df['dataset'].iloc[0]
+    # dataset_name = df['dataset'].iloc[0]
 
     fig, ax = plt.subplots(figsize=(10, 6))
 
@@ -270,12 +272,20 @@ def generate_search_analysis_plots(experiment_paths: Dict[str, List[str]]):
     for scenario, paths in experiment_paths.items():
         for dataset_path in paths:
             save_dir = os.path.join(dataset_path, 'images')
+            # os.makedirs(save_dir, exist_ok=True)
+
+            dataset_name = os.path.basename(dataset_path)
+            dataset_name = "fashion-mnist" if "fashion_mnist" in dataset_name else dataset_name.split('_')[1]
 
             # Search query stats plots (aggregated data)
             search_stats_path = os.path.join(dataset_path, 'search_query_stats.csv')
             if os.path.exists(search_stats_path):
                 search_df = load_csv_data(search_stats_path)
-                dataset_name = search_df['dataset'].iloc[0]
+                
+                # Only run if search_df is not empty
+                if search_df.empty:
+                    print(f"Warning: No data available for {search_stats_path}")
+                    continue
 
                 # Generate individual metric plots
                 for metric in search_metrics:
@@ -289,6 +299,7 @@ def generate_search_analysis_plots(experiment_paths: Dict[str, List[str]]):
                     )
 
                 plot_visited_vs_computed(
+                    dataset_name,
                     search_df,
                     save_dir,
                     f'{scenario}_search_efficiency'
@@ -298,7 +309,12 @@ def generate_search_analysis_plots(experiment_paths: Dict[str, List[str]]):
             early_termination_path = os.path.join(dataset_path, 'early_terminated_queries.csv')
             if os.path.exists(early_termination_path):
                 early_termination_df = load_csv_data(early_termination_path)
+                # Only run if early_termination_df is not empty
+                if early_termination_df.empty:
+                    print(f"Warning: No data available for {early_termination_path}")
+                    continue
                 plot_early_termination_analysis(
+                    dataset_name,
                     early_termination_df,
                     save_dir,
                     f'{scenario}_early_termination'

@@ -449,7 +449,7 @@ def generate_memory_connectivity_plots(experiment_paths: Dict[str, List[str]]):
                 # Plot scatter and recall plots if search stats exist
                 if os.path.exists(search_stats_path):
                     search_df = load_csv_data(search_stats_path)
-                    dataset_name = search_df['dataset'].iloc[0]
+                    # dataset_name = search_df['dataset'].iloc[0]
                     if len(search_df) == len(connectivity_df):
                         # New scatter plot with mean recall colormap
                         plot_connectivity_scatter(
