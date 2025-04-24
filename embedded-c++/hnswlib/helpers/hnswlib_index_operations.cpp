@@ -538,8 +538,7 @@ void HNSWLibIndexOperations::parallelRunTestQueries(Connection& con, Hierarchica
         neighbor_ids_values.reserve(test_vectors->RowCount());
 
         for (idx_t i = 0; i < test_vectors->RowCount(); i++) {
-            test_vecs.push_back(ExtractFloatVector(test_vectors->GetValue(1, i)));
-
+            
             // Extract neighbor IDs and filter to include only those present in the index
             auto original_neighbors = ExtractSizeVector(test_vectors->GetValue(2, i));
             std::vector<size_t> filtered_neighbors;
@@ -553,6 +552,13 @@ void HNSWLibIndexOperations::parallelRunTestQueries(Connection& con, Hierarchica
                     filtered_neighbors.push_back(idx->first);
                 }
             }
+            // Skip test vector if no valid neighbors are found
+            if (filtered_neighbors.empty()) {
+                continue;
+            }
+            
+            // Only extract the test vector if valid neighbors are found
+            test_vecs.push_back(ExtractFloatVector(test_vectors->GetValue(1, i)));
 
             // Convert filtered neighbors back to DuckDB Value
             std::vector<Value> filtered_values;
@@ -613,9 +619,6 @@ void HNSWLibIndexOperations::parallelRunTestQueries(Connection& con, Hierarchica
         if (early_term_results.size() > 0) {
             std::cout << "Appending " << early_term_results.size() << " early termination results" << std::endl;
             for (const auto& result : early_term_results) {
-                
-                
-                
                 try {
                     early_term_appender.AppendRow(
                         Value(std::get<0>(result)),                // dataset name

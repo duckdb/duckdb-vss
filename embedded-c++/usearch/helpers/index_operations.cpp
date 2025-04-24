@@ -689,7 +689,7 @@ TestVectorData IndexOperations::parallelExactSearch(Connection& con, index_dense
  */
 void IndexOperations::parallelRunTestQueries(Connection& con, index_dense_gt<row_t>& index, const std::string& table_name,
     const unique_ptr<MaterializedQueryResult>& test_vectors, Appender& appender, Appender& search_appender, 
-    Appender& early_term_appender, int iteration, int dataset_size) {
+    Appender& early_term_appender, int iteration, int dataset_size, bool get_neighbors) {
     std::cout << "🧪 RUNNING TEST QUERIES 🧪" << std::endl;
 
     try {
@@ -702,11 +702,19 @@ void IndexOperations::parallelRunTestQueries(Connection& con, index_dense_gt<row
         test_vector_indices.reserve(test_vectors->RowCount());
         neighbor_ids_values.reserve(test_vectors->RowCount());
 
-        // Get the neighbors for each iteration though exact search where k = 100
-        TestVectorData data = parallelExactSearch(con, index, test_vectors);
-        test_vecs = data.test_vecs;
-        test_vector_indices = data.test_vector_indices;
-        neighbor_ids_values = data.neighbor_ids_values;
+        // For new data scenario we get the neighbors for each iteration
+        if (get_neighbors) {
+            TestVectorData data = parallelExactSearch(con, index, test_vectors);
+            test_vecs = data.test_vecs;
+            test_vector_indices = data.test_vector_indices;
+            neighbor_ids_values = data.neighbor_ids_values;
+        } else {
+            for (idx_t i = 0; i < test_vectors->RowCount(); i++) {
+                test_vecs.push_back(ExtractFloatVector(test_vectors->GetValue(1, i)));
+                test_vector_indices.push_back(test_vectors->GetValue(0, i).GetValue<int>());
+                neighbor_ids_values.push_back(test_vectors->GetValue(2, i));
+            }
+        }
 
         // Thread-safe containers for results
         std::mutex results_mutex;
