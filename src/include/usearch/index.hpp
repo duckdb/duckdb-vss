@@ -3113,6 +3113,56 @@ class index_gt {
         tape_allocator_ = std::move(reordered_tape);
         entry_slot_ = old_slot_to_new[entry_slot_];
     }
+    
+    /**
+     *  @brief  Scans the whole collection, removing the links leading towards
+     *          banned entries. This essentially isolates some nodes from the rest
+     *          of the graph, while keeping their outgoing links, in case the node
+     *          is structurally relevant and has a crucial role in the index.
+     *          It won't reclaim the memory.
+     *
+     *  @param[in] allow_member Predicate to mark nodes for isolation.
+     *  @param[in] executor Thread-pool to execute the job in parallel.
+     *  @param[in] progress Callback to report the execution progress.
+     */
+    template <                                        //
+        typename allow_member_at = dummy_predicate_t, //
+        typename executor_at = dummy_executor_t,      //
+        typename progress_at = dummy_progress_t       //
+        >
+    void isolate(                               //
+        allow_member_at&& allow_member,         //
+        executor_at&& executor = executor_at{}, //
+        progress_at&& progress = progress_at{}) noexcept {
+
+        // Progress status
+        std::atomic<bool> do_tasks{true};
+        std::atomic<std::size_t> processed{0};
+
+        // Erase all the incoming links
+        std::size_t nodes_count = size();
+        executor.dynamic(nodes_count, [&](std::size_t thread_idx, std::size_t node_idx) {
+            node_t node = node_at_(node_idx);
+            for (level_t level = 0; level <= node.level(); ++level) {
+                neighbors_ref_t neighbors = neighbors_(node, level);
+                std::size_t old_size = neighbors.size();
+                neighbors.clear();
+                for (std::size_t i = 0; i != old_size; ++i) {
+                    compressed_slot_t neighbor_slot = neighbors[i];
+                    node_t neighbor = node_at_(neighbor_slot);
+                    if (allow_member(member_cref_t{neighbor.ckey(), neighbor_slot}))
+                        neighbors.push_back(neighbor_slot);
+                }
+            }
+            ++processed;
+            if (thread_idx == 0)
+                do_tasks = progress(processed.load(), nodes_count);
+            return do_tasks.load();
+        });
+
+        // At the end report the latest numbers, because the reporter thread may be finished earlier
+        progress(processed.load(), nodes_count);
+    }
 
     /**
      *  @brief  Logs unreachable and isolated nodes with level-specific connectivity metrics.
