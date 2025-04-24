@@ -1221,6 +1221,7 @@ class index_dense_gt {
     /**
      *  @brief Removes an entry with the specified key from the index.
      *  @param[in] key The key of the entry to remove.
+     *  @param[in] batch_size (!ADDED PARAMETER) Expected batch size of experiment deletions.
      *  @return The ::labeling_result_t indicating the result of the removal operation.
      *          If the removal was successful, `result.completed` will be `true`.
      *          If the key was not found in the index, `result.completed` will be `false`.
