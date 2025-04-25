@@ -48,6 +48,7 @@ USearchNewDataRunner(int iterations = 100, int threads = 64) : db(nullptr), con(
             DatabaseSetup::initializeBMTable(con, dataset.name + "_search");
             DatabaseSetup::intializeEarlyTermTable(con);
             DatabaseSetup::setupFullDataset(con, dataset);
+            DatabaseSetup::setupGroundTruthTable(con, dataset.name, dataset.dimensions);
 
             // Create the usearch index
             std::size_t vector_size = dataset.dimensions;
@@ -74,9 +75,9 @@ USearchNewDataRunner(int iterations = 100, int threads = 64) : db(nullptr), con(
             // Log initial index stats
             index.log_links();
 
-            // Get test vectors
-            auto test_vectors = con.Query("SELECT * FROM " + dataset.name + "_test;");
-            auto test_vectors_count = test_vectors->RowCount();
+            // Get test vectors with ground truth neighbor ids (from brute force knn)
+            auto test_vectors = con.Query("SELECT * FROM " + dataset.name + "_ground_truth;");
+            auto test_vectors_count = con.Query("SELECT distinct id FROM " + dataset.name + "_ground_truth;")->RowCount();
 
             // Create appender for results
             Appender appender(con, dataset.name + "_results");
@@ -86,7 +87,7 @@ USearchNewDataRunner(int iterations = 100, int threads = 64) : db(nullptr), con(
             Appender early_termination_appender(con, "early_terminated_queries");
 
             // Initial query run (multi-threaded)
-            IndexOperations::parallelRunTestQueries(con, index, dataset.name, test_vectors, appender, search_bm_appender, early_termination_appender, 0, dataset_cardinality, true);
+            IndexOperations::parallelRunTestQueries(con, index, dataset.name, test_vectors, appender, search_bm_appender, early_termination_appender, 0, dataset_cardinality);
 
             // Run iterations
             for (int iteration = 1; iteration <= 10; iteration++) {
@@ -110,7 +111,7 @@ USearchNewDataRunner(int iterations = 100, int threads = 64) : db(nullptr), con(
                 // Run test queries (multi-threaded)
                 IndexOperations::parallelRunTestQueries(con, index, dataset.name, test_vectors, appender, 
                                         search_bm_appender, early_termination_appender, 
-                                        iteration, dataset_cardinality, true);
+                                        iteration, dataset_cardinality);
 
                 std::cout << "✅ FINISHED ITERATION " << iteration << " ✅" << std::endl;
             }
@@ -184,17 +185,17 @@ int main() {
         USearchNewDataRunner fm_runner(max_iterations, threads);
         fm_runner.runTest(0);
 
-        // mnist
-        USearchNewDataRunner m_runner(max_iterations, threads);
-        m_runner.runTest(1);
+        // // mnist
+        // USearchNewDataRunner m_runner(max_iterations, threads);
+        // m_runner.runTest(1);
 
-        // sift
-        USearchNewDataRunner s_runner(max_iterations, threads);
-        s_runner.runTest(2);
+        // // sift
+        // USearchNewDataRunner s_runner(max_iterations, threads);
+        // s_runner.runTest(2);
 
-        // gist
-        USearchNewDataRunner g_runner(max_iterations, threads);
-        g_runner.runTest(3);
+        // // gist
+        // USearchNewDataRunner g_runner(max_iterations, threads);
+        // g_runner.runTest(3);
 
         return 0;
     } catch (std::exception& e) {

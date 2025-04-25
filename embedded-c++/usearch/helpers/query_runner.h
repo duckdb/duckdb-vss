@@ -16,4 +16,5 @@ public:
     static unique_ptr<MaterializedQueryResult> getSampleVectors(Connection& con, const std::string& table_name, int rows = 1);
     static unique_ptr<MaterializedQueryResult> getSampleNonUnreachableVectors(Connection& con, const std::string& table_name, int rows = 5);
     static std::vector<unique_ptr<MaterializedQueryResult>> partitionDataset(Connection& con, const std::string& table_name, int num_partitions = 100);
+    static unique_ptr<MaterializedQueryResult> getGroundTruth(Connection& con, const std::string& dataset);
 };

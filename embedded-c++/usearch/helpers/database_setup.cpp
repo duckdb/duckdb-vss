@@ -35,6 +35,22 @@ void DatabaseSetup::setupTestTable(Connection& con, const std::string& table_nam
     }
 }
 
+void DatabaseSetup::setupGroundTruthTable(Connection& con, const std::string& table_name, int vector_dimensionality) {
+    con.Query("ATTACH 'raw.db' AS raw (READ_ONLY);");
+
+    con.Query("CREATE OR REPLACE TABLE memory." + table_name + "_ground_truth" +
+              " (id INTEGER, vec FLOAT[" + std::to_string(vector_dimensionality) + "], neighbor_id INTEGER, distance FLOAT)");
+
+    con.Query("INSERT INTO memory." + table_name + "_ground_truth" +
+              " SELECT * FROM raw." + table_name + "_ground_truth;");
+
+    auto test_res = con.Query("SELECT * FROM memory." + table_name + "_ground_truth" + " LIMIT 1;");
+    if (test_res->RowCount() != 1) {
+        throw std::runtime_error("Setup failed: Expected 1 row in test table");
+    }
+    con.Query("DETACH raw;");
+}
+
 void DatabaseSetup::setupFullDataset(Connection& con, const DatasetConfig& config) {
     con.Query("ATTACH 'raw.db' AS raw (READ_ONLY);");
 
@@ -89,4 +105,44 @@ void DatabaseSetup::intializeEarlyTermTable(Connection& con) {
 void DatabaseSetup::exportResultsToCSV(Connection& con, const std::string& table_name) {
     con.Query("COPY memory.recall_stats TO '" + table_name + "_output.csv' (HEADER, DELIMITER ',');");
     con.Query("COPY memory." + table_name + "_bm TO '" + table_name + "_bm.csv' (HEADER, DELIMITER ',');");
+}
+
+void DatabaseSetup::generateGroundTruthTable(Connection& con, const std::string& table_name, int vector_dimensionality) {
+    con.Query("ATTACH 'raw.db';");
+
+    con.Query("CREATE OR REPLACE TABLE raw." + table_name + "_ground_truth" +
+              " (id INTEGER, vec FLOAT[" + std::to_string(vector_dimensionality) + "], neighbor_id INTEGER, distance FLOAT)");
+
+    // Insert into ground truth table with one row per neighbor and distance
+    con.Query("WITH query_vectors AS ("
+                "SELECT "
+                "id as query_id,"
+                "vec AS query_vec "
+                "FROM raw." + table_name + "_test"
+                "), "
+                "distances AS ("
+                "SELECT "
+                "query_vectors.query_id,"
+                "query_vectors.query_vec,"
+                "train.id AS neighbor_id,"
+                "array_distance(train.vec, query_vectors.query_vec) AS distance "
+                "FROM raw." + table_name + "_train AS train "
+                "CROSS JOIN query_vectors "
+                ") "
+                "INSERT INTO raw." + table_name + "_ground_truth "
+                "SELECT "
+                "query_id AS id,"
+                "query_vec AS vec,"
+                "neighbor_id,"
+                "distance "
+                "FROM distances "
+                "ORDER BY query_id, distance ASC;");
+    
+    // Verify data was inserted correctly
+    auto count_res = con.Query("SELECT COUNT(*) FROM raw." + table_name + "_ground_truth;");
+    if (count_res->RowCount() != 1) {
+        throw std::runtime_error("Setup failed: Could not count rows in ground truth table");
+    }
+    
+    con.Query("DETACH raw;");
 }
