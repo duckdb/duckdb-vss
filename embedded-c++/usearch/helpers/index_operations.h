@@ -26,24 +26,9 @@ struct TestVectorData {
 
 class IndexOperations {
 public:
-    static void runTestQueries(Connection& con, index_dense_gt<row_t>& index, const std::string& table_name,
-        const unique_ptr<MaterializedQueryResult>& test_vectors, Appender& appender, Appender& search_appender, 
-        Appender& early_term_appender, int iteration, int dataset_size);
-        
     static void parallelRunTestQueries(Connection& con, index_dense_gt<row_t>& index, const std::string& table_name,
         const unique_ptr<MaterializedQueryResult>& test_vectors, Appender& appender, Appender& search_appender, 
         Appender& early_term_appender, int iteration, int dataset_size);
-    
-    static TestVectorData parallelExactSearch(Connection& con, index_dense_gt<row_t>& index,
-        const unique_ptr<MaterializedQueryResult>& test_vectors);
-
-    static size_t singleAdd(
-        index_dense_gt<row_t>& index,
-        const unique_ptr<MaterializedQueryResult>& sample_vecs,
-        const std::string& dataset_name,
-        int iteration,
-        Appender& add_bm_appender
-    );
     
     static size_t parallelAdd(
         index_dense_gt<row_t>& index,

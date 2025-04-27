@@ -4,8 +4,6 @@
 
 using namespace hnswlib;
 
-
-
 std::vector<float> ExtractFloatVector(const Value& value) {
 
     // Handle FLOAT[N] array types
@@ -135,46 +133,6 @@ std::vector<size_t> ExtractSizeVector(const Value& value) {
     }
 
     throw ConversionException("Not a list or array type: " + value.type().ToString());
-}
-
-/**
- * Performs vector addition to the index (single thread)
- * 
- * @param index The HNSWLib index to add vectors to
- * @param sample_vecs The result set containing vectors to add
- * @param dataset_name The name of the dataset for benchmarking
- * @param iteration The current iteration number
- * @param add_bm_appender Appender for benchmarking results
- * @return Number of vectors successfully added
- */
-size_t HNSWLibIndexOperations::singleAdd(
-    HierarchicalNSW<float>& index,
-    const unique_ptr<MaterializedQueryResult>& sample_vecs,
-    const std::string& dataset_name,
-    int iteration,
-    Appender& add_bm_appender
-) {
-    std::cout << "🔵 ADDING SAMPLE VECTORS 🔵" << std::endl;
-    size_t added_count = 0;
-    try {
-        for (idx_t i = 0; i < sample_vecs->RowCount(); i++) {
-            auto id = sample_vecs->GetValue<int>(0, i);
-            auto vec = ExtractFloatVector(sample_vecs->GetValue(1, i));
-            auto start_time = std::chrono::high_resolution_clock::now();
-            index.addPoint(&vec[0], id, true);
-            auto end_time = std::chrono::high_resolution_clock::now();
-            auto duration = std::chrono::duration<double>(end_time - start_time).count();
-            add_bm_appender.AppendRow(
-                Value(dataset_name),
-                Value::INTEGER(iteration),
-                Value::FLOAT(duration)
-            );
-            added_count++;
-        }
-    } catch (const std::exception& e) {
-        std::cerr << "Error adding vectors: " << e.what() << std::endl;
-    }
-    return added_count;
 }
 
 /**
@@ -361,153 +319,6 @@ size_t HNSWLibIndexOperations::parallelRemove(
 }
 
 /**
- * Runs test queries on the index (single thread)
- * 
- * @param con The DuckDB connection
- * @param index The USearch index to run queries on
- * @param table_name The name of the dataset
- * @param test_vectors The result set containing test vectors
- * @param appender Appender for results table
- * @param search_appender Appender for search benchmarking table
- * @param early_term_appender Appender for early termination table
- * @param iteration The current iteration number
- * @param dataset_size The size of the dataset
- */
-void HNSWLibIndexOperations::runTestQueries(Connection& con, HierarchicalNSW<float>& index, const std::string& table_name,
-    const unique_ptr<MaterializedQueryResult>& test_vectors, Appender& appender, Appender& search_appender, Appender& early_term_appender, int iteration, int dataset_size) {
-        std::cout << "🧪 RUNNING TEST QUERIES 🧪" << std::endl;
-
-        std::priority_queue<std::pair<float, hnswlib::labeltype>> search_results;
-    
-        // Run KNN search for each test vector
-        for (idx_t i = 0; i < test_vectors->RowCount(); i++) {
-            try {
-                auto test_vec = ExtractFloatVector(test_vectors->GetValue(1, i));
-                auto test_neighbor_ids = ExtractSizeVector(test_vectors->GetValue(2, i));
-                int test_query_vector_index_int = test_vectors->GetValue(0, i).GetValue<int>();
-                Value neighbor_ids = test_vectors->GetValue(2, i);
-    
-                auto start_time = std::chrono::high_resolution_clock::now();
-                auto results = index.searchKnn(&test_vec[0], 100); // TODO wanted hardcoded
-                auto end_time = std::chrono::high_resolution_clock::now();
-                auto duration = std::chrono::duration<double>(end_time - start_time).count();
-    
-                if(results.neighbors.size() != 0) {
-                    std::vector<Value> result_vec_ids;
-                    result_vec_ids.reserve(results.neighbors.size());
-    
-                    // Create result value directly
-                    Value result_list_value;
-    
-                    for (std::size_t j = 0; j < results.neighbors.size(); ++j){
-                        size_t key = static_cast<size_t>(results.neighbors.top().first);
-                        results.neighbors.pop();
-                        
-                        result_vec_ids.push_back(Value::INTEGER(key));
-                    }
-    
-                    result_list_value =  Value::LIST(LogicalType::INTEGER, std::move(result_vec_ids));
-    
-                    // Append search results to results table
-                    try {
-                        appender.AppendRow(
-                            Value(table_name),                              // dataset name
-                            Value::INTEGER(iteration),                      // iteration number
-                            Value::INTEGER(test_query_vector_index_int),    // test vector ID
-                            neighbor_ids,                                   // ground truth neighbors
-                            result_list_value,                              // result vector IDs
-                            Value(),                                      // recall (computed later)
-                            // have to add back
-                            Value::INTEGER(results.computed_distances),     // computed distances
-                            Value::INTEGER(results.visited_members),        // visited members
-                            Value::INTEGER(results.count)                   // count
-                        );
-                    } catch (const std::exception& e) {
-                        std::cerr << "Error appending row: " << e.what() << std::endl;
-                        continue;
-                    }
-    
-                    // If < 100 results are returned, append search query stats to early termination table
-                    if (results.neighbors.size() < 100) {
-                        try {
-                            early_term_appender.AppendRow(
-                                Value(table_name),                              // dataset name
-                                Value::INTEGER(iteration),                      // iteration number
-                                Value::INTEGER(test_query_vector_index_int),    // test vector ID
-                                neighbor_ids,                                   // ground truth neighbors
-                                result_list_value,                              // result vector IDs
-                                Value(),
-                                // Have to add back                                     // recall (computed later)
-                                Value::INTEGER(results.computed_distances),     // computed distances
-                                Value::INTEGER(results.visited_members),        // visited members
-                                Value::INTEGER(results.count)                   // count
-                            );
-                        } catch (const std::exception& e) {
-                            std::cerr << "Error appending row: " << e.what() << std::endl;
-                            continue;
-                        }
-                    }
-                // 0 results returned case
-                } else {
-                    // Append search results to results table
-                    try {
-                        appender.AppendRow(
-                            Value(table_name),                              // dataset name
-                            Value::INTEGER(iteration),                      // iteration number
-                            Value::INTEGER(test_query_vector_index_int),    // test vector ID
-                            neighbor_ids,                                   // ground truth neighbors
-                            Value(),                                        // result vector IDs
-                            Value(),
-                            // have to add back                                        // recall (computed later)
-                            Value::INTEGER(results.computed_distances),     // computed distances
-                            Value::INTEGER(results.visited_members),        // visited members
-                            Value::INTEGER(results.count)                   // count
-                        );
-                    } catch (const std::exception& e) {
-                        std::cerr << "Error appending row: " << e.what() << std::endl;
-                        continue;
-                    }
-    
-                    // Append search query stats to early termination table
-                    try {
-                        early_term_appender.AppendRow(
-                            Value(table_name),                              // dataset name
-                            Value::INTEGER(iteration),                      // iteration number
-                            Value::INTEGER(test_query_vector_index_int),    // test vector ID
-                            neighbor_ids,                                   // ground truth neighbors
-                            Value(),                                        // result vector IDs
-                            Value(),                                   // recall (computed later)
-                            // have to add back                                        // recall (computed later)
-                            Value::INTEGER(results.computed_distances),     // computed distances
-                            Value::INTEGER(results.visited_members),        // visited members
-                            Value::INTEGER(results.count)                   // count
-                        );
-                    } catch (const std::exception& e) {
-                        std::cerr << "Error appending row: " << e.what() << std::endl;
-                        continue;
-                    }
-                }
-    
-                // Append search bm stats
-                try {
-                    search_appender.AppendRow(
-                        Value(table_name),
-                        Value::INTEGER(iteration),
-                        Value::FLOAT(duration)
-                    );
-                } catch (const std::exception& e) {
-                    std::cerr << "Error appending search bm row: " << e.what() << std::endl;
-                    continue;
-                }
-                
-            } catch (const std::exception& e) {
-                std::cerr << "Error processing test vector " << i << ": " << e.what() << std::endl;
-                continue;
-            }
-        }
-}
-
-/**
  * Runs test queries on the index in parallel
  * 
  * @param con The DuckDB connection
@@ -519,6 +330,7 @@ void HNSWLibIndexOperations::runTestQueries(Connection& con, HierarchicalNSW<flo
  * @param early_term_appender Appender for early termination results
  * @param iteration The current iteration number
  * @param dataset_size The size of the dataset
+ * @param index_map A map of internal IDs to index positions
  */
 void HNSWLibIndexOperations::parallelRunTestQueries(Connection& con, HierarchicalNSW<float>& index, const std::string& table_name,
     const unique_ptr<MaterializedQueryResult>& test_vectors, Appender& appender, Appender& search_appender, 
@@ -618,7 +430,8 @@ void HNSWLibIndexOperations::parallelRunTestQueries(Connection& con, Hierarchica
                                                 static_cast<unsigned int>(test_vectors->RowCount()));
         
         
-        
+        std::cout << "Starting parallel search with " << executor_threads << " threads" << std::endl;
+
         auto batch_start = std::chrono::high_resolution_clock::now();
         
         std::vector<std::vector<size_t>> converted_test_vector_indices = {std::vector<size_t>(test_vector_indices.begin(), test_vector_indices.end())};
@@ -688,7 +501,3 @@ void HNSWLibIndexOperations::parallelRunTestQueries(Connection& con, Hierarchica
         std::cerr << "Error in parallel search: " << e.what() << std::endl;
     }
 }
-
-
-    
-

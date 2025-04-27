@@ -17,22 +17,10 @@ std::vector<float> ExtractFloatVector(const Value& value);
 std::vector<size_t> ExtractSizeVector(const Value& value);
 
 class HNSWLibIndexOperations {
-public:
-    static void runTestQueries(Connection& con, HierarchicalNSW<float>& index, const std::string& table_name,
-        const unique_ptr<MaterializedQueryResult>& test_vectors, Appender& appender, Appender& search_appender, 
-        Appender& early_term_appender, int iteration, int dataset_size);
-        
+public: 
     static void parallelRunTestQueries(Connection& con, HierarchicalNSW<float>& index, const std::string& table_name,
         const unique_ptr<MaterializedQueryResult>& test_vectors, Appender& appender, Appender& search_appender, 
         Appender& early_term_appender, int iteration, int dataset_size, std::unordered_map<hnswlib::labeltype, size_t>& index_map);
-
-    static size_t singleAdd(
-        HierarchicalNSW<float>& index,
-        const unique_ptr<MaterializedQueryResult>& sample_vecs,
-        const std::string& dataset_name,
-        int iteration,
-        Appender& add_bm_appender
-    );
     
     static size_t parallelAdd(
         HierarchicalNSW<float>& index,
