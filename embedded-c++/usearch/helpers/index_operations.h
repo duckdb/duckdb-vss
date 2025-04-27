@@ -32,7 +32,7 @@ public:
         
     static void parallelRunTestQueries(Connection& con, index_dense_gt<row_t>& index, const std::string& table_name,
         const unique_ptr<MaterializedQueryResult>& test_vectors, Appender& appender, Appender& search_appender, 
-        Appender& early_term_appender, int iteration, int dataset_size, bool get_neighbors=false);
+        Appender& early_term_appender, int iteration, int dataset_size);
     
     static TestVectorData parallelExactSearch(Connection& con, index_dense_gt<row_t>& index,
         const unique_ptr<MaterializedQueryResult>& test_vectors);
