@@ -31,3 +31,4 @@ python/data/raw/*.hdf5
 *.txt
 
 *.usearch
+*.bin
