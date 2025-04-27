@@ -49,6 +49,8 @@ add_executable(usearch_create_indexes usearch/create_index.cpp)
 add_executable(hnswlib_random hnswlib/random.cpp)
 add_executable(hnswlib_full_coverage hnswlib/full_coverage.cpp)
 add_executable(hnswlib_new_data hnswlib/new_data.cpp)
+add_executable(hnswlib_unreachable_points hnswlib/unreachable_points.cpp)
+add_executable(hnswlib_create_indexes hnswlib/create_index.cpp)
 #other
 add_executable(generate_ground_truth usearch/generate_ground_truth.cpp)
 
@@ -62,5 +64,7 @@ target_link_libraries(usearch_create_indexes usearch_utils duckdb)
 target_link_libraries(hnswlib_random hnswlib_utils usearch_utils duckdb)
 target_link_libraries(hnswlib_full_coverage hnswlib_utils usearch_utils duckdb)
 target_link_libraries(hnswlib_new_data hnswlib_utils usearch_utils duckdb)
+target_link_libraries(hnswlib_unreachable_points hnswlib_utils usearch_utils duckdb)
+target_link_libraries(hnswlib_create_indexes hnswlib_utils usearch_utils duckdb)
 # other link libraries
 target_link_libraries(generate_ground_truth usearch_utils duckdb)
