@@ -8,6 +8,8 @@
 using namespace duckdb;
 using namespace hnswlib;
 
+std::string experiment;
+
 // ==================== Main Random USearch Runner ====================
 class HNSWLibRandomRunner {
 private:
@@ -18,7 +20,7 @@ private:
     int threads;
 
 public:
-HNSWLibRandomRunner(int iterations = 200, int threads = 64) : db(nullptr), con(db), max_iterations(iterations) {
+HNSWLibRandomRunner(int iterations = 200, int threads = 32) : db(nullptr), con(db), max_iterations(iterations) {
         con.Query("SET THREADS TO " + std::to_string(threads) + ";");
         datasets = DatabaseSetup::getDatasetConfigs();
     }
@@ -46,42 +48,22 @@ HNSWLibRandomRunner(int iterations = 200, int threads = 64) : db(nullptr), con(d
             DatabaseSetup::intializeEarlyTermTable(con);
             DatabaseSetup::setupFullDataset(con, dataset);
 
-            // Create the usearch index
-            std::size_t vector_size = dataset.dimensions;
-            // Create the hnswlib index
-
+            // Load the hnswlib index
             auto dataset_cardinality = con.Query("SELECT COUNT(*) FROM " + dataset.name + "_train;")->GetValue<int64_t>(0, 0);
             L2Space space(dataset.dimensions);
-            HierarchicalNSW<float> index(&space, dataset_cardinality, dataset.m, dataset.ef_construction, 100, true);
+            std::string index_path = "hnswlib/indexes/" + dataset.name + "_index.bin";
+            HierarchicalNSW<float> index(&space, index_path, false, dataset_cardinality, true);
 
-            std::vector<int> ids;
-            std::vector<std::vector<float>> vectors;
-            ids.reserve(dataset_cardinality);
-            vectors.reserve(dataset_cardinality);
-
-            auto dataset_vectors = con.Query("SELECT * FROM " + dataset.name + "_train;");
-            
-            for (idx_t i = 0; i < dataset_cardinality; i++) {
-                ids.push_back(dataset_vectors->GetValue<int>(0, i));
-                vectors.push_back(ExtractFloatVector(dataset_vectors->GetValue(1, i)));
-            }
-
-            for (std::size_t task = 0; task < dataset_cardinality; ++task) {
-                try {
-                    int id = ids[task];
-                    auto& vec = vectors[task];
-                    
-                    index.addPoint(vec.data(), id);
-                }
-                catch (const std::exception& e) {
-                    std::cerr << "Error adding vector " << task << ": " << e.what() << std::endl;
-                }
-            };
-
+            // Load the index_map
+            std::string index_map_path = "hnswlib/indexes/" + dataset.name + "_index_map.txt";
             std::unordered_map<size_t, size_t> index_map;
-            for (size_t i = 0; i < ids.size(); ++i) {
-                index_map[i] = ids[i];
+            index_map.reserve(dataset_cardinality);
+            std::ifstream index_map_file(index_map_path);
+            size_t key, value;
+            while (index_map_file >> key >> value) {
+                index_map[key] = value;
             }
+            index_map_file.close();
 
             // Log initial index stats
             index.log_memory_stats();
@@ -92,11 +74,13 @@ HNSWLibRandomRunner(int iterations = 200, int threads = 64) : db(nullptr), con(d
             auto test_vectors = con.Query("SELECT * FROM " + dataset.name + "_test;");
             auto test_vectors_count = test_vectors->RowCount();
 
+            // Dataset vectors
+            auto dataset_vectors = con.Query("SELECT * FROM " + dataset.name + "_train;");
+
             // TODO: hardcoded value
             auto perc = 0.01;
             std::ostringstream perc_str;
             perc_str << std::fixed << std::setprecision(2) << perc;
-            std::string perc_formatted = perc_str.str();
             auto sample_size = perc * dataset_cardinality;
 
             // Create appender for results
@@ -116,7 +100,7 @@ HNSWLibRandomRunner(int iterations = 200, int threads = 64) : db(nullptr), con(d
 
 
                 // Get sample vectors to delete and re-add
-                auto sample_vecs = QueryRunner::getSampleVectors(con, dataset.name, 1);
+                auto sample_vecs = QueryRunner::getSampleVectors(con, dataset.name, sample_size);
 
 
 
@@ -140,8 +124,8 @@ HNSWLibRandomRunner(int iterations = 200, int threads = 64) : db(nullptr), con(d
                 }
 
                 // Delete sample vectors (multi-threaded)
-                size_t removed = HNSWLibIndexOperations::parallelRemove(index, delete_indices, index_map, dataset.name, 
-                    iteration, del_bm_appender, threads);
+                size_t removed = HNSWLibIndexOperations::singleRemove(index, delete_indices, index_map, dataset.name, 
+                    iteration, del_bm_appender);
 
                 // Re-add the deleted vectors with their original labels
                 std::vector<size_t> new_indices(delete_indices.size());
@@ -185,7 +169,7 @@ HNSWLibRandomRunner(int iterations = 200, int threads = 64) : db(nullptr), con(d
 
             // Output experiment results to CSV
             // dir name: usearch/results/{experiment}/{dataset_name}_{num_queries}q_{num_iterations}i_{sample_fraction}s/
-            std::string output_dir = "hnswlib/results/random/" + dataset.name + "_" + std::to_string(test_vectors_count) + "q_" + std::to_string(max_iterations) + "i_" + perc_formatted + "s/";
+            std::string output_dir = "hnswlib/results/random/" +  experiment + dataset.name + "_" + std::to_string(test_vectors_count) + "q_" + std::to_string(max_iterations) + "i_" + std::to_string(sample_size) + "r/";
             // Create the directory if it doesn't exist
             std::filesystem::create_directories(output_dir);
             FileOperations::cleanupOutputFiles(output_dir);
@@ -198,6 +182,11 @@ HNSWLibRandomRunner(int iterations = 200, int threads = 64) : db(nullptr), con(d
             // Move lib output files to output dir
             FileOperations::copyFileTo("node_connectivity.csv", output_dir + "node_connectivity.csv");
             FileOperations::copyFileTo("memory_stats.csv", output_dir + "memory_stats.csv");
+
+            // Save the final index
+            std::string s_path = output_dir + "random_" + dataset.name + "_index.bin";
+            index.saveIndex(s_path);
+            std::cout << "Index saved to: " << s_path << std::endl;
 
             // Cleanup intermediate files
             FileOperations::cleanupOutputFiles(std::filesystem::current_path());
@@ -221,6 +210,8 @@ int main() {
     
     int max_iterations = 200;
     int threads = 32;
+
+    experiment = "hnswlib_";
 
     try {
         // fashion_mnist

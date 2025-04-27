@@ -8,6 +8,8 @@
 using namespace duckdb;
 using namespace hnswlib;
 
+std::string experiment;
+
 // ==================== Main Full Coverage USearch Runner ====================
 class HNSWLibFullCoverageRunner {
 private:
@@ -18,7 +20,7 @@ private:
     int threads;
 
 public:
-HNSWLibFullCoverageRunner(int iterations = 100, int threads = 8) : db(nullptr), con(db), max_iterations(iterations) {
+HNSWLibFullCoverageRunner(int iterations = 100, int threads = 32) : db(nullptr), con(db), max_iterations(iterations) {
         con.Query("SET THREADS TO " + std::to_string(threads) + ";");
         datasets = DatabaseSetup::getDatasetConfigs();
     }
@@ -46,41 +48,29 @@ HNSWLibFullCoverageRunner(int iterations = 100, int threads = 8) : db(nullptr), 
             DatabaseSetup::intializeEarlyTermTable(con);
             DatabaseSetup::setupFullDataset(con, dataset);
 
-            // Create the hnswlib index
-
+            // Load the hnswlib index
             auto dataset_cardinality = con.Query("SELECT COUNT(*) FROM " + dataset.name + "_train;")->GetValue<int64_t>(0, 0);
             L2Space space(dataset.dimensions);
-            HierarchicalNSW<float> index(&space, dataset_cardinality, dataset.m, dataset.ef_construction, 100, true);
-            
-            std::vector<int> ids;
-            std::vector<std::vector<float>> vectors;
-            ids.reserve(dataset_cardinality);
-            vectors.reserve(dataset_cardinality);
+            std::string index_path = "hnswlib/indexes/" + dataset.name + "_index.bin";
+            HierarchicalNSW<float> index(&space, index_path, false, dataset_cardinality, true);
 
-            auto dataset_vectors = con.Query("SELECT * FROM " + dataset.name + "_train;");
-        
-            for (idx_t i = 0; i < dataset_cardinality; i++) {
-                ids.push_back(dataset_vectors->GetValue<int>(0, i));
-                vectors.push_back(ExtractFloatVector(dataset_vectors->GetValue(1, i)));
-            }
-            for (std::size_t task = 0; task < dataset_cardinality; ++task) {
-                try {
-                    int id = ids[task];
-                    auto& vec = vectors[task];
-                    
-                    index.addPoint(vec.data(), id);
-                }
-                catch (const std::exception& e) {
-                    std::cerr << "Error adding vector " << task << ": " << e.what() << std::endl;
-                }
-            };
+            // Load the index_map
+            std::string index_map_path = "hnswlib/indexes/" + dataset.name + "_index_map.txt";
             std::unordered_map<size_t, size_t> index_map;
-            for (size_t i = 0; i < ids.size(); ++i) {
-                index_map[i] = ids[i];
+            index_map.reserve(dataset_cardinality);
+            std::ifstream index_map_file(index_map_path);
+            size_t key, value;
+            while (index_map_file >> key >> value) {
+                index_map[key] = value;
             }
+            index_map_file.close();
+            
             // Get test vectors
             auto test_vectors = con.Query("SELECT * FROM " + dataset.name + "_test;");
             auto test_vectors_count = test_vectors->RowCount();
+
+            // Dataset vectors
+            auto dataset_vectors = con.Query("SELECT * FROM " + dataset.name + "_train;");
 
             // Create appender for results
             Appender appender(con, dataset.name + "_results");
@@ -94,9 +84,9 @@ HNSWLibFullCoverageRunner(int iterations = 100, int threads = 8) : db(nullptr), 
 
             auto partitions = QueryRunner::partitionDataset(con, dataset.name, 100);
 
-             // Log initial index stats
-             index.log_memory_stats();
-             index.log_connectivity_stats(&space);
+            // Log initial index stats
+            index.log_memory_stats();
+            index.log_connectivity_stats(&space);
             
 
             // Run iterations
@@ -128,8 +118,8 @@ HNSWLibFullCoverageRunner(int iterations = 100, int threads = 8) : db(nullptr), 
                 }
 
                 // Delete vectors from this partition to the index
-                size_t removed = HNSWLibIndexOperations::parallelRemove(index, delete_indices, index_map, dataset.name, 
-                                                            iteration, del_bm_appender, threads);
+                size_t removed = HNSWLibIndexOperations::singleRemove(index, delete_indices, index_map, dataset.name, 
+                                                            iteration, del_bm_appender);
 
                 // Re-add the deleted vectors with their original labels
                 std::vector<size_t> new_indices(delete_indices.size());
@@ -172,7 +162,7 @@ HNSWLibFullCoverageRunner(int iterations = 100, int threads = 8) : db(nullptr), 
 
             // Output experiment results to CSV
             // dir name: usearch/results/{experiment}/{dataset_name}_{num_queries}q_{num_iterations}i_{partition_size}p/
-            std::string output_dir = "hnswlib/results/fullcoverage/" + dataset.name + "_" + std::to_string(test_vectors_count) + "q_" + std::to_string(max_iterations) + "i_" + std::to_string(dataset_cardinality/partitions.size()) + "p/";
+            std::string output_dir = "hnswlib/results/fullcoverage/" + experiment + dataset.name + "_" + std::to_string(test_vectors_count) + "q_" + std::to_string(max_iterations) + "i_" + std::to_string(dataset_cardinality/partitions.size()) + "r/";
             // Create the directory if it doesn't exist
             std::filesystem::create_directories(output_dir);
             FileOperations::cleanupOutputFiles(output_dir);
@@ -185,6 +175,11 @@ HNSWLibFullCoverageRunner(int iterations = 100, int threads = 8) : db(nullptr), 
             // Move lib output files to output dir
             FileOperations::copyFileTo("node_connectivity.csv", output_dir + "node_connectivity.csv");
             FileOperations::copyFileTo("memory_stats.csv", output_dir + "memory_stats.csv");
+
+            // Save the final index
+            std::string s_path = output_dir + "full_coverage_" + dataset.name + "_index.bin";
+            index.saveIndex(s_path);
+            std::cout << "Index saved to: " << s_path << std::endl;
 
             // Cleanup intermediate files
             FileOperations::cleanupOutputFiles(std::filesystem::current_path());
@@ -207,7 +202,9 @@ int main() {
      */
     
     int max_iterations = 100;
-    int threads = 8;
+    int threads = 32;
+
+    experiment = "hnswlib_";
 
     try {
         // fashion_mnist

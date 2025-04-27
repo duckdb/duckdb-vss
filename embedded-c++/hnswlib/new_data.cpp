@@ -8,6 +8,8 @@
 using namespace duckdb;
 using namespace hnswlib;
 
+std::string experiment;
+
 // ==================== Main New Data USearch Runner ====================
 class HNSWLibNewDataRunner {
 private:
@@ -18,7 +20,7 @@ private:
     int threads;
 
 public:
-HNSWLibNewDataRunner(int iterations = 100, int threads = 64) : db(nullptr), con(db), max_iterations(iterations) {
+HNSWLibNewDataRunner(int iterations = 10, int threads = 32) : db(nullptr), con(db), max_iterations(iterations) {
         con.Query("SET THREADS TO " + std::to_string(threads) + ";");
         datasets = DatabaseSetup::getDatasetConfigs();
     }
@@ -45,56 +47,36 @@ HNSWLibNewDataRunner(int iterations = 100, int threads = 64) : db(nullptr), con(
             DatabaseSetup::initializeBMTable(con, dataset.name + "_search");
             DatabaseSetup::intializeEarlyTermTable(con);
             DatabaseSetup::setupFullDataset(con, dataset);
+            DatabaseSetup::setupGroundTruthTable(con, dataset.name, dataset.dimensions);
 
-            // Create the hnswlib index
+            // Load the hnswlib index
             auto dataset_cardinality = con.Query("SELECT COUNT(*) FROM " + dataset.name + "_train;")->GetValue<int64_t>(0, 0);
             L2Space space(dataset.dimensions);
-            HierarchicalNSW<float> index(&space, dataset_cardinality, dataset.m, dataset.ef_construction, 100, true);
+            std::string index_path = "hnswlib/indexes/" + dataset.name + "_index_half.bin";
+            HierarchicalNSW<float> index(&space, index_path, false, dataset_cardinality/2, true);
+
+            // Load the index_map
+            std::string index_map_path = "hnswlib/indexes/" + dataset.name + "_index_map_half.txt";
+            std::unordered_map<size_t, size_t> index_map;
+            index_map.reserve(dataset_cardinality/2);
+            std::ifstream index_map_file(index_map_path);
+            size_t key, value;
+            while (index_map_file >> key >> value) {
+                index_map[key] = value;
+            }
+            index_map_file.close();
 
             // Partition dataset into 20
             auto partitions = QueryRunner::partitionDataset(con, dataset.name, 20);
             auto half_count = dataset_cardinality / 2;
-
-            std::vector<int> ids;
-            std::vector<std::vector<float>> vectors;
-            ids.reserve(half_count);
-            vectors.reserve(half_count);
-
-            std::cout << "🔍 POPULATING INDEX WITH FIRST HALF 🔍" << std::endl;
-            // Populate index with first half
-            for (idx_t i = 0; i < 20; i++) {
-                auto& partition = partitions[i];
-                for (idx_t j = 0; j < partition->RowCount(); j++) {
-                    ids.push_back(partition->GetValue<int>(0, j));
-                    vectors.push_back(ExtractFloatVector(partition->GetValue(1, j)));
-                }
-            }
-
-            for (std::size_t task = 0; task < dataset_cardinality; ++task) {             
-                try {
-                    int id = ids[task];
-                    auto& vec = vectors[task];
-                    if (task < half_count){
-                        index.addPoint(vec.data(), id);
-                    }
-                }
-                catch (const std::exception& e) {
-                    std::cerr << "Error adding vector " << task << ": " << e.what() << std::endl;
-                }
-            }
-            
-            std::unordered_map<size_t, size_t> index_map;
-            for (size_t i = 0; i < ids.size(); ++i) {
-                index_map[i] = ids[i];
-            }
                         
-             // Log initial index stats
-             index.log_memory_stats();
-             index.log_connectivity_stats(&space);
+            // Log initial index stats
+            index.log_memory_stats();
+            index.log_connectivity_stats(&space);
             
-            // Get test vectors
-            auto test_vectors = con.Query("SELECT * FROM " + dataset.name + "_test;");
-            auto test_vectors_count = test_vectors->RowCount();
+            // Get test vectors with ground truth neighbor ids (from brute force knn)
+            auto test_vectors = con.Query("SELECT * FROM " + dataset.name + "_ground_truth;");
+            auto test_vectors_count = con.Query("SELECT distinct id FROM " + dataset.name + "_ground_truth;")->RowCount();
 
             // Create appender for results
             Appender appender(con, dataset.name + "_results");
@@ -116,6 +98,7 @@ HNSWLibNewDataRunner(int iterations = 100, int threads = 64) : db(nullptr), con(
                 auto& partitions_to_add = partitions[9 + iteration];
 
                 std::vector<size_t> delete_indices;
+                delete_indices.reserve(partitions_to_remove->RowCount());
                 for (idx_t i = 0; i < partitions_to_remove->RowCount(); i++) {
                     delete_indices.push_back(partitions_to_remove->GetValue<int>(0, i));
                 }
@@ -124,8 +107,10 @@ HNSWLibNewDataRunner(int iterations = 100, int threads = 64) : db(nullptr), con(
                 size_t removed = HNSWLibIndexOperations::singleRemove(index, delete_indices, index_map, dataset.name, 
                                                           iteration, del_bm_appender);
                 
-                std::vector<size_t> new_indices(partitions_to_add->RowCount());
+                std::vector<size_t> new_indices;
+                new_indices.reserve(partitions_to_add->RowCount());
                 std::vector<std::vector<float>> new_vectors;
+                new_vectors.reserve(partitions_to_add->RowCount());
                 for (idx_t i = 0; i < partitions_to_add->RowCount(); i++) {
                     new_indices.push_back(partitions_to_add->GetValue<int>(0, i));
                     new_vectors.push_back(ExtractFloatVector(partitions_to_add->GetValue(1, i)));
@@ -161,7 +146,7 @@ HNSWLibNewDataRunner(int iterations = 100, int threads = 64) : db(nullptr), con(
 
             // Output experiment results to CSV
             // dir name: usearch/results/{experiment}/{dataset_name}_{num_queries}q_{num_iterations}i_{partition_size}p/
-            std::string output_dir = "hnswlib/results/newdata/" + dataset.name + "_" + std::to_string(test_vectors_count) + "q_" + std::to_string(max_iterations) + "i_" + std::to_string(dataset_cardinality/partitions.size()) + "p/";
+            std::string output_dir = "hnswlib/results/newdata/" +  experiment + dataset.name + "_" + std::to_string(test_vectors_count) + "q_" + std::to_string(max_iterations) + "i_" + std::to_string(dataset_cardinality/partitions.size()) + "r/";
             // Create the directory if it doesn't exist
             std::filesystem::create_directories(output_dir);
             FileOperations::cleanupOutputFiles(output_dir);
@@ -174,6 +159,11 @@ HNSWLibNewDataRunner(int iterations = 100, int threads = 64) : db(nullptr), con(
             // Move lib output files to output dir
             FileOperations::copyFileTo("node_connectivity.csv", output_dir + "node_connectivity.csv");
             FileOperations::copyFileTo("memory_stats.csv", output_dir + "memory_stats.csv");
+
+            // Save the final index
+            std::string s_path = output_dir + "new_data_" + dataset.name + "_index.bin";
+            index.saveIndex(s_path);
+            std::cout << "Index saved to: " << s_path << std::endl;
 
             // Cleanup intermediate files
             FileOperations::cleanupOutputFiles(std::filesystem::current_path());
@@ -198,6 +188,8 @@ int main() {
     
     int max_iterations = 10;
     int threads = 32;
+
+    experiment = "hnswlib_";
 
     try {
         // fashion_mnist
