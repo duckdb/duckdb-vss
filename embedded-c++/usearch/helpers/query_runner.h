@@ -15,7 +15,5 @@ public:
     static void outputTableAsCSV(Connection& con, const std::string& full_table_name, const std::string& output_file_name);
     static unique_ptr<MaterializedQueryResult> getSampleVectors(Connection& con, const std::string& table_name, int rows = 1);
     static unique_ptr<MaterializedQueryResult> getSampleReachableVectors(Connection& con, const std::string& table_name, int rows, std::unordered_set<size_t>& available_points);
-    static std::vector<int64_t> getAllDistinctNeighborIds(Connection& con, const std::string& table_name, int iteration);
-    static unique_ptr<MaterializedQueryResult> getSampleNonUnreachableVectors(Connection& con, const std::string& table_name, int rows = 5);
     static std::vector<unique_ptr<MaterializedQueryResult>> partitionDataset(Connection& con, const std::string& table_name, int num_partitions = 100);
 };

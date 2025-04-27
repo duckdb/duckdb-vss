@@ -89,37 +89,6 @@ unique_ptr<MaterializedQueryResult> QueryRunner::getSampleReachableVectors(Conne
         std::to_string(rows)+ ";");
 }
 
-std::vector<int64_t> QueryRunner::getAllDistinctNeighborIds(Connection& con, const std::string& table_name, int iteration) {
-    auto result = con.Query("SELECT neighbor_vec_ids FROM " + table_name + "_results WHERE iteration = " + std::to_string(iteration) + ";");
-    std::unordered_set<int64_t> unique_ids;
-    
-    // Process each row's neighbor_vec_ids list
-    for (idx_t row_idx = 0; row_idx < result->RowCount(); row_idx++) {
-        auto neighbor_ids = ExtractSizeVector(result->GetValue(0, row_idx));
-        for (const auto& id : neighbor_ids) {
-            unique_ids.insert(id);
-        }
-    }
-    
-    // Convert set back to vector
-    return std::vector<int64_t>(unique_ids.begin(), unique_ids.end());
-}
-
-unique_ptr<MaterializedQueryResult> QueryRunner::getSampleNonUnreachableVectors(Connection& con, const std::string& table_name, int rows) {
-    std::string unreachable_keys;
-    // Get text from txt file unreachable_points.txt
-    std::ifstream infile("unreachable_points.txt");
-    if (infile.good())
-    {
-        string sLine;
-        getline(infile, sLine);
-        unreachable_keys = sLine;
-    }
-    return con.Query(
-        "with non_up as (SELECT * FROM " + table_name + "_train where id not in (" + unreachable_keys + ")) SELECT * FROM non_up USING SAMPLE " +
-            std::to_string(rows) + ";");
-}
-
 std::vector<unique_ptr<MaterializedQueryResult>> QueryRunner::partitionDataset(
     Connection& con, 
     const std::string& table_name, 
