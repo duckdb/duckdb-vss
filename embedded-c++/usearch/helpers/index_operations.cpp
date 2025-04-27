@@ -415,51 +415,14 @@ void IndexOperations::parallelRunTestQueries(Connection& con, index_dense_gt<row
         std::vector<int> test_vector_indices;
         std::vector<Value> neighbor_ids_values;
 
-        // New data scenario test_vectors contains ground truth neighbor_ids of size test_vectors_size*dataset_size
-        // Only include ids that are in the index until neighbor_ids size == 100
-        if (test_vectors->RowCount() > 20000) {
-            auto unique_test_q_ids = con.Query("SELECT DISTINCT id, vec FROM " + table_name + "_ground_truth;");
-            test_vecs.reserve(unique_test_q_ids->RowCount());
-            test_vector_indices.reserve(unique_test_q_ids->RowCount());
-            neighbor_ids_values.reserve(unique_test_q_ids->RowCount());
-            // Extract neighbor IDs and filter to include only those present in the index
-            // Schema is id, vec, neighbor_id, distance, ordered by id, distance
-            for (idx_t i = 0; i < unique_test_q_ids->RowCount(); i++){
-                auto ground_truth_for_q_vec = con.Query("SELECT * FROM " + table_name + "_ground_truth WHERE id = " + std::to_string(unique_test_q_ids->GetValue(0, i).GetValue<int>()) + " order by distance asc;");
-                std::vector<int> top_k_neighbors;
-                top_k_neighbors.reserve(100);
-                for (idx_t j = 0; j < ground_truth_for_q_vec->RowCount(); j++) {
-                    // Filter neighbors to only include IDs that exist in the index until size == 100
-                    if (index.contains(ground_truth_for_q_vec->GetValue(2, j).GetValue<int>())) {
-                        top_k_neighbors.push_back(ground_truth_for_q_vec->GetValue(2, j).GetValue<int>());
-                    }
-                    if (top_k_neighbors.size() == 100) {
-                        break;
-                    }
-                }
-                test_vecs.push_back(ExtractFloatVector(unique_test_q_ids->GetValue(1, i)));
-                test_vector_indices.push_back(unique_test_q_ids->GetValue(0, i).GetValue<int>());
+        test_vecs.reserve(test_vectors->RowCount());
+        test_vector_indices.reserve(test_vectors->RowCount());
+        neighbor_ids_values.reserve(test_vectors->RowCount());
 
-                // Convert filtered neighbors back to DuckDB Value
-                std::vector<Value> filtered_values;
-                filtered_values.reserve(top_k_neighbors.size());
-                for (auto& id : top_k_neighbors) {
-                    filtered_values.push_back(Value::INTEGER(id));
-                }
-                // Store the filtered neighbor IDs
-                Value filtered_list_value = Value::LIST(LogicalType::INTEGER, std::move(filtered_values));
-                neighbor_ids_values.push_back(filtered_list_value);
-            }
-        } else {
-            // Normal scenario test_vectors contains ground truth neighbor_ids of size == 100
-            test_vecs.reserve(test_vectors->RowCount());
-            test_vector_indices.reserve(test_vectors->RowCount());
-            neighbor_ids_values.reserve(test_vectors->RowCount());
-            for (idx_t i = 0; i < test_vectors->RowCount(); i++) {
-                test_vecs.push_back(ExtractFloatVector(test_vectors->GetValue(1, i)));
-                test_vector_indices.push_back(test_vectors->GetValue(0, i).GetValue<int>());
-                neighbor_ids_values.push_back(test_vectors->GetValue(2, i));
-            }
+        for (idx_t i = 0; i < test_vectors->RowCount(); i++) {
+            test_vecs.push_back(ExtractFloatVector(test_vectors->GetValue(1, i)));
+            test_vector_indices.push_back(test_vectors->GetValue(0, i).GetValue<int>());
+            neighbor_ids_values.push_back(test_vectors->GetValue(2, i));
         }
 
         // Thread-safe containers for results

@@ -16,4 +16,5 @@ public:
     static unique_ptr<MaterializedQueryResult> getSampleVectors(Connection& con, const std::string& table_name, int rows = 1);
     static unique_ptr<MaterializedQueryResult> getSampleReachableVectors(Connection& con, const std::string& table_name, int rows, std::unordered_set<size_t>& available_points);
     static std::vector<unique_ptr<MaterializedQueryResult>> partitionDataset(Connection& con, const std::string& table_name, int num_partitions = 100);
+    static unique_ptr<MaterializedQueryResult> getCurrentTopKNeighbors(Connection& con, const std::string& table_name, std::unordered_set<size_t>& current_idx_keys_set);
 };

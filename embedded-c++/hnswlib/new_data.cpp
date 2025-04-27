@@ -21,7 +21,7 @@ private:
     int threads;
 
 public:
-HNSWLibNewDataRunner(int iterations, int threads) : db(nullptr), con(db), max_iterations(iterations) {
+HNSWLibNewDataRunner(int iterations, int threads) : db(nullptr), con(db), max_iterations(iterations), threads(threads) {
         con.Query("SET THREADS TO " + std::to_string(threads) + ";");
         datasets = DatabaseSetup::getDatasetConfigs();
     }
@@ -75,16 +75,26 @@ HNSWLibNewDataRunner(int iterations, int threads) : db(nullptr), con(db), max_it
             index.log_memory_stats();
             index.log_connectivity_stats(&space);
             
-            // Get test vectors with ground truth neighbor ids (from brute force knn)
-            auto test_vectors = con.Query("SELECT * FROM " + dataset.name + "_ground_truth;");
-            auto test_vectors_count = con.Query("SELECT distinct id FROM " + dataset.name + "_ground_truth;")->RowCount();
-
             // Create appender for results
             Appender appender(con, dataset.name + "_results");
             Appender del_bm_appender(con, dataset.name + "_del_bm");
             Appender add_bm_appender(con, dataset.name + "_add_bm");
             Appender search_bm_appender(con, dataset.name + "_search_bm");
             Appender early_termination_appender(con, "early_terminated_queries");
+
+            // Get current keys in index from partitions 1- 10
+            std::unordered_set<size_t> current_idx_keys_set;
+            current_idx_keys_set.reserve(dataset_cardinality/2);
+            for (int i = 0; i < 10; i++) {
+                for (idx_t j = 0; j < partitions[i]->RowCount(); j++) {
+                    current_idx_keys_set.insert(partitions[i]->GetValue<int>(0, j));
+                }
+            }
+            assert(current_idx_keys_set.size() == (dataset_cardinality/2));
+
+            // Get test vectors with ground truth neighbor ids (from brute force knn)
+            auto test_vectors = QueryRunner::getCurrentTopKNeighbors(con, dataset.name, current_idx_keys_set);
+            auto test_vectors_count = test_vectors->RowCount();
 
             // Initial query run (multi-threaded)
             HNSWLibIndexOperations::parallelRunTestQueries(con, index, dataset.name, test_vectors, appender, search_bm_appender, early_termination_appender, 0, dataset_cardinality, index_map);
@@ -123,6 +133,20 @@ HNSWLibNewDataRunner(int iterations, int threads) : db(nullptr), con(db), max_it
                 // Log index stats
                 index.log_memory_stats();
                 index.log_connectivity_stats(&space);
+
+                // Remove vectors from current_idx_keys_set
+                for (int i = 0; i < partitions_to_remove->RowCount(); i++) {
+                    current_idx_keys_set.erase(partitions_to_remove->GetValue<int>(0, i));
+                }
+                // Add new indices to current_idx_keys_set
+                for (int i = 0; i < partitions_to_add->RowCount(); i++) {
+                    current_idx_keys_set.insert(partitions_to_add->GetValue<int>(0, i));
+                }
+
+                assert(current_idx_keys_set.size() == (dataset_cardinality/2));
+
+                // Get current top 100 neighbors
+                auto current_top_100_neighbors = QueryRunner::getCurrentTopKNeighbors(con, dataset.name, current_idx_keys_set);
            
                 // Run test queries (multi-threaded)
                 HNSWLibIndexOperations::parallelRunTestQueries(con, index, dataset.name, test_vectors, appender, search_bm_appender, early_termination_appender, iteration, dataset_cardinality, index_map);

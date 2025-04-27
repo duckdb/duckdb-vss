@@ -127,3 +127,38 @@ std::vector<unique_ptr<MaterializedQueryResult>> QueryRunner::partitionDataset(
     
     return partitions;
 }
+
+unique_ptr<MaterializedQueryResult> QueryRunner::getCurrentTopKNeighbors(Connection& con, const std::string& table_name, std::unordered_set<size_t>& current_idx_keys_set) {
+    // Transform idx keys to string 
+    std::string idx_keys_str;
+    for (const auto& point : current_idx_keys_set) {
+        idx_keys_str += std::to_string(point) + ",";
+    }
+    idx_keys_str.pop_back(); // Remove the last comma
+
+    auto current_top_100_neighbors = con.Query(
+        "WITH ranked_neighbors AS ( "
+        "SELECT "
+        "query_id, "
+        "neighbor_id, "
+        "distance, "
+        "ROW_NUMBER() OVER (PARTITION BY query_id ORDER BY distance ASC) as rank "
+        "FROM " + table_name + "_ground_truth where neighbor_id in (" + idx_keys_str + ")"
+        ") "
+        "SELECT "
+        "n.query_id, "
+        "t.vec, "
+        "LIST(n.neighbor_id ORDER BY n.distance ASC) AS neighbor_ids "
+        "FROM ranked_neighbors n "
+        "JOIN " + table_name + "_test t ON n.query_id = t.id "
+        "WHERE n.rank <= 100 "
+        "GROUP BY n.query_id, t.vec;"
+    );
+
+    auto test_set = con.Query("select * from " + table_name + "_test");
+    std::cout << "test_set->RowCount(): " << test_set->RowCount() << std::endl;
+    std::cout << "current_top_100_neighbors->RowCount(): " << current_top_100_neighbors->RowCount() << std::endl;
+    assert(test_set->RowCount() == current_top_100_neighbors->RowCount());
+
+    return current_top_100_neighbors;
+}
