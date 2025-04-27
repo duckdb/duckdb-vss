@@ -21,7 +21,7 @@ private:
     int threads;
 
 public:
-USearchRandomRunner(int iterations, int threads) : db(nullptr), con(db), max_iterations(iterations) {
+USearchRandomRunner(int iterations, int threads) : db(nullptr), con(db), max_iterations(iterations), threads(threads) {
         con.Query("SET THREADS TO " + std::to_string(threads) + ";");
         datasets = DatabaseSetup::getDatasetConfigs();
     }

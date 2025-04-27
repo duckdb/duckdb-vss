@@ -18,7 +18,7 @@ private:
     int threads;
 
 public:
-HNSWLibIndexCreator(int threads) : db(nullptr), con(db) {
+HNSWLibIndexCreator(int threads) : db(nullptr), con(db), threads(threads) {
         con.Query("SET THREADS TO " + std::to_string(threads) + ";");
         datasets = DatabaseSetup::getDatasetConfigs();
     }
