@@ -3460,20 +3460,6 @@ class index_gt {
             }
         }
         
-        // TODO: Check that key is updated when replaced, i.e. that old key of replaced node is still used.
-        // If new key used, this should be equal mapping to id from DuckDB train table...
-        // Add key of unreachable nodes to csv for unreachable points experiment
-        std::ofstream up_file("unreachable_points.txt", std::ios::trunc);
-        for (const auto& node_key : unreachable_nodes) {
-            up_file << node_key;
-            // Add comma if not the last node
-            if (&node_key != &unreachable_nodes.back()) {
-                up_file << ",";
-            }
-        }
-        up_file << std::endl;
-        up_file.close();
-        
         // Count and output level-specific unreachable nodes (for analysis, not for unreachable_count)
         std::vector<std::size_t> unreachable_per_level;
         for (level_t level = 0; level <= max_level(); ++level) {
