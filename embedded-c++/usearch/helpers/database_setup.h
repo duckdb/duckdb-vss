@@ -24,5 +24,4 @@ public:
     static void initializeBMTable(Connection& con, const std::string& table_name);
     static void intializeEarlyTermTable(Connection& con);
     static void exportResultsToCSV(Connection& con, const std::string& table_name);
-    static void generateGroundTruthTable(Connection& con, const std::string& table_name, int vector_dimensionality);
 };
