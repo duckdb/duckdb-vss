@@ -1,4 +1,5 @@
 #include "query_runner.h"
+#include "index_operations.h"
 
 void QueryRunner::calculateRecall(Connection& con, const std::string& table_name) {
     std::cout << "🧮 CALCULATING RECALL 🧮" << std::endl;
@@ -75,6 +76,33 @@ unique_ptr<MaterializedQueryResult> QueryRunner::getSampleVectors(Connection& co
     return con.Query(
         "SELECT * FROM " + table_name + "_train USING SAMPLE " +
         std::to_string(rows)+ ";");
+}
+
+unique_ptr<MaterializedQueryResult> QueryRunner::getSampleReachableVectors(Connection& con, const std::string& table_name, int rows, std::unordered_set<size_t>& available_points) {
+    std::string available_points_str;
+    for (const auto& point : available_points) {
+        available_points_str += std::to_string(point) + ",";
+    }
+    available_points_str.pop_back(); // Remove the last comma
+    return con.Query(
+        "SELECT * FROM " + table_name + "_train where id in (" + available_points_str + ") USING SAMPLE " +
+        std::to_string(rows)+ ";");
+}
+
+std::vector<int64_t> QueryRunner::getAllDistinctNeighborIds(Connection& con, const std::string& table_name, int iteration) {
+    auto result = con.Query("SELECT neighbor_vec_ids FROM " + table_name + "_results WHERE iteration = " + std::to_string(iteration) + ";");
+    std::unordered_set<int64_t> unique_ids;
+    
+    // Process each row's neighbor_vec_ids list
+    for (idx_t row_idx = 0; row_idx < result->RowCount(); row_idx++) {
+        auto neighbor_ids = ExtractSizeVector(result->GetValue(0, row_idx));
+        for (const auto& id : neighbor_ids) {
+            unique_ids.insert(id);
+        }
+    }
+    
+    // Convert set back to vector
+    return std::vector<int64_t>(unique_ids.begin(), unique_ids.end());
 }
 
 unique_ptr<MaterializedQueryResult> QueryRunner::getSampleNonUnreachableVectors(Connection& con, const std::string& table_name, int rows) {
