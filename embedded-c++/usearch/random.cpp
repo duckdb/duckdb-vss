@@ -21,12 +21,12 @@ private:
     int threads;
 
 public:
-USearchRandomRunner(int iterations = 200, int threads = 64) : db(nullptr), con(db), max_iterations(iterations) {
+USearchRandomRunner(int iterations, int threads) : db(nullptr), con(db), max_iterations(iterations) {
         con.Query("SET THREADS TO " + std::to_string(threads) + ";");
         datasets = DatabaseSetup::getDatasetConfigs();
     }
 
-    void runTest(int datasetIdx = 0) {
+    void runTest(int datasetIdx) {
         try {
             // Cleanup intermediate files
             FileOperations::cleanupOutputFiles(std::filesystem::current_path());
@@ -83,7 +83,7 @@ USearchRandomRunner(int iterations = 200, int threads = 64) : db(nullptr), con(d
             auto perc = 0.01;
             std::ostringstream perc_str;
             perc_str << std::fixed << std::setprecision(2) << perc;
-            auto sample_size = perc * dataset_cardinality;
+            auto sample_size = (int) (perc * dataset_cardinality);
 
             // Create appender for results
             Appender appender(con, dataset.name + "_results");
@@ -179,26 +179,26 @@ int main() {
      */
     
     int max_iterations = 200;
-    int threads = 32;
+    std::size_t executor_threads = (std::thread::hardware_concurrency());
     
     // original_ - tests original USearch implementation w/o changing source code
     experiment = "usearch_";
 
     try {
         // fashion_mnist
-        USearchRandomRunner fm_runner(max_iterations, threads);
+        USearchRandomRunner fm_runner(max_iterations, executor_threads);
         fm_runner.runTest(0);
 
         // mnist
-        USearchRandomRunner m_runner(max_iterations, threads);
+        USearchRandomRunner m_runner(max_iterations, executor_threads);
         m_runner.runTest(1);
 
         // sift
-        USearchRandomRunner s_runner(max_iterations, threads);
+        USearchRandomRunner s_runner(max_iterations, executor_threads);
         s_runner.runTest(2);
 
         // gist
-        USearchRandomRunner g_runner(max_iterations, threads);
+        USearchRandomRunner g_runner(max_iterations, executor_threads);
         g_runner.runTest(3);
 
         return 0;

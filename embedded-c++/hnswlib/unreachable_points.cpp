@@ -91,7 +91,7 @@ HNSWLibUnreachablePointsRunner(int iterations, int threads) : db(nullptr), con(d
             auto perc = 0.05;
             std::ostringstream perc_str;
             perc_str << std::fixed << std::setprecision(2) << perc;
-            auto sample_size = perc * dataset_cardinality;
+            auto sample_size = (int) (perc * dataset_cardinality);
 
             // Create appender for results
             Appender appender(con, dataset.name + "_results");
@@ -281,7 +281,7 @@ int main() {
      * points set will not be searched in future search processes.
      */
     
-    int max_iterations = 10;
+    int max_iterations = 3000;
     std::size_t executor_threads = (std::thread::hardware_concurrency());
 
     experiment = "hnswlib_";

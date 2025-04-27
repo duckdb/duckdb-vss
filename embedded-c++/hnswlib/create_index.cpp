@@ -4,6 +4,7 @@
 #include "usearch/helpers/database_setup.h"
 #include "usearch/helpers/query_runner.h"
 #include "usearch/helpers/file_operations.h"
+#include "hnswlib/helpers/util.h"
 
 using namespace duckdb;
 using namespace hnswlib;
@@ -17,12 +18,12 @@ private:
     int threads;
 
 public:
-HNSWLibIndexCreator(int threads = 64) : db(nullptr), con(db) {
+HNSWLibIndexCreator(int threads) : db(nullptr), con(db) {
         con.Query("SET THREADS TO " + std::to_string(threads) + ";");
         datasets = DatabaseSetup::getDatasetConfigs();
     }
 
-    void createIndexes(int datasetIdx = 0) {
+    void createIndexes(int datasetIdx) {
         try {
             // Limit to valid dataset indices
             if (datasetIdx < 0 || datasetIdx >= (int)datasets.size()) {
@@ -166,18 +167,20 @@ int main() {
      * for all experiments.
      */
 
+    std::size_t executor_threads = (std::thread::hardware_concurrency());
+
     try {
         // fashion_mnist
-        HNSWLibIndexCreator fm_creator(64);
+        HNSWLibIndexCreator fm_creator(executor_threads);
         fm_creator.createIndexes(0);
         // mnist
-        HNSWLibIndexCreator m_creator(64);
+        HNSWLibIndexCreator m_creator(executor_threads);
         m_creator.createIndexes(1);
         // sift
-        HNSWLibIndexCreator s_creator(64);
+        HNSWLibIndexCreator s_creator(executor_threads);
         s_creator.createIndexes(2);
         // gist
-        HNSWLibIndexCreator g_creator(64);
+        HNSWLibIndexCreator g_creator(executor_threads);
         g_creator.createIndexes(3);
         std::cout << "All indexes created successfully." << std::endl;
 

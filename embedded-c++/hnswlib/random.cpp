@@ -4,6 +4,7 @@
 #include "usearch/helpers/database_setup.h"
 #include "usearch/helpers/query_runner.h"
 #include "usearch/helpers/file_operations.h"
+#include "hnswlib/helpers/util.h"
 
 using namespace duckdb;
 using namespace hnswlib;
@@ -20,12 +21,12 @@ private:
     int threads;
 
 public:
-HNSWLibRandomRunner(int iterations = 200, int threads = 32) : db(nullptr), con(db), max_iterations(iterations) {
+HNSWLibRandomRunner(int iterations, int threads) : db(nullptr), con(db), max_iterations(iterations) {
         con.Query("SET THREADS TO " + std::to_string(threads) + ";");
         datasets = DatabaseSetup::getDatasetConfigs();
     }
 
-    void runTest(int datasetIdx = 0) {
+    void runTest(int datasetIdx) {
         try {
             // Cleanup intermediate files
             FileOperations::cleanupOutputFiles(std::filesystem::current_path());
@@ -81,7 +82,7 @@ HNSWLibRandomRunner(int iterations = 200, int threads = 32) : db(nullptr), con(d
             auto perc = 0.01;
             std::ostringstream perc_str;
             perc_str << std::fixed << std::setprecision(2) << perc;
-            auto sample_size = perc * dataset_cardinality;
+            auto sample_size = (int) (perc * dataset_cardinality);
 
             // Create appender for results
             Appender appender(con, dataset.name + "_results");
@@ -209,25 +210,25 @@ int main() {
      */
     
     int max_iterations = 200;
-    int threads = 32;
+    std::size_t executor_threads = (std::thread::hardware_concurrency());
 
     experiment = "hnswlib_";
 
     try {
         // fashion_mnist
-        HNSWLibRandomRunner fm_runner(max_iterations, threads);
+        HNSWLibRandomRunner fm_runner(max_iterations, executor_threads);
         fm_runner.runTest(0);
 
         // mnist
-        HNSWLibRandomRunner m_runner(max_iterations, threads);
+        HNSWLibRandomRunner m_runner(max_iterations, executor_threads);
         m_runner.runTest(1);
 
         // sift
-        HNSWLibRandomRunner s_runner(max_iterations, threads);
+        HNSWLibRandomRunner s_runner(max_iterations, executor_threads);
         s_runner.runTest(2);
 
         // gist
-        HNSWLibRandomRunner g_runner(max_iterations, threads);
+        HNSWLibRandomRunner g_runner(max_iterations, executor_threads);
         g_runner.runTest(3);
 
         return 0;

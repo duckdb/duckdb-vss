@@ -1,5 +1,6 @@
 #include "duckdb.hpp"
 #include "usearch/helpers/database_setup.h"
+#include "usearch/helpers/index_operations.h"
 
 #include <iostream>
 
@@ -14,12 +15,12 @@ private:
 	int threads;
 
 public:
-	GroundTruthGenerator(int threads = 64) : db(nullptr), con(db) {
+	GroundTruthGenerator(int threads) : db(nullptr), con(db) {
 		con.Query("SET THREADS TO " + std::to_string(threads) + ";");
 		datasets = DatabaseSetup::getDatasetConfigs();
 	}
 
-	void runGenerator(int datasetIdx = 0) {
+	void runGenerator(int datasetIdx) {
 		try {
 			// Limit to valid dataset indices
 			if (datasetIdx < 0 || datasetIdx >= (int)datasets.size()) {
@@ -52,23 +53,23 @@ int main() {
 	 * dataset.
 	 */
 
-	int threads = 32;
+	std::size_t executor_threads = (std::thread::hardware_concurrency());
 
 	try {
 		// fashion_mnist
-		GroundTruthGenerator fm_runner(threads);
+		GroundTruthGenerator fm_runner(executor_threads);
 		fm_runner.runGenerator(0);
 
 		// mnist
-		GroundTruthGenerator m_runner(threads);
+		GroundTruthGenerator m_runner(executor_threads);
 		m_runner.runGenerator(1);
 
 		// sift
-		GroundTruthGenerator s_runner(threads);
+		GroundTruthGenerator s_runner(executor_threads);
 		s_runner.runGenerator(2);
 
 		// gist
-		GroundTruthGenerator g_runner(threads);
+		GroundTruthGenerator g_runner(executor_threads);
 		g_runner.runGenerator(3);
 
 		return 0;

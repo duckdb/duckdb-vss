@@ -4,6 +4,7 @@
 #include "usearch/helpers/database_setup.h"
 #include "usearch/helpers/query_runner.h"
 #include "usearch/helpers/file_operations.h"
+#include "hnswlib/helpers/util.h"
 
 using namespace duckdb;
 using namespace hnswlib;
@@ -20,12 +21,12 @@ private:
     int threads;
 
 public:
-HNSWLibFullCoverageRunner(int iterations = 100, int threads = 32) : db(nullptr), con(db), max_iterations(iterations) {
+HNSWLibFullCoverageRunner(int iterations, int threads) : db(nullptr), con(db), max_iterations(iterations) {
         con.Query("SET THREADS TO " + std::to_string(threads) + ";");
         datasets = DatabaseSetup::getDatasetConfigs();
     }
 
-    void runTest(int datasetIdx = 0) {
+    void runTest(int datasetIdx) {
         try {
             // Cleanup intermediate files
             FileOperations::cleanupOutputFiles(std::filesystem::current_path());
@@ -162,7 +163,7 @@ HNSWLibFullCoverageRunner(int iterations = 100, int threads = 32) : db(nullptr),
 
             // Output experiment results to CSV
             // dir name: usearch/results/{experiment}/{dataset_name}_{num_queries}q_{num_iterations}i_{partition_size}p/
-            std::string output_dir = "hnswlib/results/fullcoverage/" + experiment + dataset.name + "_" + std::to_string(test_vectors_count) + "q_" + std::to_string(max_iterations) + "i_" + std::to_string(dataset_cardinality/partitions.size()) + "r/";
+            std::string output_dir = "hnswlib/results/fullcoverage/" + experiment + dataset.name + "_" + std::to_string(test_vectors_count) + "q_" + std::to_string(max_iterations) + "i_" + std::to_string((int) (dataset_cardinality/partitions.size())) + "r/";
             // Create the directory if it doesn't exist
             std::filesystem::create_directories(output_dir);
             FileOperations::cleanupOutputFiles(output_dir);
@@ -202,25 +203,25 @@ int main() {
      */
     
     int max_iterations = 100;
-    int threads = 32;
+    std::size_t executor_threads = (std::thread::hardware_concurrency());
 
     experiment = "hnswlib_";
 
     try {
         // fashion_mnist
-        HNSWLibFullCoverageRunner fm_runner(max_iterations, threads);
+        HNSWLibFullCoverageRunner fm_runner(max_iterations, executor_threads);
         fm_runner.runTest(0);
 
         // mnist
-        HNSWLibFullCoverageRunner m_runner(max_iterations, threads);
+        HNSWLibFullCoverageRunner m_runner(max_iterations, executor_threads);
         fm_runner.runTest(1);
 
           // sift
-        HNSWLibFullCoverageRunner s_runner(max_iterations, threads);
+        HNSWLibFullCoverageRunner s_runner(max_iterations, executor_threads);
         fm_runner.runTest(2);
 
         // gist
-        HNSWLibFullCoverageRunner g_runner(max_iterations, threads);
+        HNSWLibFullCoverageRunner g_runner(max_iterations, executor_threads);
         fm_runner.runTest(3);
 
         return 0;

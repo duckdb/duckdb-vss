@@ -21,12 +21,12 @@ private:
     int threads;
 
 public:
-USearchFullCoverageRunner(int iterations = 100, int threads = 64) : db(nullptr), con(db), max_iterations(iterations) {
+USearchFullCoverageRunner(int iterations, int threads) : db(nullptr), con(db), max_iterations(iterations) {
         con.Query("SET THREADS TO " + std::to_string(threads) + ";");
         datasets = DatabaseSetup::getDatasetConfigs();
     }
 
-    void runTest(int datasetIdx = 0) {
+    void runTest(int datasetIdx) {
         try {
             // Cleanup intermediate files
             FileOperations::cleanupOutputFiles(std::filesystem::current_path());
@@ -131,7 +131,7 @@ USearchFullCoverageRunner(int iterations = 100, int threads = 64) : db(nullptr),
 
             // Output experiment results to CSV
             // dir name: usearch/results/{experiment}/{dataset_name}_{num_queries}q_{num_iterations}i_{partition_size}r/
-            std::string output_dir = "usearch/results/fullcoverage/" + experiment + dataset.name + "_" + std::to_string(test_vectors_count) + "q_" + std::to_string(max_iterations) + "i_" + std::to_string(dataset_cardinality/partitions.size()) + "r/";
+            std::string output_dir = "usearch/results/fullcoverage/" + experiment + dataset.name + "_" + std::to_string(test_vectors_count) + "q_" + std::to_string(max_iterations) + "i_" + std::to_string((int) (dataset_cardinality/partitions.size())) + "r/";
             // Create the directory if it doesn't exist
             std::filesystem::create_directories(output_dir);
             FileOperations::cleanupOutputFiles(output_dir);
@@ -171,26 +171,26 @@ int main() {
      */
     
     int max_iterations = 100;
-    int threads = 32;
+    std::size_t executor_threads = (std::thread::hardware_concurrency());
     
     // original_ - tests original USearch implementation w/o changing source code
     experiment = "usearch_";
 
     try {
         // fashion_mnist
-        USearchFullCoverageRunner fm_runner(max_iterations, threads);
+        USearchFullCoverageRunner fm_runner(max_iterations, executor_threads);
         fm_runner.runTest(0);
 
         // mnist
-        USearchFullCoverageRunner m_runner(max_iterations, threads);
+        USearchFullCoverageRunner m_runner(max_iterations, executor_threads);
         m_runner.runTest(1);
 
         // sift
-        USearchFullCoverageRunner s_runner(max_iterations, threads);
+        USearchFullCoverageRunner s_runner(max_iterations, executor_threads);
         s_runner.runTest(2);
 
         // gist
-        USearchFullCoverageRunner g_runner(max_iterations, threads);
+        USearchFullCoverageRunner g_runner(max_iterations, executor_threads);
         g_runner.runTest(3);
 
         return 0;

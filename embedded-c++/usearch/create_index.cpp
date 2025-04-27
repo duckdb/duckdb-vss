@@ -15,16 +15,15 @@ private:
     DuckDB db;
     Connection con;
     std::vector<DatasetConfig> datasets;
-    int max_iterations;
     int threads;
 
 public:
-USearchIndexCreator(int threads = 64) : db(nullptr), con(db) {
+USearchIndexCreator(int threads) : db(nullptr), con(db) {
         con.Query("SET THREADS TO " + std::to_string(threads) + ";");
         datasets = DatabaseSetup::getDatasetConfigs();
     }
 
-    void createIndexes(int datasetIdx = 0) {
+    void createIndexes(int datasetIdx) {
         try {
             // Limit to valid dataset indices
             if (datasetIdx < 0 || datasetIdx >= (int)datasets.size()) {
