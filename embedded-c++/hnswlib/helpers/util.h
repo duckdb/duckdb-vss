@@ -25,7 +25,7 @@ public:
 
     static void query_hnsw(hnswlib::HierarchicalNSW<float>& alg_hnsw, const std::vector<std::vector<float>>& queries, int k, int num_threads, std::vector<std::vector<size_t>>& results,  std::vector<std::tuple<std::string, int, int, Value, Value, Value, int, int, int>>& search_results,
         std::vector<std::tuple<std::string, int, int, Value, Value, Value, int, int, int>>& early_term_results,
-        std::vector<std::tuple<std::string, int, double>>& search_benchmarks , std::mutex& results_mutex, const std::string& table_name, int iteration, std::vector<std::vector<std::size_t>>& test_neighbor_ids_vec,
+        std::vector<std::tuple<std::string, int, double>>& search_benchmarks , std::mutex& results_mutex, const std::string& table_name, int iteration,
         std::vector<int>& test_vector_indices, std::vector<duckdb::Value>& neighbor_ids_values,  std::unordered_map<hnswlib::labeltype, size_t>& index_map);
 
     static void markDeleteMultiThread(hnswlib::HierarchicalNSW<float>& index, const std::vector<size_t>& delete_indices, const std::unordered_map<size_t, size_t>& index_map, int num_threads, std::string dataset_name, int iteration, std::vector<std::tuple<std::string, int, double>>& benchmarks, std::mutex& bench_mutex);

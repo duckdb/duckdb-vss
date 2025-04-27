@@ -8,13 +8,12 @@
 
 void util::query_hnsw(hnswlib::HierarchicalNSW<float>& alg_hnsw, const std::vector<std::vector<float>>& queries, int k, int num_threads, std::vector<std::vector<size_t>>& results,  std::vector<std::tuple<std::string, int, int, Value, Value, Value, int, int, int>>& search_results,
     std::vector<std::tuple<std::string, int, int, Value, Value, Value, int, int, int>>& early_term_results,
-    std::vector<std::tuple<std::string, int, double>>& search_benchmarks , std::mutex& results_mutex, const std::string& table_name, int iteration, std::vector<std::vector<std::size_t>>& test_neighbor_ids_vec,
+    std::vector<std::tuple<std::string, int, double>>& search_benchmarks , std::mutex& results_mutex, const std::string& table_name, int iteration,
     std::vector<int>& test_vector_indices, std::vector<duckdb::Value>& neighbor_ids_values, std::unordered_map<hnswlib::labeltype, size_t>& index_map) {
     size_t num_queries = queries.size();
     results.resize(num_queries, std::vector<size_t>(k));
     ParallelFor(0, num_queries, num_threads, [&](size_t row, size_t threadId) {
         try {
-            auto& test_neighbor_ids = test_neighbor_ids_vec[row];
             int test_query_vector_index_int = test_vector_indices[row];
             const Value& neighbor_ids = neighbor_ids_values[row];
             auto start_time = std::chrono::high_resolution_clock::now();
@@ -192,9 +191,3 @@ void util::addPointsMultiThread(hnswlib::HierarchicalNSW<float>& index, const st
         }
     });
 }
-
-
-
-
-
-
