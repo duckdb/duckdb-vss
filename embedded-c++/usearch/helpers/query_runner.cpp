@@ -156,8 +156,6 @@ unique_ptr<MaterializedQueryResult> QueryRunner::getCurrentTopKNeighbors(Connect
     );
 
     auto test_set = con.Query("select * from " + table_name + "_test");
-    std::cout << "test_set->RowCount(): " << test_set->RowCount() << std::endl;
-    std::cout << "current_top_100_neighbors->RowCount(): " << current_top_100_neighbors->RowCount() << std::endl;
     assert(test_set->RowCount() == current_top_100_neighbors->RowCount());
 
     return current_top_100_neighbors;

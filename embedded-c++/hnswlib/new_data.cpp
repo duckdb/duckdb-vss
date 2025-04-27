@@ -97,7 +97,7 @@ HNSWLibNewDataRunner(int iterations, int threads) : db(nullptr), con(db), max_it
             auto test_vectors_count = test_vectors->RowCount();
 
             // Initial query run (multi-threaded)
-            HNSWLibIndexOperations::parallelRunTestQueries(con, index, dataset.name, test_vectors, appender, search_bm_appender, early_termination_appender, 0, dataset_cardinality, index_map);
+            HNSWLibIndexOperations::parallelRunTestQueries(con, index, dataset.name, test_vectors, appender, search_bm_appender, early_termination_appender, 0, dataset_cardinality, index_map, true);
 
             // Run iteration
             
@@ -149,7 +149,7 @@ HNSWLibNewDataRunner(int iterations, int threads) : db(nullptr), con(db), max_it
                 auto current_top_100_neighbors = QueryRunner::getCurrentTopKNeighbors(con, dataset.name, current_idx_keys_set);
            
                 // Run test queries (multi-threaded)
-                HNSWLibIndexOperations::parallelRunTestQueries(con, index, dataset.name, test_vectors, appender, search_bm_appender, early_termination_appender, iteration, dataset_cardinality, index_map);
+                HNSWLibIndexOperations::parallelRunTestQueries(con, index, dataset.name, test_vectors, appender, search_bm_appender, early_termination_appender, iteration, dataset_cardinality, index_map, true);
 
                 std::cout << "✅ FINISHED ITERATION " << iteration << " ✅" << std::endl;
             }

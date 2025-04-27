@@ -334,7 +334,7 @@ size_t HNSWLibIndexOperations::parallelRemove(
  */
 void HNSWLibIndexOperations::parallelRunTestQueries(Connection& con, HierarchicalNSW<float>& index, const std::string& table_name,
     const unique_ptr<MaterializedQueryResult>& test_vectors, Appender& appender, Appender& search_appender, 
-    Appender& early_term_appender, int iteration, int dataset_size, std::unordered_map<hnswlib::labeltype, size_t>& index_map) {
+    Appender& early_term_appender, int iteration, int dataset_size, std::unordered_map<hnswlib::labeltype, size_t>& index_map, bool new_data) {
     std::cout << "🧪 RUNNING TEST QUERIES 🧪" << std::endl;
 
     try {
@@ -347,30 +347,39 @@ void HNSWLibIndexOperations::parallelRunTestQueries(Connection& con, Hierarchica
         test_vector_indices.reserve(test_vectors->RowCount());
         neighbor_ids_values.reserve(test_vectors->RowCount());
 
+        Value filtered_list_value;
+
         for (idx_t i = 0; i < test_vectors->RowCount(); i++) { 
             // Extract neighbor IDs and filter to include only those present in the index
-            auto original_neighbors = ExtractSizeVector(test_vectors->GetValue(2, i));
-            std::vector<size_t> filtered_neighbors;
-            filtered_neighbors.reserve(original_neighbors.size());
-            // Filter neighbors to only include IDs that exist in the index
-            for (auto& neighbor_id : original_neighbors) {
-                auto idx = index_map.at(neighbor_id);
-                auto label = index.label_lookup_.find(static_cast<hnswlib::labeltype>(idx));
-                if (label != index.label_lookup_.end()) {
-                    auto idx = index_map.find(neighbor_id);
-                    filtered_neighbors.push_back(idx->first);
+            if(new_data) {
+                Value filtered_list_value = test_vectors->GetValue(2, i);
+            } else {
+                // Filter neighbors to only include IDs that exist in the index
+                auto original_neighbors = ExtractSizeVector(test_vectors->GetValue(2, i));
+                std::vector<size_t> filtered_neighbors;
+                filtered_neighbors.reserve(original_neighbors.size());
+
+                for (auto& neighbor_id : original_neighbors) {
+                    auto idx = index_map.at(neighbor_id);
+                    auto label = index.label_lookup_.find(static_cast<hnswlib::labeltype>(idx));
+                    if (label != index.label_lookup_.end()) {
+                        auto idx = index_map.find(neighbor_id);
+                        filtered_neighbors.push_back(idx->first);
+                    }
                 }
+
+                // Convert filtered neighbors back to DuckDB Value
+                std::vector<Value> filtered_values;
+                filtered_values.reserve(filtered_neighbors.size());
+                for (auto& id : filtered_neighbors) {
+                    auto idx = index_map.at(id);
+                    filtered_values.push_back(Value::INTEGER(idx));
+                }
+
+                Value filtered_list_value = Value::LIST(LogicalType::INTEGER, std::move(filtered_values));
             }
             
-            // Convert filtered neighbors back to DuckDB Value
-            std::vector<Value> filtered_values;
-            filtered_values.reserve(filtered_neighbors.size());
-            for (auto& id : filtered_neighbors) {
-                auto idx = index_map.at(id);
-                filtered_values.push_back(Value::INTEGER(idx));
-            }
             // Store the filtered neighbor IDs
-            Value filtered_list_value = Value::LIST(LogicalType::INTEGER, std::move(filtered_values));
             test_vecs.push_back(ExtractFloatVector(test_vectors->GetValue(1, i)));
             test_vector_indices.push_back(test_vectors->GetValue(0, i).GetValue<int>());
             neighbor_ids_values.push_back(filtered_list_value);
