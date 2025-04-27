@@ -528,50 +528,84 @@ void HNSWLibIndexOperations::parallelRunTestQueries(Connection& con, Hierarchica
     try {
         // Extract all test vectors upfront to avoid DB access in threads
         std::vector<std::vector<float>> test_vecs;
-        std::vector<std::vector<size_t>> test_neighbor_ids_vec;
         std::vector<int> test_vector_indices;
         std::vector<Value> neighbor_ids_values;
 
-        test_vecs.reserve(test_vectors->RowCount());
-        test_neighbor_ids_vec.reserve(test_vectors->RowCount());
-        test_vector_indices.reserve(test_vectors->RowCount());
-        neighbor_ids_values.reserve(test_vectors->RowCount());
-
-        for (idx_t i = 0; i < test_vectors->RowCount(); i++) {
-            
+        // New data scenario test_vectors contains ground truth neighbor_ids of size test_vectors_size*dataset_size
+        // Only include ids that are in the index until neighbor_ids size == 100
+        if (test_vectors->RowCount() > 20000) {
+            auto unique_test_q_ids = con.Query("SELECT DISTINCT id, vec FROM " + table_name + "_ground_truth;");
+            test_vecs.reserve(unique_test_q_ids->RowCount());
+            test_vector_indices.reserve(unique_test_q_ids->RowCount());
+            neighbor_ids_values.reserve(unique_test_q_ids->RowCount());
             // Extract neighbor IDs and filter to include only those present in the index
-            auto original_neighbors = ExtractSizeVector(test_vectors->GetValue(2, i));
-            std::vector<size_t> filtered_neighbors;
-            filtered_neighbors.reserve(original_neighbors.size());
-            // Filter neighbors to only include IDs that exist in the index
-            for (auto& neighbor_id : original_neighbors) {
-                auto idx = index_map.at(neighbor_id);
-                auto label = index.label_lookup_.find(static_cast<hnswlib::labeltype>(idx));
-                if (label != index.label_lookup_.end()) {
-                    auto idx = index_map.find(neighbor_id);
-                    filtered_neighbors.push_back(idx->first);
+            // Schema is id, vec, neighbor_id, distance, ordered by id, distance
+            for (idx_t i = 0; i < unique_test_q_ids->RowCount(); i++){
+                auto ground_truth_for_q_vec = con.Query("SELECT * FROM " + table_name + "_ground_truth WHERE id = " + std::to_string(unique_test_q_ids->GetValue(0, i).GetValue<int>()) + " order by distance asc;");
+                assert(ground_truth_for_q_vec->RowCount() > 100);
+                std::vector<int> top_k_neighbors;
+                top_k_neighbors.reserve(100);
+                for (idx_t j = 0; j < ground_truth_for_q_vec->RowCount(); j++) {
+                    // Filter neighbors to only include IDs that exist in the index until size == 100
+                    auto neighbor_id = ground_truth_for_q_vec->GetValue(2, j).GetValue<int>();
+                    auto label = index.label_lookup_.find(static_cast<hnswlib::labeltype>(neighbor_id));
+                    if (label != index.label_lookup_.end()) {
+                        top_k_neighbors.push_back(neighbor_id);
+                    }
+                    if (top_k_neighbors.size() == 100) {
+                        break;
+                    }
                 }
+                assert(top_k_neighbors.size() == 100);
+                // Convert filtered neighbors back to DuckDB Value
+                std::vector<Value> filtered_values;
+                filtered_values.reserve(top_k_neighbors.size());
+                for (auto& id : top_k_neighbors) {
+                    auto idx = index_map.at(id);
+                    filtered_values.push_back(Value::INTEGER(idx));
+                }
+                // Store the filtered neighbor IDs
+                Value filtered_list_value = Value::LIST(LogicalType::INTEGER, std::move(filtered_values));
+                test_vecs.push_back(ExtractFloatVector(unique_test_q_ids->GetValue(1, i)));
+                test_vector_indices.push_back(unique_test_q_ids->GetValue(0, i).GetValue<int>());
+                neighbor_ids_values.push_back(filtered_list_value);
             }
-            // Skip test vector if no valid neighbors are found
-            if (filtered_neighbors.empty()) {
-                continue;
+            assert(test_vecs.size() == unique_test_q_ids->RowCount());
+            assert(test_vector_indices.size() == unique_test_q_ids->RowCount());
+            assert(neighbor_ids_values.size() == unique_test_q_ids->RowCount());
+        } else {
+            test_vecs.reserve(test_vectors->RowCount());
+            test_vector_indices.reserve(test_vectors->RowCount());
+            neighbor_ids_values.reserve(test_vectors->RowCount());
+            for (idx_t i = 0; i < test_vectors->RowCount(); i++) {
+                
+                // Extract neighbor IDs and filter to include only those present in the index
+                auto original_neighbors = ExtractSizeVector(test_vectors->GetValue(2, i));
+                std::vector<size_t> filtered_neighbors;
+                filtered_neighbors.reserve(original_neighbors.size());
+                // Filter neighbors to only include IDs that exist in the index
+                for (auto& neighbor_id : original_neighbors) {
+                    auto idx = index_map.at(neighbor_id);
+                    auto label = index.label_lookup_.find(static_cast<hnswlib::labeltype>(idx));
+                    if (label != index.label_lookup_.end()) {
+                        auto idx = index_map.find(neighbor_id);
+                        filtered_neighbors.push_back(idx->first);
+                    }
+                }
+                
+                // Convert filtered neighbors back to DuckDB Value
+                std::vector<Value> filtered_values;
+                filtered_values.reserve(filtered_neighbors.size());
+                for (auto& id : filtered_neighbors) {
+                    auto idx = index_map.at(id);
+                    filtered_values.push_back(Value::INTEGER(idx));
+                }
+                // Store the filtered neighbor IDs
+                Value filtered_list_value = Value::LIST(LogicalType::INTEGER, std::move(filtered_values));
+                test_vecs.push_back(ExtractFloatVector(test_vectors->GetValue(1, i)));
+                test_vector_indices.push_back(test_vectors->GetValue(0, i).GetValue<int>());
+                neighbor_ids_values.push_back(filtered_list_value);
             }
-            
-            // Only extract the test vector if valid neighbors are found
-            test_vecs.push_back(ExtractFloatVector(test_vectors->GetValue(1, i)));
-
-            // Convert filtered neighbors back to DuckDB Value
-            std::vector<Value> filtered_values;
-            filtered_values.reserve(filtered_neighbors.size());
-            for (auto& id : filtered_neighbors) {
-                auto idx = index_map.at(id);
-                filtered_values.push_back(Value::INTEGER(idx));
-            }
-            // Store the filtered neighbor IDs
-            Value filtered_list_value = Value::LIST(LogicalType::INTEGER, std::move(filtered_values));
-            test_neighbor_ids_vec.push_back(filtered_neighbors);
-            test_vector_indices.push_back(test_vectors->GetValue(0, i).GetValue<int>());
-            neighbor_ids_values.push_back(filtered_list_value);
         }
 
         // Thread-safe containers for results
@@ -588,7 +622,7 @@ void HNSWLibIndexOperations::parallelRunTestQueries(Connection& con, Hierarchica
         auto batch_start = std::chrono::high_resolution_clock::now();
         
         std::vector<std::vector<size_t>> converted_test_vector_indices = {std::vector<size_t>(test_vector_indices.begin(), test_vector_indices.end())};
-        util::query_hnsw(index, test_vecs, 100, executor_threads, converted_test_vector_indices, search_results, early_term_results, search_benchmarks, results_mutex, table_name, iteration, test_neighbor_ids_vec, test_vector_indices, neighbor_ids_values, index_map);
+        util::query_hnsw(index, test_vecs, 100, executor_threads, converted_test_vector_indices, search_results, early_term_results, search_benchmarks, results_mutex, table_name, iteration, test_vector_indices, neighbor_ids_values, index_map);
        
    
         
