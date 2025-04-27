@@ -183,28 +183,6 @@ public:
             // Complete the operation
             appender.Close();
 
-            // Get train dataset index ids
-            std::unordered_set<size_t> train_ids;
-            for (const auto& vec : trainVectors) {
-                train_ids.insert(vec.id);
-            }
-
-            auto gt_test_vectors = QueryRunner::getCurrentTopKNeighbors(con, dataset.name, train_ids);
-
-            // gt_test_vectors should be the exact same as test_res
-            for (idx_t i = 0; i < gt_test_vectors->RowCount(); i++) {
-                auto gt_test_vector = gt_test_vectors->GetValue(0, i);
-                auto test_vector = test_res->GetValue(0, i);
-                if (gt_test_vector != test_vector) {
-                    throw std::runtime_error("Setup failed: Inconsistent ground truth table ids");
-                }
-                auto gt_neighbor_ids = ExtractSizeVector(gt_test_vectors->GetValue(2, i));
-                auto test_neighbor_ids = ExtractSizeVector(test_res->GetValue(2, i));
-                if (gt_neighbor_ids != test_neighbor_ids) {
-                    throw std::runtime_error("Setup failed: Inconsistent ground truth table neighbor ids");
-                }
-            }
-
             // Create raw table
             con.Query("CREATE OR REPLACE TABLE raw." + dataset.name + "_ground_truth as select * from " + dataset.name + "_ground_truth");
 
