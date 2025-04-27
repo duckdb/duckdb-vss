@@ -4,6 +4,7 @@
 #include "usearch/helpers/database_setup.h"
 #include "usearch/helpers/query_runner.h"
 #include "usearch/helpers/file_operations.h"
+#include "hnswlib/helpers/util.h"
 
 using namespace duckdb;
 using namespace hnswlib;
@@ -20,12 +21,12 @@ private:
     int threads;
 
 public:
-HNSWLibUnreachablePointsRunner(int iterations = 3000, int threads = 32) : db(nullptr), con(db), max_iterations(iterations) {
+HNSWLibUnreachablePointsRunner(int iterations, int threads) : db(nullptr), con(db), max_iterations(iterations) {
         con.Query("SET THREADS TO " + std::to_string(threads) + ";");
         datasets = DatabaseSetup::getDatasetConfigs();
     }
 
-    void runTest(int datasetIdx = 0) {
+    void runTest(int datasetIdx) {
         try {
             // Cleanup intermediate files
             FileOperations::cleanupOutputFiles(std::filesystem::current_path());
@@ -65,8 +66,6 @@ HNSWLibUnreachablePointsRunner(int iterations = 3000, int threads = 32) : db(nul
             }
             index_map_file.close();
 
-            index.setEf(dataset_cardinality);
-
             // Log initial index stats
             index.log_memory_stats();
             index.log_connectivity_stats(&space);
@@ -74,6 +73,10 @@ HNSWLibUnreachablePointsRunner(int iterations = 3000, int threads = 32) : db(nul
             // Get test vectors
             auto test_vectors = con.Query("SELECT * FROM " + dataset.name + "_test;");
             auto test_vectors_count = test_vectors->RowCount();
+
+            // Get one test vector
+            auto test_vec_single = con.Query("SELECT * FROM " + dataset.name + "_test limit 1;");
+            auto test_vec_single_vector = ExtractFloatVector(test_vec_single->GetValue(1, 0));
 
             // Dataset vectors
             auto dataset_vectors = con.Query("SELECT * FROM " + dataset.name + "_train;");
@@ -97,22 +100,41 @@ HNSWLibUnreachablePointsRunner(int iterations = 3000, int threads = 32) : db(nul
             Appender search_bm_appender(con, dataset.name + "_search_bm");
             Appender early_termination_appender(con, "early_terminated_queries");
 
+            std::size_t executor_threads = (std::thread::hardware_concurrency());
+            std::cout << "Threads: " << executor_threads << std::endl;
+
+
             // Initial query run (multi-threaded)
             HNSWLibIndexOperations::parallelRunTestQueries(con, index, dataset.name, test_vectors, appender, search_bm_appender, early_termination_appender, 0, dataset_cardinality, index_map);
 
             // Update available points
-            appender.Flush();
-            auto found_points = QueryRunner::getAllDistinctNeighborIds(con, dataset.name, 0);
-            available_points.clear();
+            auto results_single = index.searchKnn(test_vec_single_vector.data(), dataset_cardinality);
+
+            std::unordered_set<size_t> found_points_set;
+            found_points_set.reserve(dataset_cardinality);
+
+            auto neighbors_size = results_single.neighbors.size();
+            for (std::size_t j = 0; j < neighbors_size; ++j) {
+                size_t key = static_cast<size_t>(results_single.neighbors.top().second);
+                results_single.neighbors.pop();
+                found_points_set.insert(key);
+            }
+
+            // Determine available points (those found in the single query)
             for (size_t idx = 0; idx < dataset_vectors->RowCount(); ++idx) {
-                if (std::find(found_points.begin(), found_points.end(), dataset_vectors->GetValue<int>(0, idx)) == found_points.end()) {
-                    available_points.insert(dataset_vectors->GetValue<int>(0, idx));
+                int point_id = dataset_vectors->GetValue<int>(0, idx);
+                if (found_points_set.find(point_id) != found_points_set.end()) {
+                    available_points.insert(point_id);
                 }
             }
 
+            // Calculate unreachable points
             std::vector<std::pair<int, int>> unreachable_points;
-            unreachable_points.reserve(3001);
-            unreachable_points.push_back(std::make_pair(0, dataset_cardinality - found_points.size()));
+            unreachable_points.reserve(dataset_cardinality);
+            
+            size_t unreachable_count = dataset_cardinality - found_points_set.size();
+            unreachable_points.push_back(std::make_pair(0, unreachable_count));
+            std::cout << "Unreachable points: " << unreachable_count << " out of " << dataset_cardinality << std::endl;
 
             // Run iterations
             size_t last_idx = 0;
@@ -155,7 +177,7 @@ HNSWLibUnreachablePointsRunner(int iterations = 3000, int threads = 32) : db(nul
                 
                 // Re-add vectors from this partition to the index
                 size_t added = HNSWLibIndexOperations::parallelAdd(index, deleted_vectors, new_indices,  dataset.name, 
-                    iteration, add_bm_appender, threads);                       
+                    iteration, add_bm_appender, executor_threads);                       
 
                 // Log index stats
                 index.log_memory_stats();
@@ -167,16 +189,30 @@ HNSWLibUnreachablePointsRunner(int iterations = 3000, int threads = 32) : db(nul
                                         iteration, dataset_cardinality, index_map);
             
                 // Update available points
-                appender.Flush();
-                auto found_points = QueryRunner::getAllDistinctNeighborIds(con, dataset.name, iteration);
+                found_points_set.clear();
                 available_points.clear();
+
+                auto results_single = index.searchKnn(test_vec_single_vector.data(), dataset_cardinality);
+                
+                auto neighbors_size = results_single.neighbors.size();
+                for (std::size_t j = 0; j < neighbors_size; ++j) {
+                    size_t key = static_cast<size_t>(results_single.neighbors.top().second);
+                    results_single.neighbors.pop();
+                    found_points_set.insert(key);
+                }
+
+                // Determine available points (those found in the single query)
                 for (size_t idx = 0; idx < dataset_vectors->RowCount(); ++idx) {
-                    if (std::find(found_points.begin(), found_points.end(), dataset_vectors->GetValue<int>(0, idx)) == found_points.end()) {
-                        available_points.insert(dataset_vectors->GetValue<int>(0, idx));
+                    int point_id = dataset_vectors->GetValue<int>(0, idx);
+                    if (found_points_set.find(point_id) != found_points_set.end()) {
+                        available_points.insert(point_id);
                     }
                 }
 
-                unreachable_points.push_back(std::make_pair(iteration, dataset_cardinality - found_points.size()));
+                // Calculate unreachable points
+                size_t unreachable_count = dataset_cardinality - found_points_set.size();
+                unreachable_points.push_back(std::make_pair(iteration, unreachable_count));
+                std::cout << "Unreachable points: " << unreachable_count << " out of " << dataset_cardinality << std::endl;
 
                 std::cout << "✅ FINISHED ITERATION " << iteration << " ✅" << std::endl;
             }
@@ -237,33 +273,35 @@ HNSWLibUnreachablePointsRunner(int iterations = 3000, int threads = 32) : db(nul
 int main() {
 
     /**
-     * UNREACHABLEPOINTS: 
-     * Find all unreachable points in the index by running search on the index 
-     * where k = dataset_cardinality. Any points that are not found are unreachable.
-     * 3000 iteration where 5% of reachable points are deleted and reinserted.
+     * UNREACHABLEPOINTS:
+     * 3000 iterations. Within each iteration, 5% of vectors that are NOT unreachable in
+     * the index are deleted and then reinserted to track the growth of unreachable
+     * points over iterations. Same experiment as Enhancing HNSW paper. 
+     * k = dataset_cardinality. Should prove that points already in the unreachable 
+     * points set will not be searched in future search processes.
      */
     
     int max_iterations = 10;
-    int threads = 32;
+    std::size_t executor_threads = (std::thread::hardware_concurrency());
 
     experiment = "hnswlib_";
 
     try {
         // fashion_mnist
-        HNSWLibUnreachablePointsRunner fm_runner(max_iterations, threads);
+        HNSWLibUnreachablePointsRunner fm_runner(max_iterations, executor_threads);
         fm_runner.runTest(0);
 
-        // // mnist
-        // HNSWLibUnreachablePointsRunner m_runner(max_iterations, threads);
-        // m_runner.runTest(1);
+        // mnist
+        HNSWLibUnreachablePointsRunner m_runner(max_iterations, executor_threads);
+        m_runner.runTest(1);
 
-        // // sift
-        // HNSWLibUnreachablePointsRunner s_runner(max_iterations, threads);
-        // s_runner.runTest(2);
+        // sift
+        HNSWLibUnreachablePointsRunner s_runner(max_iterations, executor_threads);
+        s_runner.runTest(2);
 
-        // // gist
-        // HNSWLibUnreachablePointsRunner g_runner(max_iterations, threads);
-        // g_runner.runTest(3);
+        // gist
+        HNSWLibUnreachablePointsRunner g_runner(max_iterations, executor_threads);
+        g_runner.runTest(3);
 
         return 0;
     } catch (std::exception& e) {
