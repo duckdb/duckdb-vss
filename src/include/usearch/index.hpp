@@ -2454,6 +2454,9 @@ class index_gt {
             return result.failed("Out of memory!");
 
         node_lock_t new_lock = node_lock_(old_slot);
+        if (new_lock.failed()) {
+            return result.failed("Failed to acquire lock after maximum attempts");
+        }
         node_t node = node_at_(old_slot);
 
         level_t node_level = node.level();
@@ -2470,6 +2473,7 @@ class index_gt {
             old_slot, entry_slot_, max_level_, node_level, //
             config, context);
         node.key(key);
+
 
         // Normalize stats
         result.computed_distances = context.computed_distances_count - result.computed_distances;
@@ -3627,13 +3631,21 @@ class index_gt {
     struct node_lock_t {
         nodes_mutexes_t& mutexes;
         std::size_t slot;
-        inline ~node_lock_t() noexcept { mutexes.atomic_reset(slot); }
+        inline ~node_lock_t() noexcept { 
+            // Only reset if it's a valid slot
+            if (slot != std::numeric_limits<std::size_t>::max())
+                mutexes.atomic_reset(slot); 
+        }
+        
+        inline bool failed() const noexcept {
+            return slot == std::numeric_limits<std::size_t>::max();
+        }
     };
-
+    
     inline node_lock_t node_lock_(std::size_t slot) const noexcept {
         // Try to acquire the lock with a timeout
         int attempts = 0;
-        const int MAX_ATTEMPTS = 1000000; // Allow a significant number of attempts
+        const int MAX_ATTEMPTS = 1000000;
         
         while (nodes_mutexes_.atomic_set(slot)) {
             attempts++;
@@ -3648,9 +3660,8 @@ class index_gt {
             if (attempts % 100000 == 0)
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 
-            // If we've tried too many times, just continue without the lock
+            // If we've tried too many times, return a failed lock
             if (attempts >= MAX_ATTEMPTS) {
-                // Return a "no-op" lock that doesn't actually hold any resource
                 return {nodes_mutexes_, std::numeric_limits<std::size_t>::max()};
             }
         }
