@@ -1,0 +1,154 @@
+# name: test/sql/hnsw/where_clause_segfault.test
+# description: If a where clause is present the code segfaults
+# group: [hnsw]
+
+require vss
+
+# First try the failing case
+
+statement ok
+CREATE TABLE my_vector_table (id INTEGER, vec FLOAT[3]);
+
+statement ok
+INSERT INTO my_vector_table (id, vec)
+SELECT id, array_value(a, b, c)
+FROM range(1, 10) t1(id),
+     range(1, 10) t2(a),
+     range(1, 10) t3(b),
+     range(1, 10) t4(c);
+
+statement ok
+CREATE INDEX my_hnsw_index ON my_vector_table USING hnsw (vec);
+
+query II
+SELECT *
+FROM my_vector_table
+WHERE id > 0
+ORDER BY array_distance(vec, [1, 2, 3]::FLOAT[3])
+LIMIT 3;
+----
+7	[1.0, 2.0, 3.0]
+8	[1.0, 2.0, 3.0]
+9	[1.0, 2.0, 3.0]
+
+# Make sure the plan is not falling back to a sequential scan. Maybe that is not even possible in that case. I think it is possible only if I first materialize the distances (maybe???)
+
+query II
+EXPLAIN ANALYZE SELECT *
+FROM my_vector_table
+WHERE id > 0
+ORDER BY array_distance(vec, [1, 2, 3]::FLOAT[3])
+LIMIT 3;
+----
+analyzed_plan	<REGEX>:.*HSNW Index:.*my_hnsw_index.*
+
+
+query II
+SELECT *
+FROM my_vector_table
+WHERE id > 3
+ORDER BY array_distance(vec, [1, 2, 3]::FLOAT[3])
+LIMIT 3;
+----
+7	[1.0, 2.0, 3.0]
+8	[1.0, 2.0, 3.0]
+9	[1.0, 2.0, 3.0]
+
+# try id only
+
+query I
+SELECT id
+FROM my_vector_table
+ORDER BY array_distance(vec, [1, 2, 3]::FLOAT[3])
+LIMIT 3;
+----
+7
+8
+9
+
+# try vector only
+
+query I
+SELECT vec
+FROM my_vector_table
+ORDER BY array_distance(vec, [1, 2, 3]::FLOAT[3])
+LIMIT 3;
+----
+[1.0, 2.0, 3.0]
+[1.0, 2.0, 3.0]
+[1.0, 2.0, 3.0]
+
+
+# Change the ranges. That was working before the changes, it should work now as well
+
+statement ok
+CREATE TABLE my_vector_table2 (id INTEGER, vec FLOAT[3]);
+
+statement ok
+INSERT INTO my_vector_table2 (id, vec)
+SELECT id, array_value(a, b, c)
+FROM range(0, 10) t1(id),
+     range(0, 10) t2(a),
+     range(0, 10) t3(b),
+     range(0, 10) t4(c);
+
+statement ok
+CREATE INDEX my_hnsw_index2 ON my_vector_table2 USING hnsw (vec);
+
+query II
+SELECT *
+FROM my_vector_table2
+WHERE id > 0
+ORDER BY array_distance(vec, [1, 2, 3]::FLOAT[3])
+LIMIT 3;
+----
+7	[1.0, 2.0, 3.0]
+8	[1.0, 2.0, 3.0]
+9	[1.0, 2.0, 3.0]
+
+query II
+SELECT *
+FROM my_vector_table2
+WHERE id > 3
+ORDER BY array_distance(vec, [1, 2, 3]::FLOAT[3])
+LIMIT 3;
+----
+7	[1.0, 2.0, 3.0]
+8	[1.0, 2.0, 3.0]
+9	[1.0, 2.0, 3.0]
+
+# Try without the id
+
+statement ok
+CREATE TABLE vec_only(vec FLOAT[3]);
+
+statement ok
+INSERT INTO vec_only
+SELECT array_value(a, b, c)
+FROM range(1, 10) t1(a),
+     range(1, 10) t2(b),
+     range(1, 10) t3(c);
+
+statement ok
+CREATE INDEX vec_only_idx ON vec_only USING hnsw(vec);
+
+query I
+SELECT *
+FROM vec_only
+ORDER BY array_distance(vec, [1,2,3]::FLOAT[3])
+LIMIT 3;
+----
+[1.0, 2.0, 3.0]
+[2.0, 2.0, 3.0]
+[1.0, 2.0, 4.0]
+
+query II
+SELECT id, array_distance(vec, [1,2,3]::FLOAT[3]) as dist
+FROM my_vector_table
+WHERE id > 0
+ORDER BY dist
+LIMIT 3;
+----
+7	0.0
+8	0.0
+9	0.0
