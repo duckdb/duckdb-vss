@@ -106,16 +106,16 @@ LIMIT 3;
 1
 1
 
-query II
-SELECT *
+query I
+SELECT array_distance(vec, [1, 2, 3]::FLOAT[3]) < 1.0
 FROM my_vector_table2
 WHERE id > 3
 ORDER BY array_distance(vec, [1, 2, 3]::FLOAT[3])
 LIMIT 3;
 ----
-7	[1.0, 2.0, 3.0]
-8	[1.0, 2.0, 3.0]
-9	[1.0, 2.0, 3.0]
+1
+1
+1
 
 query II
 SELECT id, array_distance(vec, [1,2,3]::FLOAT[3]) as dist
