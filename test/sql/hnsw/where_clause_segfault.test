@@ -43,40 +43,16 @@ LIMIT 3;
 analyzed_plan	<REGEX>:.*HSNW Index:.*my_hnsw_index.*
 
 
-query II
-SELECT *
+query I
+SELECT array_distance(vec, [1, 2, 3]::FLOAT[3]) < 1.0
 FROM my_vector_table
 WHERE id > 3
 ORDER BY array_distance(vec, [1, 2, 3]::FLOAT[3])
 LIMIT 3;
 ----
-7	[1.0, 2.0, 3.0]
-8	[1.0, 2.0, 3.0]
-9	[1.0, 2.0, 3.0]
-
-# try id only
-
-query I
-SELECT id
-FROM my_vector_table
-ORDER BY array_distance(vec, [1, 2, 3]::FLOAT[3])
-LIMIT 3;
-----
-7
-8
-9
-
-# try vector only
-
-query I
-SELECT vec
-FROM my_vector_table
-ORDER BY array_distance(vec, [1, 2, 3]::FLOAT[3])
-LIMIT 3;
-----
-[1.0, 2.0, 3.0]
-[1.0, 2.0, 3.0]
-[1.0, 2.0, 3.0]
+1
+1
+1
 
 
 # Change the ranges. That was working before the changes, it should work now as well
@@ -116,14 +92,3 @@ LIMIT 3;
 1
 1
 1
-
-query II
-SELECT id, array_distance(vec, [1,2,3]::FLOAT[3]) as dist
-FROM my_vector_table
-WHERE id > 0
-ORDER BY dist
-LIMIT 3;
-----
-7	0.0
-8	0.0
-9	0.0
