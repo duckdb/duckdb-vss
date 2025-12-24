@@ -16,11 +16,9 @@ on:
       - '**/README.md'
       - 'doc/**'
   workflow_dispatch:
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' || github.sha }}
   cancel-in-progress: true
-
 jobs:
   duckdb-stable-build:
     name: Build extension binaries
@@ -29,7 +27,7 @@ jobs:
       extension_name: vss
       duckdb_version: main
       ci_tools_version: main
-
+    if: (github.event_name != 'push' || !contains(lower(join(github.event.commits.*.message, ' ')), 'bump to')) && (github.event_name != 'pull_request' || !contains(lower(github.event.pull_request.title), 'bump to'))
   duckdb-stable-deploy:
     name: Deploy extension binaries
     needs: duckdb-stable-build
@@ -40,3 +38,4 @@ jobs:
       duckdb_version: main
       ci_tools_version: main
       deploy_latest: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
+    if: (github.event_name != 'push' || !contains(lower(join(github.event.commits.*.message, ' ')), 'bump to')) && (github.event_name != 'pull_request' || !contains(lower(github.event.pull_request.title), 'bump to'))
