@@ -160,7 +160,7 @@ static InsertionOrderPreservingMap<string> HNSWIndexScanToString(TableFunctionTo
 	InsertionOrderPreservingMap<string> result;
 	auto &bind_data = input.bind_data->Cast<HNSWIndexScanBindData>();
 	result["Table"] = bind_data.table.name;
-	result["HSNW Index"] = bind_data.index.GetIndexName();
+	result["HNSW Index"] = bind_data.index.GetIndexName();
 	return result;
 }
 
