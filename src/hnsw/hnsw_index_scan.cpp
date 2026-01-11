@@ -1,20 +1,21 @@
+#include "hnsw/hnsw_index_scan.hpp"
+
+#include "duckdb/catalog/catalog_entry/duck_index_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/dependency_list.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/function/function_set.hpp"
+#include "duckdb/main/database.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/optimizer/matcher/expression_matcher.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/local_storage.hpp"
-#include "duckdb/main/extension/extension_loader.hpp"
-#include "duckdb/catalog/catalog_entry/duck_index_entry.hpp"
-#include "duckdb/storage/data_table.hpp"
-
 #include "hnsw/hnsw.hpp"
 #include "hnsw/hnsw_index.hpp"
-#include "hnsw/hnsw_index_scan.hpp"
 
 namespace duckdb {
 
@@ -34,6 +35,9 @@ struct HNSWIndexScanGlobalState : public GlobalTableFunctionState {
 	// Index scan state
 	unique_ptr<IndexScanState> index_state;
 	Vector row_ids = Vector(LogicalType::ROW_TYPE);
+
+	DataChunk all_columns;
+	vector<idx_t> projection_ids;
 };
 
 static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContext &context,
@@ -63,6 +67,25 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 	result->index_state =
 	    bind_data.index.Cast<HNSWIndex>().InitializeScan(bind_data.query.get(), bind_data.limit, context);
 
+	if (!input.CanRemoveFilterColumns()) {
+		return std::move(result);
+	}
+
+	// We need this to project out what we scan from the underlying table.
+	result->projection_ids = input.projection_ids;
+
+	auto &duck_table = bind_data.table.Cast<DuckTableEntry>();
+	const auto &columns = duck_table.GetColumns();
+	vector<LogicalType> scanned_types;
+	for (const auto &col_idx : input.column_indexes) {
+		if (col_idx.IsRowIdColumn()) {
+			scanned_types.emplace_back(LogicalType::ROW_TYPE);
+		} else {
+			scanned_types.push_back(columns.GetColumn(col_idx.ToLogical()).Type());
+		}
+	}
+	result->all_columns.Initialize(context, scanned_types);
+
 	return std::move(result);
 }
 
@@ -84,8 +107,17 @@ static void HNSWIndexScanExecute(ClientContext &context, TableFunctionInput &dat
 	}
 
 	// Fetch the data from the local storage given the row ids
-	bind_data.table.GetStorage().Fetch(transaction, output, state.column_ids, state.row_ids, row_count,
+	if (state.projection_ids.empty()) {
+		bind_data.table.GetStorage().Fetch(transaction, output, state.column_ids, state.row_ids, row_count,
+		                                   state.fetch_state);
+		return;
+	}
+
+	// Otherwise, we need to first fetch into our scan chunk, and then project out the result
+	state.all_columns.Reset();
+	bind_data.table.GetStorage().Fetch(transaction, state.all_columns, state.column_ids, state.row_ids, row_count,
 	                                   state.fetch_state);
+	output.ReferenceColumns(state.all_columns, state.projection_ids);
 }
 
 //-------------------------------------------------------------------------
