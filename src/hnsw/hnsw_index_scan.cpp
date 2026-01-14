@@ -14,6 +14,7 @@
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/local_storage.hpp"
+
 #include "hnsw/hnsw.hpp"
 #include "hnsw/hnsw_index.hpp"
 
