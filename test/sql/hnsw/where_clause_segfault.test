@@ -40,7 +40,7 @@ WHERE id > 0
 ORDER BY array_distance(vec, [1, 2, 3]::FLOAT[3])
 LIMIT 3;
 ----
-analyzed_plan	<REGEX>:.*HSNW Index:.*my_hnsw_index.*
+analyzed_plan	<REGEX>:.*HNSW Index:.*my_hnsw_index.*
 
 
 query I
