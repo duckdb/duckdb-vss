@@ -658,6 +658,12 @@ unique_ptr<ExpressionMatcher> HNSWIndex::MakeFunctionMatcher() const {
 	return std::move(matcher);
 }
 
+void HNSWIndex::VerifyBuffers(IndexLock &lock) {
+	// Verify the linked block allocator buffers
+	linked_block_allocator->VerifyBuffers();
+}
+
+
 //------------------------------------------------------------------------------
 // Register Index Type
 //------------------------------------------------------------------------------
