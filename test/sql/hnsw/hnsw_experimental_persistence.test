@@ -1,3 +1,6 @@
+# name: test/sql/hnsw/hnsw_experimental_persistence.test
+# group: [hnsw]
+
 require vss
 
 require noforcestorage

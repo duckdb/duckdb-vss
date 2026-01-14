@@ -1,3 +1,6 @@
+# name: test/sql/slow/hnsw_lateral_join_group_large.test_slow
+# group: [slow]
+
 require vss
 
 statement ok
