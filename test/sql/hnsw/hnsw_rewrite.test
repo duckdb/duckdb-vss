@@ -1,3 +1,6 @@
+# name: test/sql/hnsw/hnsw_rewrite.test
+# group: [hnsw]
+
 require vss
 
 # Test that we rewrite (1 - array_cosine_similarity) to array_cosine_distance

@@ -1,3 +1,6 @@
+# name: test/sql/hnsw/hnsw_lateral_join_group.test
+# group: [hnsw]
+
 require vss
 
 statement ok

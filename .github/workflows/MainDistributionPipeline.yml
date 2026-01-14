@@ -27,8 +27,8 @@ jobs:
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
       extension_name: vss
-      duckdb_version: main
-      ci_tools_version: main
+      duckdb_version: v1.4.3
+      ci_tools_version: v1.4.3
 
   duckdb-stable-deploy:
     name: Deploy extension binaries
@@ -37,6 +37,6 @@ jobs:
     secrets: inherit
     with:
       extension_name: vss
-      duckdb_version: main
-      ci_tools_version: main
+      duckdb_version: v1.4.3
+      ci_tools_version: v1.4.3
       deploy_latest: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}

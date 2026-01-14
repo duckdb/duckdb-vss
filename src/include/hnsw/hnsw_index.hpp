@@ -60,6 +60,8 @@ public:
 
 	unique_ptr<HNSWIndexStats> GetStats();
 
+	void VerifyBuffers(IndexLock &lock) override;
+
 	static const case_insensitive_map_t<unum::usearch::metric_kind_t> METRIC_KIND_MAP;
 	static const unordered_map<uint8_t, unum::usearch::scalar_kind_t> SCALAR_KIND_MAP;
 
