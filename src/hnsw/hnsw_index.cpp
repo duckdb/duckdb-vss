@@ -566,8 +566,12 @@ bool HNSWIndex::MergeIndexes(IndexLock &state, BoundIndex &other_index) {
 void HNSWIndex::Vacuum(IndexLock &state) {
 }
 
-string HNSWIndex::VerifyAndToString(IndexLock &state, const bool only_verify) {
-	throw NotImplementedException("HNSWIndex::VerifyAndToString() not implemented");
+void HNSWIndex::Verify(IndexLock &l) {
+	throw NotImplementedException("HNSWIndex::Verify() not implemented");
+}
+
+string HNSWIndex::ToString(IndexLock &l, bool display_ascii) {
+	throw NotImplementedException("HNSWIndex::ToString() not implemented");
 }
 
 void HNSWIndex::VerifyAllocations(IndexLock &state) {
