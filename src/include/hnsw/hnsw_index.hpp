@@ -1,10 +1,13 @@
 #pragma once
 
+#include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/execution/index/bound_index.hpp"
 #include "duckdb/execution/index/index_pointer.hpp"
 #include "duckdb/execution/index/fixed_size_allocator.hpp"
-#include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/optimizer/matcher/expression_matcher.hpp"
+#include "duckdb/storage/index_storage_info.hpp"
+#include "duckdb/storage/storage_lock.hpp"
+#include "duckdb/storage/table/scan_state.hpp"
 
 #include "usearch/duckdb_usearch.hpp"
 

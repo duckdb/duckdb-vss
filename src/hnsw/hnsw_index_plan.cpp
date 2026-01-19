@@ -1,12 +1,12 @@
-#include "duckdb/planner/operator/logical_create_index.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "duckdb/planner/expression/bound_operator_expression.hpp"
-
-#include "duckdb/parser/parsed_data/create_index_info.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
-
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/execution/operator/filter/physical_filter.hpp"
+#include "duckdb/parser/parsed_data/create_index_info.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "duckdb/planner/operator/logical_create_index.hpp"
+#include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/storage_manager.hpp"
 
 #include "hnsw/hnsw.hpp"
 #include "hnsw/hnsw_index.hpp"

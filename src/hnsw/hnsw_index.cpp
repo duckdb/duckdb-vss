@@ -1,10 +1,11 @@
 #include "hnsw/hnsw_index.hpp"
 
-#include "duckdb/common/serializer/binary_deserializer.hpp"
-#include "duckdb/common/serializer/binary_serializer.hpp"
 #include "duckdb/execution/index/fixed_size_allocator.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/storage/partial_block_manager.hpp"
+#include "duckdb/storage/storage_info.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
+#include "duckdb/storage/table_io_manager.hpp"
 #include "hnsw/hnsw.hpp"
 
 namespace duckdb {

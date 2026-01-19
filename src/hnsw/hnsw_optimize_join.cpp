@@ -18,8 +18,9 @@
 #include "duckdb/planner/operator/logical_window.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
-#include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/storage/storage_index.hpp"
+#include "duckdb/storage/table/data_table_info.hpp"
+#include "duckdb/transaction/duck_transaction.hpp"
 
 #include "hnsw/hnsw.hpp"
 #include "hnsw/hnsw_index.hpp"

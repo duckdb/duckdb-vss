@@ -1,7 +1,10 @@
 #pragma once
+
 #include "duckdb/execution/physical_operator.hpp"
-#include "duckdb/execution/progress_data.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/index.hpp"
+#include "duckdb/storage/index_storage_info.hpp"
 
 namespace duckdb {
 

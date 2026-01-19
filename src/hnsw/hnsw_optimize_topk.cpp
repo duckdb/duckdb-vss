@@ -9,6 +9,12 @@
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/optimizer/matcher/expression_matcher.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/index.hpp"
+#include "duckdb/storage/statistics/node_statistics.hpp"
+#include "duckdb/storage/table/data_table_info.hpp"
+#include "duckdb/storage/table/table_index_list.hpp"
+
 #include "hnsw/hnsw.hpp"
 #include "hnsw/hnsw_index.hpp"
 #include "hnsw/hnsw_index_scan.hpp"
