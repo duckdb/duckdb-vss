@@ -1,8 +1,15 @@
 #pragma once
 
+#include "duckdb/common/enums/operator_result_type.hpp"
+#include "duckdb/common/enums/physical_operator_type.hpp"
+#include "duckdb/common/typedefs.hpp"
+#include "duckdb/common/types.hpp"
+#include "duckdb/common/unique_ptr.hpp"
+#include "duckdb/common/vector.hpp"
 #include "duckdb/execution/physical_operator.hpp"
+#include "duckdb/parser/parsed_data/create_index_info.hpp"
+#include "duckdb/planner/expression.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
-#include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/index.hpp"
 #include "duckdb/storage/index_storage_info.hpp"
 

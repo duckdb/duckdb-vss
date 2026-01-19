@@ -8,7 +8,6 @@
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/storage_manager.hpp"
 
-#include "hnsw/hnsw.hpp"
 #include "hnsw/hnsw_index.hpp"
 #include "hnsw/hnsw_index_physical_create.hpp"
 
