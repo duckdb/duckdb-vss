@@ -1,9 +1,8 @@
 #include "duckdb/function/table_macro_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
-#include "duckdb/optimizer/matcher/expression_matcher.hpp"
 #include "hnsw/hnsw.hpp"
-#include "hnsw/hnsw_index.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/parsed_data/create_macro_info.hpp"
 
 namespace duckdb {
 
