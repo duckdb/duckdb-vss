@@ -1,6 +1,6 @@
 #pragma once
 
-#include "duckdb.hpp"
+#include "duckdb/main/extension.hpp"
 
 namespace duckdb {
 

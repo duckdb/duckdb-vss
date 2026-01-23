@@ -1,15 +1,10 @@
-#include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
-#include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
-#include "duckdb/optimizer/matcher/expression_matcher.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
-#include "duckdb/planner/expression_iterator.hpp"
-#include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_cross_product.hpp"
 #include "duckdb/planner/operator/logical_delim_get.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
@@ -20,6 +15,7 @@
 #include "duckdb/planner/operator/logical_window.hpp"
 #include "duckdb/storage/storage_index.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
+#include "duckdb/storage/table/data_table_info.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "hnsw/hnsw.hpp"
 #include "hnsw/hnsw_index.hpp"
@@ -719,7 +715,7 @@ void HNSWIndexJoinOptimizer::Optimize(OptimizerExtensionInput &input, unique_ptr
 
 void HNSWModule::RegisterJoinOptimizer(DatabaseInstance &db) {
 	// Register the JoinOptimizer
-	//OptimizerExtension::Register(db.config, HNSWIndexJoinOptimizer());
+	OptimizerExtension::Register(db.config, HNSWIndexJoinOptimizer());
 }
 
 } // namespace duckdb
