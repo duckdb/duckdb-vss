@@ -261,7 +261,7 @@ public:
 //-----------------------------------------------------------------------------
 void HNSWModule::RegisterScanOptimizer(DatabaseInstance &db) {
 	// Register the optimizer extension
-	db.config.optimizer_extensions.push_back(HNSWIndexScanOptimizer());
+	OptimizerExtension::Register(db.config, HNSWIndexScanOptimizer());
 }
 
 } // namespace duckdb

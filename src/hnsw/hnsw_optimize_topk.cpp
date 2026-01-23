@@ -1,14 +1,15 @@
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/optimizer/matcher/expression_matcher.hpp"
+#include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/optimizer/optimizer_extension.hpp"
+#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
-#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
-#include "duckdb/optimizer/optimizer.hpp"
-#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
-#include "duckdb/optimizer/matcher/expression_matcher.hpp"
-#include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "hnsw/hnsw.hpp"
 #include "hnsw/hnsw_index.hpp"
 #include "hnsw/hnsw_index_scan.hpp"
@@ -236,7 +237,7 @@ public:
 
 void HNSWModule::RegisterTopKOptimizer(DatabaseInstance &db) {
 	// Register the TopKOptimizer
-	db.config.optimizer_extensions.push_back(HNSWTopKOptimizer());
+	// OptimizerExtension::Register(db.config, HNSWTopKOptimizer());
 }
 
 } // namespace duckdb
