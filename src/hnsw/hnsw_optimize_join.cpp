@@ -1,6 +1,7 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
@@ -12,12 +13,10 @@
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_window.hpp"
-#include "duckdb/planner/expression_iterator.hpp"
-#include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/storage/storage_index.hpp"
+#include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/storage/table/data_table_info.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
-
 #include "hnsw/hnsw.hpp"
 #include "hnsw/hnsw_index.hpp"
 
@@ -716,7 +715,7 @@ void HNSWIndexJoinOptimizer::Optimize(OptimizerExtensionInput &input, unique_ptr
 
 void HNSWModule::RegisterJoinOptimizer(DatabaseInstance &db) {
 	// Register the JoinOptimizer
-	db.config.optimizer_extensions.push_back(HNSWIndexJoinOptimizer());
+	OptimizerExtension::Register(db.config, HNSWIndexJoinOptimizer());
 }
 
 } // namespace duckdb

@@ -99,8 +99,14 @@ public:
 	//! Traverses an HNSWIndex and vacuums the qualifying nodes. The lock obtained from InitializeLock must be held
 	void Vacuum(IndexLock &state) override;
 
-	//! Returns the string representation of the HNSWIndex, or only traverses and verifies the index.
-	string VerifyAndToString(IndexLock &state, const bool only_verify) override;
+	//! Traverses and verifies the index.
+	//! Currently not implemented.
+	void Verify(IndexLock &l) override;
+
+	//! Returns the string representation of an index.
+	//! Currently not implemented.
+	string ToString(IndexLock &l, bool display_ascii) override;
+
 	//! Ensures that the node allocation counts match the node counts.
 	void VerifyAllocations(IndexLock &state) override;
 

@@ -5,6 +5,7 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/index.hpp"
@@ -239,7 +240,7 @@ public:
 
 void HNSWModule::RegisterTopKOptimizer(DatabaseInstance &db) {
 	// Register the TopKOptimizer
-	db.config.optimizer_extensions.push_back(HNSWTopKOptimizer());
+	OptimizerExtension::Register(db.config, HNSWTopKOptimizer());
 }
 
 } // namespace duckdb

@@ -2,6 +2,7 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/optimizer/optimizer_extension.hpp"
 
 #include "hnsw/hnsw.hpp"
 
@@ -87,7 +88,7 @@ public:
 
 void HNSWModule::RegisterExprOptimizer(DatabaseInstance &db) {
 	// Register the TopKOptimizer
-	db.config.optimizer_extensions.push_back(HNSWExprOptimizer());
+	OptimizerExtension::Register(db.config, HNSWExprOptimizer());
 }
 
 } // namespace duckdb

@@ -39,7 +39,7 @@ public:
 
 public:
 	//! Source interface, NOOP for this operator
-	SourceResultType GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const override {
+	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const override {
 		return SourceResultType::FINISHED;
 	}
 	bool IsSource() const override {
