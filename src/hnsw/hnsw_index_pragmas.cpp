@@ -120,17 +120,16 @@ static void HNSWIndexInfoExecute(ClientContext &context, TableFunctionInput &dat
 		auto &table_info = *storage.GetDataTableInfo();
 
 		table_info.BindIndexes(context, HNSWIndex::TYPE_NAME);
-		table_info.GetIndexes().Scan([&](Index &index) {
+		for(auto &index : table_info.GetIndexes().Indexes()) {
 			if (!index.IsBound() || HNSWIndex::TYPE_NAME != index.GetIndexType()) {
-				return false;
+				continue;
 			}
 			auto &cast_index = index.Cast<HNSWIndex>();
 			if (cast_index.name == index_entry.name) {
 				hnsw_index = &cast_index;
-				return true;
+				break;
 			}
-			return false;
-		});
+		}
 
 		if (!hnsw_index) {
 			throw BinderException("Index %s not found", index_entry.name);
@@ -201,18 +200,17 @@ static void CompactIndexPragma(ClientContext &context, const FunctionParameters 
 
 	auto &table_info = *storage.GetDataTableInfo();
 	table_info.BindIndexes(context, HNSWIndex::TYPE_NAME);
-	table_info.GetIndexes().Scan([&](Index &index) {
+	for(auto &index : table_info.GetIndexes().Indexes()) {
 		if (!index.IsBound() || HNSWIndex::TYPE_NAME != index.GetIndexType()) {
-			return false;
+			continue;
 		}
 		auto &cast_index = index.Cast<HNSWIndex>();
 		if (cast_index.name == index_entry.name) {
 			cast_index.Compact();
 			found_index = true;
-			return true;
+			break;
 		}
-		return false;
-	});
+	}
 
 	if (!found_index) {
 		throw BinderException("Index %s not found", index_name);
