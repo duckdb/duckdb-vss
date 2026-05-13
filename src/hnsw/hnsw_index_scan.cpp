@@ -15,6 +15,7 @@
 #include "duckdb/transaction/local_storage.hpp"
 
 #include "hnsw/hnsw.hpp"
+#include "hnsw/hnsw_filter_bitmap.hpp"
 #include "hnsw/hnsw_index.hpp"
 
 namespace duckdb {
@@ -38,6 +39,9 @@ struct HNSWIndexScanGlobalState : public GlobalTableFunctionState {
 
 	DataChunk all_columns;
 	vector<idx_t> projection_ids;
+
+	//! Bitmap built from pushed-down filters; nullptr when no filter pushdown.
+	unique_ptr<FilterBitmap> filter_bitmap;
 };
 
 static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContext &context,
@@ -63,9 +67,16 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 	result->local_storage_state.Initialize(result->column_ids, context, input.filters);
 	local_storage.InitializeScan(bind_data.table.GetStorage(), result->local_storage_state.local_state, input.filters);
 
-	// Initialize the scan state for the index
-	result->index_state =
-	    bind_data.index.Cast<HNSWIndex>().InitializeScan(bind_data.query.get(), bind_data.limit, context);
+	// Build filter bitmap if filters were pushed down by the optimizer
+	if (bind_data.pushed_filters && !bind_data.pushed_filters->filters.empty()) {
+		result->filter_bitmap =
+		    BuildFilterBitmap(context, bind_data.table, *bind_data.pushed_filters,
+		                      bind_data.filter_logical_col_ids, bind_data.filter_col_types);
+	}
+
+	// Initialize the scan state for the index (pass bitmap when available)
+	result->index_state = bind_data.index.Cast<HNSWIndex>().InitializeScan(
+	    bind_data.query.get(), bind_data.limit, context, result->filter_bitmap.get());
 
 	if (!input.CanRemoveFilterColumns()) {
 		return std::move(result);
@@ -161,6 +172,19 @@ static InsertionOrderPreservingMap<string> HNSWIndexScanToString(TableFunctionTo
 	auto &bind_data = input.bind_data->Cast<HNSWIndexScanBindData>();
 	result["Table"] = bind_data.table.name;
 	result["HNSW Index"] = bind_data.index.GetIndexName();
+
+	if (bind_data.pushed_filters && !bind_data.pushed_filters->filters.empty()) {
+		string filter_str;
+		for (const auto &entry : bind_data.pushed_filters->filters) {
+			auto col_name = bind_data.table.GetColumn(LogicalIndex(entry.first)).Name();
+			if (!filter_str.empty()) {
+				filter_str += ", ";
+			}
+			filter_str += entry.second->ToString(col_name);
+		}
+		result["Filters"] = filter_str;
+	}
+
 	return result;
 }
 

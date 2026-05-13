@@ -628,6 +628,13 @@ class index_dense_gt {
     template <typename predicate_at> search_result_t filtered_search(f32_t const* vector, std::size_t wanted, predicate_at&& predicate, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, std::forward<predicate_at>(predicate), thread, exact, casts_.from_f32, config_.expansion_search); }
     template <typename predicate_at> search_result_t filtered_search(f64_t const* vector, std::size_t wanted, predicate_at&& predicate, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, std::forward<predicate_at>(predicate), thread, exact, casts_.from_f64, config_.expansion_search); }
 
+    // filtered_ef_search: like filtered_search but with an explicit expansion factor (mirrors ef_search vs search)
+    template <typename predicate_at> search_result_t filtered_ef_search(b1x8_t const* v, std::size_t w, predicate_at&& p, std::size_t ef, std::size_t t = any_thread(), bool exact = false) const { return search_(v, w, std::forward<predicate_at>(p), t, exact, casts_.from_b1x8, ef); }
+    template <typename predicate_at> search_result_t filtered_ef_search(i8_t const* v, std::size_t w, predicate_at&& p, std::size_t ef, std::size_t t = any_thread(), bool exact = false) const { return search_(v, w, std::forward<predicate_at>(p), t, exact, casts_.from_i8, ef); }
+    template <typename predicate_at> search_result_t filtered_ef_search(f16_t const* v, std::size_t w, predicate_at&& p, std::size_t ef, std::size_t t = any_thread(), bool exact = false) const { return search_(v, w, std::forward<predicate_at>(p), t, exact, casts_.from_f16, ef); }
+    template <typename predicate_at> search_result_t filtered_ef_search(f32_t const* v, std::size_t w, predicate_at&& p, std::size_t ef, std::size_t t = any_thread(), bool exact = false) const { return search_(v, w, std::forward<predicate_at>(p), t, exact, casts_.from_f32, ef); }
+    template <typename predicate_at> search_result_t filtered_ef_search(f64_t const* v, std::size_t w, predicate_at&& p, std::size_t ef, std::size_t t = any_thread(), bool exact = false) const { return search_(v, w, std::forward<predicate_at>(p), t, exact, casts_.from_f64, ef); }
+
     std::size_t get(vector_key_t key, b1x8_t* vector, std::size_t vectors_count = 1) const { return get_(key, vector, vectors_count, casts_.to_b1x8); }
     std::size_t get(vector_key_t key, i8_t* vector, std::size_t vectors_count = 1) const { return get_(key, vector, vectors_count, casts_.to_i8); }
     std::size_t get(vector_key_t key, f16_t* vector, std::size_t vectors_count = 1) const { return get_(key, vector, vectors_count, casts_.to_f16); }

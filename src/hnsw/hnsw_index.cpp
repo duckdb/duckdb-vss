@@ -1,4 +1,5 @@
 #include "hnsw/hnsw_index.hpp"
+#include "hnsw/hnsw_filter_bitmap.hpp"
 
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/common/assert.hpp"
@@ -312,7 +313,8 @@ struct HNSWIndexScanState : public IndexScanState {
 	unique_array<row_t> row_ids = nullptr;
 };
 
-unique_ptr<IndexScanState> HNSWIndex::InitializeScan(float *query_vector, idx_t limit, ClientContext &context) {
+unique_ptr<IndexScanState> HNSWIndex::InitializeScan(float *query_vector, idx_t limit, ClientContext &context,
+                                                     const FilterBitmap *bitmap) {
 	auto state = make_uniq<HNSWIndexScanState>();
 
 	// Try to get the ef_search parameter from the database or use the default value
@@ -330,7 +332,14 @@ unique_ptr<IndexScanState> HNSWIndex::InitializeScan(float *query_vector, idx_t 
 
 	// Acquire a shared lock to search the index
 	auto lock = rwlock.GetSharedLock();
-	auto search_result = index.ef_search(query_vector, limit, ef_search);
+	USearchIndexType::search_result_t search_result;
+	if (bitmap) {
+		search_result = index.filtered_ef_search(
+		    query_vector, limit, [&](row_t key) noexcept { return bitmap->Contains(key); }, ef_search,
+		    index.any_thread());
+	} else {
+		search_result = index.ef_search(query_vector, limit, ef_search);
+	}
 
 	state->current_row = 0;
 	state->total_rows = search_result.size();
@@ -359,11 +368,14 @@ struct MultiScanState final : IndexScanState {
 	Vector vec;
 	vector<row_t> row_ids;
 	size_t ef_search;
+	//! Non-owning pointer; bitmap is owned by the calling operator state.
+	const FilterBitmap *filter_bitmap = nullptr;
+
 	MultiScanState(size_t ef_search_p) : vec(LogicalType::ROW_TYPE, nullptr), ef_search(ef_search_p) {
 	}
 };
 
-unique_ptr<IndexScanState> HNSWIndex::InitializeMultiScan(ClientContext &context) {
+unique_ptr<IndexScanState> HNSWIndex::InitializeMultiScan(ClientContext &context, const FilterBitmap *bitmap) {
 	// Try to get the ef_search parameter from the database or use the default value
 	auto ef_search = index.expansion_search();
 
@@ -376,8 +388,9 @@ unique_ptr<IndexScanState> HNSWIndex::InitializeMultiScan(ClientContext &context
 			}
 		}
 	}
-	// Return the new state
-	return make_uniq<MultiScanState>(ef_search);
+	auto state = make_uniq<MultiScanState>(ef_search);
+	state->filter_bitmap = bitmap;
+	return std::move(state);
 }
 
 idx_t HNSWIndex::ExecuteMultiScan(IndexScanState &state_p, float *query_vector, idx_t limit) {
@@ -386,7 +399,14 @@ idx_t HNSWIndex::ExecuteMultiScan(IndexScanState &state_p, float *query_vector, 
 	USearchIndexType::search_result_t search_result;
 	{
 		auto lock = rwlock.GetSharedLock();
-		search_result = index.ef_search(query_vector, limit, state.ef_search);
+		if (state.filter_bitmap) {
+			const auto *bm = state.filter_bitmap;
+			search_result = index.filtered_ef_search(
+			    query_vector, limit, [&](row_t key) noexcept { return bm->Contains(key); }, state.ef_search,
+			    index.any_thread());
+		} else {
+			search_result = index.ef_search(query_vector, limit, state.ef_search);
+		}
 	}
 
 	const auto offset = state.row_ids.size();
@@ -715,9 +735,18 @@ void HNSWModule::RegisterIndex(DatabaseInstance &db) {
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
 	// Register scan option
-	db.config.AddExtensionOption("hnsw_ef_search",
-	                             "experimental: override the ef_search parameter when scanning HNSW indexes",
-	                             LogicalType::BIGINT);
+	db.config.AddExtensionOption(
+	    "hnsw_ef_search",
+	    "experimental: override the ef_search parameter when scanning HNSW indexes. "
+	    "Increase this value when using filtered queries with selective predicates to improve ANN recall.",
+	    LogicalType::BIGINT);
+
+	// Register filter pushdown option
+	db.config.AddExtensionOption("hnsw_enable_filter_pushdown",
+	                             "when true (default), WHERE clause filters on the HNSW table are pushed into the "
+	                             "index scan via a pre-built row bitmap so filtered candidates do not consume the "
+	                             "result budget. Set to false to revert to post-filter behavior.",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
 
 	// Register the index type
 	db.config.GetIndexTypes().RegisterIndexType(index_type);

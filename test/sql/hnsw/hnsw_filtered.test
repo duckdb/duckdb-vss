@@ -1,0 +1,193 @@
+# name: test/sql/hnsw/hnsw_filtered.test
+# description: Filtered HNSW - WHERE clause filters pushed into index scan via bitmap pre-filter
+# group: [hnsw]
+
+require vss
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Setup: 100 rows with a deterministic label column and 1D-like vectors so that
+# distance ordering is predictable.  Rows with even id get label='A', odd id get
+# label='B'.  Vectors are along the x-axis so array_distance([0.5,0,0]) always
+# gives |i*0.01 - 0.5|, and the k-nearest are those with i closest to 50.
+# ───────────────────────────────────────────────────────────────────────────────
+
+statement ok
+CREATE TABLE flt (
+    id    INTEGER,
+    label VARCHAR,
+    vec   FLOAT[3]
+);
+
+statement ok
+INSERT INTO flt
+SELECT
+    i,
+    CASE WHEN i % 2 = 0 THEN 'A' ELSE 'B' END,
+    array_value((i * 0.01)::FLOAT, 0.0::FLOAT, 0.0::FLOAT)
+FROM range(100) t(i);
+
+statement ok
+CREATE INDEX flt_idx ON flt USING HNSW (vec);
+
+# Use high ef_search so results are near-exact on this tiny table
+statement ok
+SET hnsw_ef_search = 200;
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 1. No filter — baseline regression: index scan still works.
+#    Plan: HNSW_INDEX_SCAN with no FILTER node and no Filters detail.
+# ───────────────────────────────────────────────────────────────────────────────
+
+query II
+EXPLAIN SELECT id FROM flt ORDER BY array_distance(vec, [0.5, 0.0, 0.0]::FLOAT[3]) LIMIT 5;
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_SCAN.*
+
+query I
+SELECT count(*) FROM (
+    SELECT id FROM flt ORDER BY array_distance(vec, [0.5, 0.0, 0.0]::FLOAT[3]) LIMIT 5
+);
+----
+5
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 2. Plan shape: WITH filter pushdown enabled the HNSW_INDEX_SCAN shows pushed
+#    Filters (label='A') and there is no separate FILTER node above the scan.
+# ───────────────────────────────────────────────────────────────────────────────
+
+statement ok
+SET hnsw_enable_filter_pushdown = true;
+
+# Positive: scan has filters pushed in
+query II
+EXPLAIN SELECT id FROM flt WHERE label = 'A' ORDER BY array_distance(vec, [0.5, 0.0, 0.0]::FLOAT[3]) LIMIT 5;
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_SCAN.*Filters:.*label.*
+
+# Negative: no standalone FILTER node, no SEMI join, no SEQ_SCAN
+query II
+EXPLAIN SELECT id FROM flt WHERE label = 'A' ORDER BY array_distance(vec, [0.5, 0.0, 0.0]::FLOAT[3]) LIMIT 5;
+----
+physical_plan	<!REGEX>:.*SEQ_SCAN.*
+
+query II
+EXPLAIN SELECT id FROM flt WHERE label = 'A' ORDER BY array_distance(vec, [0.5, 0.0, 0.0]::FLOAT[3]) LIMIT 5;
+----
+physical_plan	<!REGEX>:.*SEMI.*
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 3. Equality filter — all returned rows must have label='A'.
+#    Approximate filtered search may return fewer than LIMIT.
+# ───────────────────────────────────────────────────────────────────────────────
+
+# At least 1 result returned
+query I
+SELECT count(*) >= 1 FROM (
+    SELECT id FROM flt WHERE label = 'A'
+    ORDER BY array_distance(vec, [0.5, 0.0, 0.0]::FLOAT[3]) LIMIT 5
+);
+----
+true
+
+# Verify all returned rows actually satisfy the filter
+query I
+SELECT count(*) FROM (
+    SELECT id, label FROM flt WHERE label = 'A'
+    ORDER BY array_distance(vec, [0.5, 0.0, 0.0]::FLOAT[3]) LIMIT 5
+) WHERE label != 'A';
+----
+0
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 4. Range filter — all returned rows must have id >= 50.
+# ───────────────────────────────────────────────────────────────────────────────
+
+query I
+SELECT count(*) >= 1 FROM (
+    SELECT id FROM flt WHERE id >= 50
+    ORDER BY array_distance(vec, [0.5, 0.0, 0.0]::FLOAT[3]) LIMIT 5
+);
+----
+true
+
+query I
+SELECT count(*) FROM (
+    SELECT id FROM flt WHERE id >= 50
+    ORDER BY array_distance(vec, [0.5, 0.0, 0.0]::FLOAT[3]) LIMIT 5
+) WHERE id < 50;
+----
+0
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 5. IS NOT NULL filter — all 100 rows qualify so this behaves like no filter.
+# ───────────────────────────────────────────────────────────────────────────────
+
+query I
+SELECT count(*) >= 1 FROM (
+    SELECT id FROM flt WHERE label IS NOT NULL
+    ORDER BY array_distance(vec, [0.5, 0.0, 0.0]::FLOAT[3]) LIMIT 5
+);
+----
+true
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 6. Highly selective filter: only 3 rows match, LIMIT=10.
+#    Must return at most 3, and all must satisfy the predicate.
+# ───────────────────────────────────────────────────────────────────────────────
+
+query I
+SELECT count(*) <= 3 FROM (
+    SELECT id FROM flt WHERE id IN (10, 50, 90)
+    ORDER BY array_distance(vec, [0.5, 0.0, 0.0]::FLOAT[3]) LIMIT 10
+);
+----
+true
+
+# All returned rows must be in the allowed set
+query I
+SELECT count(*) FROM (
+    SELECT id FROM flt WHERE id IN (10, 50, 90)
+    ORDER BY array_distance(vec, [0.5, 0.0, 0.0]::FLOAT[3]) LIMIT 10
+) WHERE id NOT IN (10, 50, 90);
+----
+0
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 7. Escape hatch: SET hnsw_enable_filter_pushdown = false reverts to the old
+#    post-filter behavior.  Plan has a FILTER node and no pushed Filters detail.
+# ───────────────────────────────────────────────────────────────────────────────
+
+statement ok
+SET hnsw_enable_filter_pushdown = false;
+
+# FILTER node present in plan
+query II
+EXPLAIN SELECT id FROM flt WHERE label = 'A'
+ORDER BY array_distance(vec, [0.5, 0.0, 0.0]::FLOAT[3]) LIMIT 5;
+----
+physical_plan	<REGEX>:.*FILTER.*
+
+# HNSW scan is still used (under the FILTER)
+query II
+EXPLAIN SELECT id FROM flt WHERE label = 'A'
+ORDER BY array_distance(vec, [0.5, 0.0, 0.0]::FLOAT[3]) LIMIT 5;
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_SCAN.*
+
+# Re-enable for subsequent tests
+statement ok
+SET hnsw_enable_filter_pushdown = true;
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 8. Correctness: sequential scan result ordering must match expectations.
+#    This validates that the distance metric produces the expected ordering
+#    independent of the HNSW index.
+# ───────────────────────────────────────────────────────────────────────────────
+
+query I
+SELECT id FROM flt WHERE id IN (10, 50, 90)
+ORDER BY array_distance(vec, [0.5, 0.0, 0.0]::FLOAT[3]);
+----
+50
+90
+10

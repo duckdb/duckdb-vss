@@ -50,12 +50,14 @@ public:
 	//! The allocator used to persist linked blocks
 	unique_ptr<FixedSizeAllocator> linked_block_allocator;
 
-	unique_ptr<IndexScanState> InitializeMultiScan(ClientContext &context);
+	unique_ptr<IndexScanState> InitializeMultiScan(ClientContext &context,
+	                                               const struct FilterBitmap *bitmap = nullptr);
 	idx_t ExecuteMultiScan(IndexScanState &state, float *query_vector, idx_t limit);
 	const Vector &GetMultiScanResult(IndexScanState &state);
 	void ResetMultiScan(IndexScanState &state);
 
-	unique_ptr<IndexScanState> InitializeScan(float *query_vector, idx_t limit, ClientContext &context);
+	unique_ptr<IndexScanState> InitializeScan(float *query_vector, idx_t limit, ClientContext &context,
+	                                          const struct FilterBitmap *bitmap = nullptr);
 	idx_t Scan(IndexScanState &state, Vector &result, idx_t result_offset = 0);
 	idx_t GetVectorSize() const;
 	string GetMetric() const;

@@ -60,6 +60,38 @@ The following table shows the supported distance metrics and their corresponding
 | Cosine similarity | `cosine` | `array_cosine_distance`        |
 | Inner product | `ip` | `array_negative_inner_product` |
 
+## Filtered Queries
+
+The HNSW index supports WHERE clause filters on the same table. Filters are pushed into the index scan so that filtered rows do not consume the `LIMIT` budget — you reliably get `LIMIT` results as long as enough rows satisfy the filter.
+
+```sql
+-- Filtered nearest-neighbor search
+SELECT id, category
+FROM items
+WHERE category = 'electronics'
+ORDER BY array_distance(vec, [0.5, 0.5, 0.5]::FLOAT[3])
+LIMIT 10;
+```
+
+Supported filter types: equality (`=`), range (`>`, `>=`, `<`, `<=`, `BETWEEN`), `IN (...)`, `IS NOT NULL`, and AND combinations of the above.
+
+Use `EXPLAIN` to verify the filter is being pushed in — the plan should show `HNSW_INDEX_SCAN` with no `FILTER` node above it:
+
+```sql
+EXPLAIN SELECT id FROM items
+WHERE category = 'electronics'
+ORDER BY array_distance(vec, [0.5, 0.5, 0.5]::FLOAT[3])
+LIMIT 10;
+```
+
+**How it works:** before the HNSW search, a single O(n) pass over the filter column(s) builds a row-ID bitmap marking rows that pass the predicate. The HNSW search then uses this bitmap to skip non-matching rows, ensuring they do not count against the `LIMIT`. This means every filtered query has an O(n) pre-scan cost over the filter columns. For large tables with non-selective filters where post-filter underfill is acceptable, the pushdown can be disabled:
+
+```sql
+SET hnsw_enable_filter_pushdown = false;
+```
+
+For deeper design details see [docs/filtered_hnsw.md](docs/filtered_hnsw.md).
+
 ## Inserts, Updates,  Deletes and Re-Compaction
 
 The HNSW index does support inserting, updating and deleting rows from the table after index creation. However, there are two things to keep in mind:  

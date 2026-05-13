@@ -1,5 +1,6 @@
 set(EXTENSION_SOURCES
     ${EXTENSION_SOURCES}
+    ${CMAKE_CURRENT_SOURCE_DIR}/hnsw_filter_bitmap.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/hnsw_index.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/hnsw_index_macros.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/hnsw_index_physical_create.cpp
