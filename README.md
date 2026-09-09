@@ -77,16 +77,20 @@ LIMIT 10;
 
 The current implementation builds a transaction-visible filter bitmap with an
 O(n) scan over the filter columns for each query. Pre-filtering is enabled by
-default and can be disabled to restore the previous post-filter behavior:
+default and can be disabled to use post-filtering instead:
 
 ```sql
-SET hnsw_enable_filter_pushdown = false;
+SET hnsw_prefilter = false;
 ```
 
 Filtered search remains approximate. Increasing `hnsw_ef_search` can improve
 recall for selective filters. Predicates DuckDB keeps as separate operators,
 such as some computed expressions, are not currently pushed into the HNSW
 search.
+
+See the [HNSW prefilter verification guide](docs/hnsw_prefilter_verification.md)
+for a complete self-checking example covering prefiltering, complex-filter
+fallback, and post-filter underfilling.
 
 ## Inserts, Updates,  Deletes and Re-Compaction
 
