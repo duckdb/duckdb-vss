@@ -96,6 +96,48 @@ SELECT unnest(min_by(id, array_distance(vec, [1, 0, 0]::FLOAT[3]), 3)) FROM item
 7
 8
 
+# DuckDB lowers constant IN lists with at least four values to a MARK join.
+# The HNSW optimizer extracts that generated constant set into the bitmap scan.
+statement ok
+CREATE TABLE in_items (id INTEGER, board_id BIGINT, active BOOLEAN, vec FLOAT[3]);
+
+statement ok
+INSERT INTO in_items SELECT i, 1000 + i, i % 2 = 0, [i, 0, 0]::FLOAT[3] FROM range(100) t(i);
+
+statement ok
+INSERT INTO in_items VALUES (-1, NULL, true, [0, 0, 0]::FLOAT[3]);
+
+statement ok
+CREATE INDEX in_items_vec_idx ON in_items USING HNSW (vec);
+
+query II
+EXPLAIN SELECT id FROM in_items WHERE board_id IN (500, 1090, 1092, 1094, 1096, 1098, 2000, 2002, 2004, 2006, NULL, 1090) AND active ORDER BY array_distance(vec, [0, 0, 0]::FLOAT[3]) LIMIT 5;
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_SCAN.*
+
+query I
+SELECT id FROM in_items WHERE board_id IN (500, 1090, 1092, 1094, 1096, 1098, 2000, 2002, 2004, 2006, NULL, 1090) AND active ORDER BY array_distance(vec, [0, 0, 0]::FLOAT[3]) LIMIT 5;
+----
+90
+92
+94
+96
+98
+
+query II
+EXPLAIN SELECT unnest(min_by(id, array_distance(vec, [0, 0, 0]::FLOAT[3]), 5)) FROM in_items WHERE board_id IN (500, 1090, 1092, 1094, 1096, 1098, 2000, 2002, 2004, 2006) AND active;
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_SCAN.*
+
+query I
+SELECT unnest(min_by(id, array_distance(vec, [0, 0, 0]::FLOAT[3]), 5)) FROM in_items WHERE board_id IN (500, 1090, 1092, 1094, 1096, 1098, 2000, 2002, 2004, 2006) AND active;
+----
+90
+92
+94
+96
+98
+
 # Rows inserted after index creation participate in pre-filtered searches.
 statement ok
 INSERT INTO items VALUES (0, 'keep', [0, 0, 0]::FLOAT[3]);
@@ -116,6 +158,21 @@ query I
 SELECT id FROM items WHERE category = 'keep' ORDER BY array_distance(vec, [1, 0, 0]::FLOAT[3]) LIMIT 3;
 ----
 0
+
+# Disabling pre-filtering leaves the MARK-join shape on DuckDB's sequential path.
+query I
+SELECT count(*) FROM (SELECT id FROM in_items WHERE board_id IN (500, 1090, 1092, 1094, 1096, 1098, 2000, 2002, 2004, 2006) AND active ORDER BY array_distance(vec, [0, 0, 0]::FLOAT[3]) LIMIT 5);
+----
+5
+
+query I
+SELECT unnest(min_by(id, array_distance(vec, [0, 0, 0]::FLOAT[3]), 5)) FROM in_items WHERE board_id IN (500, 1090, 1092, 1094, 1096, 1098, 2000, 2002, 2004, 2006) AND active;
+----
+90
+92
+94
+96
+98
 
 statement ok
 SET hnsw_prefilter = true;
