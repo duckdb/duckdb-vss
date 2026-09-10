@@ -95,7 +95,7 @@ unique_ptr<HNSWConstantInFilter> HNSWTryExtractConstantInFilter(unique_ptr<Logic
 	value_set_t values;
 	ColumnDataScanState scan_state;
 	DataChunk chunk;
-	chunk_get.collection->InitializeScan(scan_state, ColumnDataScanProperties::DISALLOW_ZERO_COPY);
+	chunk_get.collection->InitializeScan(scan_state);
 	chunk_get.collection->InitializeScanChunk(scan_state, chunk);
 	while (chunk_get.collection->Scan(scan_state, chunk)) {
 		for (idx_t row_idx = 0; row_idx < chunk.size(); row_idx++) {
