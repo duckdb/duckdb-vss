@@ -97,6 +97,17 @@ static void BuildFilterBitmap(ClientContext &context, TableFunctionInitInput &in
 		scan_chunk.data.back().ToUnifiedFormat(row_ids);
 		auto row_id_data = UnifiedVectorFormat::GetData<row_t>(row_ids);
 		for (idx_t row_idx = 0; row_idx < scan_chunk.size(); row_idx++) {
+			if (in_filter_column_position.IsValid()) {
+				auto probe_value = scan_chunk.GetValue(in_filter_column_position.GetIndex(), row_idx);
+				if (probe_value.IsNull()) {
+					continue;
+				}
+
+				const auto &allowed_values = bind_data.constant_in_filter->values;
+				if (allowed_values.find(probe_value) == allowed_values.end()) {
+					continue;
+				}
+			}
 			filter.Set(row_id_data[row_ids.sel->get_index(row_idx)]);
 		}
 	}
