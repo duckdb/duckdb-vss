@@ -63,6 +63,19 @@ static void BuildFilterBitmap(ClientContext &context, TableFunctionInitInput &in
 		}
 	}
 
+	optional_idx constant_in_column;
+	if (bind_data.constant_in_filter) {
+		for (idx_t column_idx = 0; column_idx < input.column_indexes.size(); column_idx++) {
+			if (input.column_indexes[column_idx] == bind_data.constant_in_filter->column_index) {
+				constant_in_column = column_idx;
+				break;
+			}
+		}
+		if (!constant_in_column.IsValid()) {
+			throw InternalException("HNSW constant IN filter column is missing from the scan projection");
+		}
+	}
+
 	// Appending the row ID preserves the table-filter indexes, which refer to the
 	// columns selected by the physical scan.
 	scan_column_ids.emplace_back(COLUMN_IDENTIFIER_ROW_ID);
