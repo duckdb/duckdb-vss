@@ -1939,6 +1939,10 @@ class index_dense_gt {
                         std::forward<executor_at>(executor), std::forward<progress_at>(progress));
         vectors_lookup_ = std::move(new_vectors_lookup);
         vectors_tape_allocator_ = std::move(new_vectors_allocator);
+
+        // Compaction permutes graph slots, invalidating both the key-to-slot lookup
+        // and the free-slot list. Rebuild them from the compacted graph.
+        reindex_keys_();
         return result;
     }
 
