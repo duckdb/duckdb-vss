@@ -1,21 +1,21 @@
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/optimizer/optimizer_extension.hpp"
+#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
-#include "duckdb/optimizer/optimizer.hpp"
-#include "duckdb/optimizer/optimizer_extension.hpp"
-#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/index.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
 #include "duckdb/storage/table/data_table_info.hpp"
 #include "duckdb/storage/table/table_index_list.hpp"
-
 #include "hnsw/hnsw.hpp"
 #include "hnsw/hnsw_index.hpp"
 #include "hnsw/hnsw_index_scan.hpp"
+#include "hnsw/hnsw_optimize_filter.hpp"
 
 namespace duckdb {
 
@@ -97,13 +97,16 @@ public:
 			return false;
 		}
 
-		// we also need the projection to be directly on top of a table scan that has a hnsw index
-		if (agg.children[0]->type != LogicalOperatorType::LOGICAL_GET) {
-			return false;
+		auto *get_ptr = &agg.children[0];
+		unique_ptr<HNSWConstantInFilter> constant_in_filter;
+		if ((*get_ptr)->type != LogicalOperatorType::LOGICAL_GET) {
+			constant_in_filter = HNSWTryExtractConstantInFilter(agg.children[0], get_ptr);
+			if (!constant_in_filter) {
+				return false;
+			}
 		}
 
-		auto &get_ptr = agg.children[0];
-		auto &get = get_ptr->Cast<LogicalGet>();
+		auto &get = (*get_ptr)->Cast<LogicalGet>();
 		if (get.function.name != "seq_scan") {
 			return false;
 		}
@@ -125,6 +128,9 @@ public:
 		unique_ptr<HNSWIndexScanBindData> bind_data = nullptr;
 		vector<reference<Expression>> bindings;
 		const auto prefilter = HNSWIndexScanFunction::PrefilterEnabled(context);
+		if (constant_in_filter && !prefilter) {
+			return false;
+		}
 
 		table_info.BindIndexes(context, HNSWIndex::TYPE_NAME);
 		for (auto index_entry : table_info.GetIndexes().IndexEntries()) {
@@ -174,8 +180,9 @@ public:
 			if (k_limit <= 0 || k_limit >= STANDARD_VECTOR_SIZE) {
 				continue;
 			}
-			bind_data = make_uniq<HNSWIndexScanBindData>(duck_table, index_entry, guard->GetIndexName(), k_limit,
-			                                             std::move(query_vector), prefilter);
+			bind_data =
+			    make_uniq<HNSWIndexScanBindData>(duck_table, index_entry, guard->GetIndexName(), k_limit,
+			                                     std::move(query_vector), prefilter, std::move(constant_in_filter));
 			break;
 		}
 
@@ -210,9 +217,9 @@ public:
 				new_filter->expressions.push_back(entry.Filter().ToExpression(*column));
 			}
 
-			new_filter->children.push_back(std::move(get_ptr));
+			new_filter->children.push_back(std::move(*get_ptr));
 			new_filter->ResolveOperatorTypes();
-			get_ptr = std::move(new_filter);
+			*get_ptr = std::move(new_filter);
 		}
 
 		return true;

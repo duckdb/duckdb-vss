@@ -8,13 +8,12 @@
 #include "duckdb/planner/table_filter_set.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/index.hpp"
-#include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
 #include "duckdb/storage/storage_index.hpp"
+#include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/local_storage.hpp"
-
 #include "hnsw/hnsw.hpp"
 #include "hnsw/hnsw_index.hpp"
 
@@ -63,6 +62,19 @@ static void BuildFilterBitmap(ClientContext &context, TableFunctionInitInput &in
 		}
 	}
 
+	optional_idx in_filter_column_position;
+	if (bind_data.constant_in_filter) {
+		for (idx_t column_idx = 0; column_idx < input.column_indexes.size(); column_idx++) {
+			if (input.column_indexes[column_idx] == bind_data.constant_in_filter->column_index) {
+				in_filter_column_position = column_idx;
+				break;
+			}
+		}
+		if (!in_filter_column_position.IsValid()) {
+			throw InternalException("HNSW constant IN filter column is missing from the scan projection");
+		}
+	}
+
 	// Appending the row ID preserves the table-filter indexes, which refer to the
 	// columns selected by the physical scan.
 	scan_column_ids.emplace_back(COLUMN_IDENTIFIER_ROW_ID);
@@ -84,6 +96,17 @@ static void BuildFilterBitmap(ClientContext &context, TableFunctionInitInput &in
 		scan_chunk.data.back().ToUnifiedFormat(row_ids);
 		auto row_id_data = UnifiedVectorFormat::GetData<row_t>(row_ids);
 		for (idx_t row_idx = 0; row_idx < scan_chunk.size(); row_idx++) {
+			if (in_filter_column_position.IsValid()) {
+				auto probe_value = scan_chunk.GetValue(in_filter_column_position.GetIndex(), row_idx);
+				if (probe_value.IsNull()) {
+					continue;
+				}
+
+				const auto &allowed_values = bind_data.constant_in_filter->values;
+				if (allowed_values.find(probe_value) == allowed_values.end()) {
+					continue;
+				}
+			}
 			filter.Set(row_id_data[row_ids.sel->get_index(row_idx)]);
 		}
 	}
@@ -117,8 +140,10 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 	// rows instead of filtering an unqualified top-k afterward.
 	HNSWFilterBitmap filter;
 	optional_ptr<const HNSWFilterBitmap> filter_ptr;
-	if (bind_data.prefilter && input.filters &&
-	    (input.filters->HasFilters() || input.filters->HasMultiColumnFilters())) {
+	const bool has_constant_in_filter = bind_data.constant_in_filter != nullptr;
+	const bool has_table_filters =
+	    input.filters && (input.filters->HasFilters() || input.filters->HasMultiColumnFilters());
+	if (bind_data.prefilter && (has_constant_in_filter || has_table_filters)) {
 		BuildFilterBitmap(context, input, bind_data, filter);
 		filter_ptr = &filter;
 	}

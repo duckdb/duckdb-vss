@@ -77,7 +77,10 @@ LIMIT 10;
 
 The current implementation builds a transaction-visible filter bitmap with an
 O(n) scan over the filter columns for each query. Pre-filtering is enabled by
-default and can be disabled to use post-filtering instead:
+default. Large constant `IN` lists that DuckDB lowers to a MARK join are also
+included in the bitmap when they compare a direct base-table column. They fall
+back to a sequential scan when pre-filtering is disabled; directly pushed
+filters continue to use post-filtering instead:
 
 ```sql
 SET hnsw_prefilter = false;
