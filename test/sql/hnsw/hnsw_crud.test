@@ -22,6 +22,15 @@ statement ok
 CREATE INDEX my_idx ON t1 USING HNSW (vec);
 
 statement ok
+CREATE TABLE loaded_delete (id INTEGER, vec FLOAT[3]);
+
+statement ok
+INSERT INTO loaded_delete VALUES (1, [1, 0, 0]), (2, [2, 0, 0]);
+
+statement ok
+CREATE INDEX loaded_delete_idx ON loaded_delete USING HNSW (vec);
+
+statement ok
 CHECKPOINT;
 
 statement ok
@@ -31,7 +40,17 @@ statement ok
 DELETE FROM t1 WHERE vec = array[1.0, 2.0, 3.0];
 
 query I
+SELECT count FROM pragma_hnsw_index_info() WHERE index_name = 'my_idx';
+----
+1
+
+query I
 SELECT * FROM t1;
+----
+[5.0, 5.0, 5.0]
+
+query I
+SELECT * FROM t1 ORDER BY array_distance(vec, [1,2,3]::FLOAT[3]) LIMIT 1;
 ----
 [5.0, 5.0, 5.0]
 
@@ -42,15 +61,175 @@ statement ok
 SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
 
 # Step 2: Check the index
+query I
+SELECT count FROM pragma_hnsw_index_info() WHERE index_name = 'my_idx';
+----
+1
+
 query II
-EXPLAIN SELECT * FROM t1 ORDER BY array_distance(vec, [1,2,3]::FLOAT[3]) LIMIT 3;
+EXPLAIN SELECT * FROM t1 ORDER BY array_distance(vec, [1,2,3]::FLOAT[3]) LIMIT 1;
 ----
 physical_plan	<REGEX>:.*HNSW_INDEX_SCAN.*
 
 query I
-SELECT * FROM t1 ORDER BY array_distance(vec, [1,2,3]::FLOAT[3]) LIMIT 3;
+SELECT * FROM t1 ORDER BY array_distance(vec, [1,2,3]::FLOAT[3]) LIMIT 1;
 ----
 [5.0, 5.0, 5.0]
 
+# Delete an entry after its HNSW index has been loaded from persistent storage.
+statement ok
+DELETE FROM loaded_delete WHERE id = 1;
+
+query I
+SELECT count FROM pragma_hnsw_index_info() WHERE index_name = 'loaded_delete_idx';
+----
+1
+
+query I
+SELECT id FROM loaded_delete ORDER BY array_distance(vec, [1,0,0]::FLOAT[3]) LIMIT 1;
+----
+2
+
+# The deletion from the loaded index is persisted as well.
+statement ok
+CHECKPOINT;
+
+restart
+
+query I
+SELECT count FROM pragma_hnsw_index_info() WHERE index_name = 'loaded_delete_idx';
+----
+1
+
+query II
+EXPLAIN SELECT id FROM loaded_delete ORDER BY array_distance(vec, [1,0,0]::FLOAT[3]) LIMIT 1;
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_SCAN.*
+
+query I
+SELECT id FROM loaded_delete ORDER BY array_distance(vec, [1,0,0]::FLOAT[3]) LIMIT 1;
+----
+2
+
 statement ok
 PRAGMA hnsw_compact_index('my_idx');
+
+# Deleting remains correct after compaction has reassigned USearch slots.
+statement ok
+CREATE TABLE t2 (id INTEGER, vec FLOAT[3]);
+
+statement ok
+INSERT INTO t2 SELECT i, [i::FLOAT, 0, 0]::FLOAT[3] FROM range(100) r(i);
+
+statement ok
+CREATE INDEX t2_idx ON t2 USING HNSW (vec);
+
+statement ok
+DELETE FROM t2 WHERE id % 2 = 0;
+
+statement ok
+PRAGMA hnsw_compact_index('t2_idx');
+
+statement ok
+DELETE FROM t2 WHERE id = 1;
+
+query I
+SELECT count FROM pragma_hnsw_index_info() WHERE index_name = 't2_idx';
+----
+49
+
+query I
+SELECT id FROM t2 ORDER BY array_distance(vec, [1,0,0]::FLOAT[3]) LIMIT 1;
+----
+3
+
+# NULL vectors are not present in HNSW and should not count as failed deletions.
+statement ok
+CREATE TABLE t3 (id INTEGER, vec FLOAT[3]);
+
+statement ok
+INSERT INTO t3 VALUES (1, NULL), (2, [2, 2, 2]);
+
+statement ok
+CREATE INDEX t3_idx ON t3 USING HNSW (vec);
+
+query I
+SELECT count FROM pragma_hnsw_index_info() WHERE index_name = 't3_idx';
+----
+1
+
+statement ok
+DELETE FROM t3 WHERE id = 1;
+
+query I
+SELECT count FROM pragma_hnsw_index_info() WHERE index_name = 't3_idx';
+----
+1
+
+statement ok
+DELETE FROM t3 WHERE id = 2;
+
+query I
+SELECT count FROM pragma_hnsw_index_info() WHERE index_name = 't3_idx';
+----
+0
+
+# Indexed-column updates are rewritten to DELETE + INSERT.
+statement ok
+CREATE TABLE t4 (id INTEGER, vec FLOAT[3]);
+
+statement ok
+INSERT INTO t4 VALUES (1, [1, 1, 1]);
+
+statement ok
+CREATE INDEX t4_idx ON t4 USING HNSW (vec);
+
+statement ok
+UPDATE t4 SET vec = [10, 10, 10] WHERE id = 1;
+
+query I
+SELECT count FROM pragma_hnsw_index_info() WHERE index_name = 't4_idx';
+----
+1
+
+query I
+SELECT id FROM t4 ORDER BY array_distance(vec, [10,10,10]::FLOAT[3]) LIMIT 1;
+----
+1
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+UPDATE t4 SET vec = [20, 20, 20] WHERE id = 1;
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count FROM pragma_hnsw_index_info() WHERE index_name = 't4_idx';
+----
+1
+
+query I
+SELECT id FROM t4 ORDER BY array_distance(vec, [10,10,10]::FLOAT[3]) LIMIT 1;
+----
+1
+
+# Read-only databases reject deletes before the HNSW index can be mutated.
+load {TEST_DIR}/temp_index_hnsw_crud_storage.db readonly
+
+statement error
+DELETE FROM t1;
+----
+read-only mode
+
+query I
+SELECT count FROM pragma_hnsw_index_info() WHERE index_name = 'my_idx';
+----
+1
+
+query I
+SELECT * FROM t1 ORDER BY array_distance(vec, [1,2,3]::FLOAT[3]) LIMIT 1;
+----
+[5.0, 5.0, 5.0]

@@ -19,6 +19,7 @@
 #include "duckdb/execution/index/fixed_size_allocator.hpp"
 #include "duckdb/execution/index/index_type.hpp"
 #include "duckdb/execution/index/index_type_set.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database.hpp"
@@ -194,8 +195,9 @@ HNSWIndex::HNSWIndex(const Identifier &name, IndexConstraintType index_constrain
 	unum::usearch::metric_punned_t metric(vector_size, metric_kind, scalar_kind);
 	unum::usearch::index_dense_config_t config = {};
 
-	// We dont need to do key lookups (id -> vector) in the index, DuckDB stores the vectors separately
-	config.enable_key_lookups = false;
+	// Deletions address entries by row ID and require USearch's key-to-slot lookup.
+	// Read-only databases cannot delete entries, so avoid the additional lookup table there.
+	config.enable_key_lookups = !db.IsReadOnly();
 
 	auto ef_construction_opt = options.find("ef_construction");
 	if (ef_construction_opt != options.end()) {
@@ -521,21 +523,44 @@ void HNSWIndex::Compact() {
 }
 
 void HNSWIndex::Delete(IndexLock &lock, DataChunk &input, Vector &rowid_vec) {
-	// Mark this index as dirty so we checkpoint it properly
-	is_dirty = true;
+	DataChunk expression_result;
+	expression_result.Initialize(Allocator::DefaultAllocator(), logical_types);
+	ExecuteExpressions(input, expression_result);
+	expression_result.Flatten();
 
-	auto count = input.size();
 	rowid_vec.Flatten();
 	auto row_id_data = FlatVector::GetData<row_t>(rowid_vec);
+	auto &indexed_vector = expression_result.data[0];
+
+	vector<row_t> row_ids_to_remove;
+	row_ids_to_remove.reserve(input.size());
+	for (idx_t i = 0; i < input.size(); i++) {
+		// NULL values are not inserted into the HNSW index.
+		if (!FlatVector::IsNull(indexed_vector, i)) {
+			row_ids_to_remove.push_back(row_id_data[i]);
+		}
+	}
+	if (row_ids_to_remove.empty()) {
+		return;
+	}
 
 	// For deleting from the index, we need an exclusive lock
 	auto _lock = rwlock.GetExclusiveLock();
-
-	for (idx_t i = 0; i < input.size(); i++) {
-		auto result = index.remove(row_id_data[i]);
+	auto result = index.remove(row_ids_to_remove.begin(), row_ids_to_remove.end());
+	if (!result) {
+		throw InternalException("Failed to delete from the HNSW index: %s", result.error.what());
 	}
 
-	index_size = index.size();
+	if (result.completed > 0) {
+		// Keep the cached state synchronized even if a partial deletion is detected below.
+		is_dirty = true;
+		index_size = index.size();
+	}
+
+	if (result.completed != row_ids_to_remove.size()) {
+		throw InternalException("Failed to delete all rows from the HNSW index. Only deleted %d out of %d indexed rows",
+		                        result.completed, row_ids_to_remove.size());
+	}
 }
 
 ErrorData HNSWIndex::Insert(IndexLock &lock, DataChunk &input, Vector &rowid_vec) {
