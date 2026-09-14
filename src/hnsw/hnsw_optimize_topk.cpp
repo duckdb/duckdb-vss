@@ -2,8 +2,8 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
-#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
@@ -124,6 +124,7 @@ public:
 
 		unique_ptr<HNSWIndexScanBindData> bind_data = nullptr;
 		vector<reference<Expression>> bindings;
+		const auto prefilter = HNSWIndexScanFunction::PrefilterEnabled(context);
 
 		table_info.BindIndexes(context, HNSWIndex::TYPE_NAME);
 		for (auto index_entry : table_info.GetIndexes().IndexEntries()) {
@@ -174,7 +175,7 @@ public:
 				continue;
 			}
 			bind_data = make_uniq<HNSWIndexScanBindData>(duck_table, index_entry, guard->GetIndexName(), k_limit,
-			                                             std::move(query_vector));
+			                                             std::move(query_vector), prefilter);
 			break;
 		}
 
@@ -195,27 +196,24 @@ public:
 		    CreateListOrderByExpr(context, col_expr->Copy(), dist_expr.Copy(),
 		                          agg_func_expr.GetFilter() ? agg_func_expr.GetFilter()->Copy() : nullptr);
 
-		if (!get.table_filters.HasFilters()) {
-			return true;
+		if (!prefilter && get.table_filters.HasFilters()) {
+			// Restore the post-filter plan when pre-filtering is explicitly disabled.
+			get.projection_ids.clear();
+			get.types.clear();
+
+			auto new_filter = make_uniq<LogicalFilter>();
+			for (const auto &entry : get.table_filters) {
+				auto filter_idx = entry.GetIndex();
+				auto &column_id = get.GetColumnIndex(filter_idx);
+				auto &type = get.returned_types[column_id.GetPrimaryIndex()];
+				auto column = make_uniq<BoundColumnRefExpression>(type, ColumnBinding(get.table_index, filter_idx));
+				new_filter->expressions.push_back(entry.Filter().ToExpression(*column));
+			}
+
+			new_filter->children.push_back(std::move(get_ptr));
+			new_filter->ResolveOperatorTypes();
+			get_ptr = std::move(new_filter);
 		}
-
-		// We need to pullup the filters from the table scan as our index scan does not support regular filter pushdown.
-		get.projection_ids.clear();
-		get.types.clear();
-
-		auto new_filter = make_uniq<LogicalFilter>();
-		auto &column_ids = get.GetColumnIds();
-		for (const auto &entry : get.table_filters) {
-			auto filter_idx = entry.GetIndex();
-			auto &column_id = get.GetColumnIndex(filter_idx);
-			auto &type = get.returned_types[column_id.GetPrimaryIndex()];
-			auto column = make_uniq<BoundColumnRefExpression>(type, ColumnBinding(get.table_index, filter_idx));
-			new_filter->expressions.push_back(entry.Filter().ToExpression(*column));
-		}
-
-		new_filter->children.push_back(std::move(get_ptr));
-		new_filter->ResolveOperatorTypes();
-		get_ptr = std::move(new_filter);
 
 		return true;
 	}

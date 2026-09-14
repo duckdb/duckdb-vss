@@ -60,6 +60,38 @@ The following table shows the supported distance metrics and their corresponding
 | Cosine similarity | `cosine` | `array_cosine_distance`        |
 | Inner product | `ip` | `array_negative_inner_product` |
 
+## Pre-filtered searches
+
+Static `WHERE` filters that DuckDB can push into the table scan are applied
+before the HNSW search. This allows the index scan to return up to the requested
+number of qualifying nearest neighbors instead of finding the unfiltered top-k
+and discarding rows afterward.
+
+```sql
+SELECT id
+FROM items
+WHERE category = 'electronics'
+ORDER BY array_distance(vec, [0.5, 0.5, 0.5]::FLOAT[3])
+LIMIT 10;
+```
+
+The current implementation builds a transaction-visible filter bitmap with an
+O(n) scan over the filter columns for each query. Pre-filtering is enabled by
+default and can be disabled to use post-filtering instead:
+
+```sql
+SET hnsw_prefilter = false;
+```
+
+Filtered search remains approximate. Increasing `hnsw_ef_search` can improve
+recall for selective filters. Predicates DuckDB keeps as separate operators,
+such as some computed expressions, are not currently pushed into the HNSW
+search.
+
+See the [HNSW prefilter verification guide](docs/hnsw_prefilter_verification.md)
+for a complete self-checking example covering prefiltering, complex-filter
+fallback, and post-filter underfilling.
+
 ## Inserts, Updates,  Deletes and Re-Compaction
 
 The HNSW index does support inserting, updating and deleting rows from the table after index creation. However, there are two things to keep in mind:  

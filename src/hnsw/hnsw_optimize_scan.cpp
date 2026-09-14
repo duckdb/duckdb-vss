@@ -4,9 +4,9 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
-#include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/index.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
@@ -100,6 +100,7 @@ public:
 		// Find the index
 		unique_ptr<HNSWIndexScanBindData> bind_data = nullptr;
 		vector<reference<Expression>> bindings;
+		const auto prefilter = HNSWIndexScanFunction::PrefilterEnabled(context);
 
 		table_info.BindIndexes(context, HNSWIndex::TYPE_NAME);
 		for (auto index_entry : table_info.GetIndexes().IndexEntries()) {
@@ -146,7 +147,7 @@ public:
 			}
 
 			bind_data = make_uniq<HNSWIndexScanBindData>(duck_table, index_entry, guard->GetIndexName(), top_n.limit,
-			                                             std::move(query_vector));
+			                                             std::move(query_vector), prefilter);
 			break;
 		}
 
@@ -155,37 +156,29 @@ public:
 			return false;
 		}
 
-		// If there are no table filters pushed down into the get, we can just replace the get with the index scan
 		const auto cardinality = get.function.cardinality(context, bind_data.get());
 		get.function = HNSWIndexScanFunction::GetFunction();
 		get.has_estimated_cardinality = cardinality->has_estimated_cardinality;
 		get.estimated_cardinality = cardinality->estimated_cardinality;
 		get.bind_data = std::move(bind_data);
-		if (!get.table_filters.HasFilters()) {
+		if (!prefilter && get.table_filters.HasFilters()) {
+			// Restore the post-filter plan when pre-filtering is explicitly disabled.
+			get.projection_ids.clear();
+			get.types.clear();
 
-			// Remove the TopN operator
-			plan = std::move(top_n.children[0]);
-			return true;
+			auto new_filter = make_uniq<LogicalFilter>();
+			for (const auto &entry : get.table_filters) {
+				auto filter_idx = entry.GetIndex();
+				auto &column_id = get.GetColumnIndex(filter_idx);
+				auto &type = get.returned_types[column_id.GetPrimaryIndex()];
+				auto &filter = entry.Filter();
+				auto column = make_uniq<BoundColumnRefExpression>(type, ColumnBinding(get.table_index, filter_idx));
+				new_filter->expressions.push_back(filter.ToExpression(*column));
+			}
+			new_filter->children.push_back(std::move(get_ptr));
+			new_filter->ResolveOperatorTypes();
+			get_ptr = std::move(new_filter);
 		}
-
-		// Otherwise, things get more complicated. We need to pullup the filters from the table scan as our index scan
-		// does not support regular filter pushdown.
-		get.projection_ids.clear();
-		get.types.clear();
-
-		auto new_filter = make_uniq<LogicalFilter>();
-		auto &column_ids = get.GetColumnIds();
-		for (const auto &entry : get.table_filters) {
-			auto filter_idx = entry.GetIndex();
-			auto &column_id = get.GetColumnIndex(filter_idx);
-			auto &type = get.returned_types[column_id.GetPrimaryIndex()];
-			auto &filter = entry.Filter();
-			auto column = make_uniq<BoundColumnRefExpression>(type, ColumnBinding(get.table_index, filter_idx));
-			new_filter->expressions.push_back(filter.ToExpression(*column));
-		}
-		new_filter->children.push_back(std::move(get_ptr));
-		new_filter->ResolveOperatorTypes();
-		get_ptr = std::move(new_filter);
 
 		// Remove the TopN operator
 		plan = std::move(top_n.children[0]);

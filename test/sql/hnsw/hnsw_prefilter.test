@@ -1,0 +1,162 @@
+# name: test/sql/hnsw/hnsw_prefilter.test
+# description: HNSW scans apply table filters before selecting the nearest neighbors.
+# group: [hnsw]
+
+require vss
+
+require noforcestorage
+
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+query I
+SELECT current_setting('hnsw_prefilter');
+----
+true
+
+statement ok
+CREATE TABLE items (id INTEGER, category VARCHAR, vec FLOAT[3]);
+
+statement ok
+INSERT INTO items SELECT i, CASE WHEN i >= 6 THEN 'keep' ELSE 'skip' END, [i, 0, 0]::FLOAT[3] FROM range(1, 11) t(i);
+
+statement ok
+INSERT INTO items VALUES (-1, NULL, [-1, 0, 0]::FLOAT[3]);
+
+statement ok
+CREATE INDEX items_vec_idx ON items USING HNSW (vec);
+
+query II
+EXPLAIN SELECT id FROM items WHERE category = 'keep' ORDER BY array_distance(vec, [1, 0, 0]::FLOAT[3]) LIMIT 3;
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_SCAN.*
+
+# The unfiltered nearest neighbors all have category 'skip'. A post-filtered
+# top-k would return no rows, while pre-filtering returns three qualifying rows.
+query IT
+SELECT id, category FROM items WHERE category = 'keep' ORDER BY array_distance(vec, [1, 0, 0]::FLOAT[3]) LIMIT 3;
+----
+6	keep
+7	keep
+8	keep
+
+# Multiple pushed-down filters are combined in the bitmap scan.
+query IT
+SELECT id, category FROM items WHERE category = 'keep' AND id >= 8 ORDER BY array_distance(vec, [1, 0, 0]::FLOAT[3]) LIMIT 3;
+----
+8	keep
+9	keep
+10	keep
+
+# Filters with fewer matches than the requested limit return all matches.
+query I
+SELECT id FROM items WHERE id > 8 ORDER BY array_distance(vec, [1, 0, 0]::FLOAT[3]) LIMIT 5;
+----
+9
+10
+
+# Generic single-column expressions are evaluated by DuckDB while building the
+# bitmap, and the index can only return row IDs from that exact result set.
+query II
+EXPLAIN SELECT id FROM items WHERE id % 3 = 0 ORDER BY array_distance(vec, [1, 0, 0]::FLOAT[3]) LIMIT 3;
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_SCAN.*
+
+query I
+SELECT id FROM items WHERE id % 3 = 0 ORDER BY array_distance(vec, [1, 0, 0]::FLOAT[3]) LIMIT 3;
+----
+3
+6
+9
+
+# NULL predicates use the same filter bitmap and never admit non-NULL rows.
+query IT
+SELECT id, category FROM items WHERE category IS NULL ORDER BY array_distance(vec, [1, 0, 0]::FLOAT[3]) LIMIT 3;
+----
+-1	NULL
+
+query I
+SELECT count(*) FROM (SELECT id FROM items WHERE category = 'missing' ORDER BY array_distance(vec, [1, 0, 0]::FLOAT[3]) LIMIT 3);
+----
+0
+
+# Predicates that cannot be represented as table filters stay in DuckDB's
+# regular filter operator; the HNSW rewrite must not bypass them.
+query IT
+SELECT id, category FROM items WHERE category = 'keep' AND id % 2 = CAST(vec[1] AS INTEGER) % 3 ORDER BY array_distance(vec, [1, 0, 0]::FLOAT[3]) LIMIT 3;
+----
+6	keep
+7	keep
+
+# The min_by top-k rewrite uses the same pre-filtered index scan.
+query I
+SELECT unnest(min_by(id, array_distance(vec, [1, 0, 0]::FLOAT[3]), 3)) FROM items WHERE category = 'keep';
+----
+6
+7
+8
+
+# Rows inserted after index creation participate in pre-filtered searches.
+statement ok
+INSERT INTO items VALUES (0, 'keep', [0, 0, 0]::FLOAT[3]);
+
+query I
+SELECT id FROM items WHERE category = 'keep' ORDER BY array_distance(vec, [1, 0, 0]::FLOAT[3]) LIMIT 3;
+----
+0
+6
+7
+
+# Disabling pre-filtering selects the post-filter behavior, where fewer than
+# LIMIT rows can survive.
+statement ok
+SET hnsw_prefilter = false;
+
+query I
+SELECT id FROM items WHERE category = 'keep' ORDER BY array_distance(vec, [1, 0, 0]::FLOAT[3]) LIMIT 3;
+----
+0
+
+statement ok
+SET hnsw_prefilter = true;
+
+# Deleted rows are absent from the transaction-visible pre-filter set.
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+DELETE FROM items WHERE id = 6;
+
+query I
+SELECT id FROM items WHERE category = 'keep' ORDER BY array_distance(vec, [1, 0, 0]::FLOAT[3]) LIMIT 3;
+----
+0
+7
+8
+
+statement ok
+COMMIT;
+
+# Filter cardinality is independent of STANDARD_VECTOR_SIZE. The filtered scan
+# accumulates qualifying row IDs across every input chunk before HNSW search.
+statement ok
+CREATE TABLE many_items (id INTEGER, eligible BOOLEAN, vec FLOAT[3]);
+
+statement ok
+INSERT INTO many_items SELECT i, i >= 2500, [i, 0, 0]::FLOAT[3] FROM range(5000) t(i);
+
+statement ok
+CREATE INDEX many_items_vec_idx ON many_items USING HNSW (vec);
+
+query II
+EXPLAIN SELECT id FROM many_items WHERE eligible ORDER BY array_distance(vec, [0, 0, 0]::FLOAT[3]) LIMIT 10;
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_SCAN.*
+
+statement ok
+CREATE TEMP TABLE many_items_result AS SELECT id, eligible FROM many_items WHERE eligible ORDER BY array_distance(vec, [0, 0, 0]::FLOAT[3]) LIMIT 10;
+
+query II
+SELECT count(*), count(*) FILTER (WHERE NOT eligible) FROM many_items_result;
+----
+10	0

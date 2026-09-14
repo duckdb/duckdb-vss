@@ -4,6 +4,7 @@
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/typedefs.hpp"
+#include "duckdb/common/unordered_set.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/common/vector.hpp"
@@ -27,6 +28,36 @@ struct HNSWIndexStats {
 	idx_t capacity;
 	idx_t approx_size;
 	vector<unum::usearch::index_dense_gt<row_t>::stats_t> level_stats;
+};
+
+struct HNSWFilterBitmap {
+	void Set(row_t row_id) {
+		D_ASSERT(row_id >= 0);
+		if (row_id >= MAX_ROW_ID) {
+			local_row_ids.insert(row_id);
+			return;
+		}
+		auto bitmap_index = static_cast<idx_t>(row_id);
+		if (bitmap_index >= base_row_ids.size()) {
+			base_row_ids.resize(bitmap_index + 1);
+		}
+		base_row_ids[bitmap_index] = true;
+	}
+
+	bool Contains(row_t row_id) const {
+		if (row_id < 0) {
+			return false;
+		}
+		if (row_id >= MAX_ROW_ID) {
+			return local_row_ids.find(row_id) != local_row_ids.end();
+		}
+		auto bitmap_index = static_cast<idx_t>(row_id);
+		return bitmap_index < base_row_ids.size() && base_row_ids[bitmap_index];
+	}
+
+private:
+	vector<bool> base_row_ids;
+	unordered_set<row_t> local_row_ids;
 };
 
 class HNSWIndex : public BoundIndex {
@@ -57,7 +88,8 @@ public:
 	const Vector &GetMultiScanResult(IndexScanState &state) const;
 	void ResetMultiScan(IndexScanState &state) const;
 
-	unique_ptr<IndexScanState> InitializeScan(float *query_vector, idx_t limit, ClientContext &context) const;
+	unique_ptr<IndexScanState> InitializeScan(float *query_vector, idx_t limit, ClientContext &context,
+	                                          optional_ptr<const HNSWFilterBitmap> filter = nullptr) const;
 	static idx_t Scan(IndexScanState &state, Vector &result, idx_t result_offset = 0);
 	idx_t GetVectorSize() const;
 	string GetMetric() const;

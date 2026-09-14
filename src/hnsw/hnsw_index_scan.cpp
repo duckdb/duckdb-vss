@@ -5,6 +5,7 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/index.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
@@ -40,6 +41,54 @@ struct HNSWIndexScanGlobalState : public GlobalTableFunctionState {
 	vector<idx_t> projection_ids;
 };
 
+static void BuildFilterBitmap(ClientContext &context, TableFunctionInitInput &input,
+                              const HNSWIndexScanBindData &bind_data, HNSWFilterBitmap &filter) {
+	auto &transaction = DuckTransaction::Get(context, bind_data.table.catalog);
+	auto &storage = bind_data.table.GetStorage();
+	auto &duck_table = bind_data.table.Cast<DuckTableEntry>();
+	const auto &columns = duck_table.GetColumns();
+
+	vector<StorageIndex> scan_column_ids;
+	vector<LogicalType> scan_types;
+	scan_column_ids.reserve(input.column_indexes.size() + 1);
+	scan_types.reserve(input.column_indexes.size() + 1);
+	for (const auto &column_index : input.column_indexes) {
+		scan_column_ids.push_back(bind_data.table.GetStorageIndex(column_index));
+		if (column_index.IsRowIdColumn()) {
+			scan_types.emplace_back(LogicalType::ROW_TYPE);
+		} else if (column_index.HasType()) {
+			scan_types.push_back(column_index.GetScanType());
+		} else {
+			scan_types.push_back(columns.GetColumn(column_index.ToLogical()).Type());
+		}
+	}
+
+	// Appending the row ID preserves the table-filter indexes, which refer to the
+	// columns selected by the physical scan.
+	scan_column_ids.emplace_back(COLUMN_IDENTIFIER_ROW_ID);
+	scan_types.emplace_back(LogicalType::ROW_TYPE);
+
+	TableScanState scan_state;
+	storage.InitializeScan(context, transaction, scan_state, scan_column_ids, input.filters);
+
+	DataChunk scan_chunk;
+	scan_chunk.Initialize(context, scan_types);
+	while (true) {
+		scan_chunk.Reset();
+		storage.Scan(transaction, scan_chunk, scan_state);
+		if (scan_chunk.size() == 0) {
+			break;
+		}
+
+		UnifiedVectorFormat row_ids;
+		scan_chunk.data.back().ToUnifiedFormat(row_ids);
+		auto row_id_data = UnifiedVectorFormat::GetData<row_t>(row_ids);
+		for (idx_t row_idx = 0; row_idx < scan_chunk.size(); row_idx++) {
+			filter.Set(row_id_data[row_ids.sel->get_index(row_idx)]);
+		}
+	}
+}
+
 static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContext &context,
                                                                     TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<HNSWIndexScanBindData>();
@@ -63,10 +112,21 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 	result->local_storage_state.Initialize(result->column_ids, context, input.filters);
 	local_storage.InitializeScan(bind_data.table.GetStorage(), result->local_storage_state.local_state, input.filters);
 
+	// Evaluate pushed-down filters first, then use the qualifying row IDs as the
+	// predicate for the HNSW graph search. This returns up to `limit` matching
+	// rows instead of filtering an unqualified top-k afterward.
+	HNSWFilterBitmap filter;
+	optional_ptr<const HNSWFilterBitmap> filter_ptr;
+	if (bind_data.prefilter && input.filters &&
+	    (input.filters->HasFilters() || input.filters->HasMultiColumnFilters())) {
+		BuildFilterBitmap(context, input, bind_data, filter);
+		filter_ptr = &filter;
+	}
+
 	// Initialize the scan state for the index
 	{
 		auto index = bind_data.index_entry->GetReadHandle<HNSWIndex>();
-		result->index_state = index->InitializeScan(bind_data.query.get(), bind_data.limit, context);
+		result->index_state = index->InitializeScan(bind_data.query.get(), bind_data.limit, context, filter_ptr);
 	}
 
 	if (!input.CanRemoveFilterColumns()) {
@@ -169,6 +229,14 @@ static InsertionOrderPreservingMap<string> HNSWIndexScanToString(TableFunctionTo
 //-------------------------------------------------------------------------
 // Get Function
 //-------------------------------------------------------------------------
+bool HNSWIndexScanFunction::PrefilterEnabled(ClientContext &context) {
+	Value prefilter;
+	if (!context.TryGetCurrentSetting("hnsw_prefilter", prefilter)) {
+		return true;
+	}
+	return prefilter.GetValue<bool>();
+}
+
 TableFunction HNSWIndexScanFunction::GetFunction() {
 	TableFunction func("hnsw_index_scan", {}, HNSWIndexScanExecute);
 	func.init_local = nullptr;
@@ -180,7 +248,7 @@ TableFunction HNSWIndexScanFunction::GetFunction() {
 	func.to_string = HNSWIndexScanToString;
 	func.table_scan_progress = nullptr;
 	func.projection_pushdown = true;
-	func.filter_pushdown = false;
+	func.filter_pushdown = true;
 	func.get_bind_info = HNSWIndexScanBindInfo;
 
 	return func;

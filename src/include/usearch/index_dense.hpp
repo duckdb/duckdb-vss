@@ -901,6 +901,14 @@ class index_dense_gt {
         return search_(vector, wanted, dummy_predicate_t {}, search_config, casts_.from.f32);
     }
 
+    template <typename predicate_at> search_result_t filtered_ef_search(f32_t const* vector, std::size_t wanted, std::size_t ef_search, predicate_at&& predicate, std::size_t thread = any_thread(), bool exact = false) const {
+        index_search_config_t search_config;
+        search_config.thread = thread;
+        search_config.expansion = ef_search;
+        search_config.exact = exact;
+        return search_(vector, wanted, std::forward<predicate_at>(predicate), search_config, casts_.from.f32);
+    }
+
     template <typename predicate_at> search_result_t filtered_search(f64_t const* vector, std::size_t wanted, predicate_at&& predicate, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, std::forward<predicate_at>(predicate), thread, exact, casts_.from.f64); }
     template <typename predicate_at> search_result_t filtered_search(f32_t const* vector, std::size_t wanted, predicate_at&& predicate, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, std::forward<predicate_at>(predicate), thread, exact, casts_.from.f32); }
     template <typename predicate_at> search_result_t filtered_search(bf16_t const* vector, std::size_t wanted, predicate_at&& predicate, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, std::forward<predicate_at>(predicate), thread, exact, casts_.from.bf16); }

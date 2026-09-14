@@ -314,7 +314,8 @@ struct HNSWIndexScanState : public IndexScanState {
 	unique_array<row_t> row_ids = nullptr;
 };
 
-unique_ptr<IndexScanState> HNSWIndex::InitializeScan(float *query_vector, idx_t limit, ClientContext &context) const {
+unique_ptr<IndexScanState> HNSWIndex::InitializeScan(float *query_vector, idx_t limit, ClientContext &context,
+                                                     optional_ptr<const HNSWFilterBitmap> filter) const {
 	auto state = make_uniq<HNSWIndexScanState>();
 
 	// Try to get the ef_search parameter from the database or use the default value
@@ -332,13 +333,36 @@ unique_ptr<IndexScanState> HNSWIndex::InitializeScan(float *query_vector, idx_t 
 
 	// Acquire a shared lock to search the index
 	auto lock = rwlock.GetSharedLock();
-	auto search_result = index.ef_search(query_vector, limit, ef_search);
+	auto search_result = [&]() {
+		if (!filter) {
+			return index.ef_search(query_vector, limit, ef_search);
+		}
+		auto predicate = [&](row_t key) {
+			return filter->Contains(key);
+		};
+		return index.filtered_ef_search(query_vector, limit, ef_search, predicate);
+	}();
 
 	state->current_row = 0;
-	state->total_rows = search_result.size();
 	state->row_ids = make_uniq_array<row_t>(search_result.size());
-
 	search_result.dump_to(state->row_ids.get());
+
+	// The filtered search is expected to return only keys accepted by the
+	// predicate. Check the bitmap again before exposing row IDs to DuckDB so a
+	// regression in the search library can underfill, but can never leak a row
+	// that does not satisfy the pushed-down filters.
+	if (filter) {
+		idx_t eligible_count = 0;
+		for (idx_t result_idx = 0; result_idx < search_result.size(); result_idx++) {
+			auto row_id = state->row_ids[result_idx];
+			if (filter->Contains(row_id)) {
+				state->row_ids[eligible_count++] = row_id;
+			}
+		}
+		state->total_rows = eligible_count;
+	} else {
+		state->total_rows = search_result.size();
+	}
 	return std::move(state);
 }
 
@@ -724,6 +748,9 @@ void HNSWModule::RegisterIndex(DatabaseInstance &db) {
 	db.config.AddExtensionOption("hnsw_ef_search",
 	                             "experimental: override the ef_search parameter when scanning HNSW indexes",
 	                             LogicalType::BIGINT);
+	db.config.AddExtensionOption("hnsw_prefilter",
+	                             "experimental: apply static table filters before searching HNSW indexes",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
 
 	// Register the index type
 	db.config.GetIndexTypes().RegisterIndexType(index_type);
