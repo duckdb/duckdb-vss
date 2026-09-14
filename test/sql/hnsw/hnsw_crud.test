@@ -171,3 +171,21 @@ query I
 SELECT id FROM t4 ORDER BY array_distance(vec, [10,10,10]::FLOAT[3]) LIMIT 1;
 ----
 1
+
+# Read-only databases reject deletes before the HNSW index can be mutated.
+load {TEST_DIR}/temp_index_hnsw_crud_storage.db readonly
+
+statement error
+DELETE FROM t1;
+----
+read-only mode
+
+query I
+SELECT count FROM pragma_hnsw_index_info() WHERE index_name = 'my_idx';
+----
+1
+
+query I
+SELECT * FROM t1 ORDER BY array_distance(vec, [1,2,3]::FLOAT[3]) LIMIT 1;
+----
+[5.0, 5.0, 5.0]
