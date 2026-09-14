@@ -27,7 +27,7 @@ jobs:
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
       extension_name: vss
-      duckdb_version: main
+      duckdb_version: fc4002c6e36f1e2d17d7c5b1a604777d69238d2b
       ci_tools_version: main
       # Temporary override; remove when extension-ci-tools updates its default.
       vcpkg_commit: cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3 # Release 2026.06.24
@@ -42,7 +42,7 @@ jobs:
     secrets: inherit
     with:
       extension_name: vss
-      duckdb_version: main
+      duckdb_version: fc4002c6e36f1e2d17d7c5b1a604777d69238d2b
       ci_tools_version: main
       deploy_latest: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
 

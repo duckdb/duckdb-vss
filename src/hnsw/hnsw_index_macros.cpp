@@ -1,4 +1,5 @@
 #include "duckdb/function/table_macro_function.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parsed_data/create_macro_info.hpp"
 #include "duckdb/parser/parser.hpp"
@@ -91,7 +92,7 @@ static void RegisterTableMacro(ExtensionLoader &loader, const string &name, cons
 
 	for (auto &param : named_params) {
 		func->parameters.push_back(make_uniq<ColumnRefExpression>(param.first));
-		func->default_parameters[Identifier(param.first)] = make_uniq<ConstantExpression>(Value(param.second));
+		func->default_parameters[Identifier(param.first)] = ConstantExpression::FromValue(Value(param.second));
 	}
 
 	CreateMacroInfo info(CatalogType::TABLE_MACRO_ENTRY);
