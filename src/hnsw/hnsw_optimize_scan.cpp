@@ -175,7 +175,7 @@ public:
 
 		auto &get = (*get_ptr)->Cast<LogicalGet>();
 		// Check if the get is a table scan
-		if (get.function.name != "seq_scan") {
+		if (get.function.GetName() != "seq_scan") {
 			return false;
 		}
 
@@ -261,7 +261,7 @@ public:
 		}
 
 		const auto cardinality = get.function.cardinality(context, bind_data.get());
-		get.function = HNSWIndexScanFunction::GetFunction();
+		get.function = BoundTableFunction(HNSWIndexScanFunction::GetFunction());
 		get.has_estimated_cardinality = cardinality->has_estimated_cardinality;
 		get.estimated_cardinality = cardinality->estimated_cardinality;
 		get.bind_data = std::move(bind_data);
@@ -308,7 +308,7 @@ public:
 				auto &child = plan->children[0];
 
 				if (child->children[0]->type == LogicalOperatorType::LOGICAL_GET &&
-				    child->children[0]->Cast<LogicalGet>().function.name == "hnsw_index_scan") {
+				    child->children[0]->Cast<LogicalGet>().function.GetName() == "hnsw_index_scan") {
 					auto &parent_projection = plan->Cast<LogicalProjection>();
 					auto &child_projection = child->Cast<LogicalProjection>();
 

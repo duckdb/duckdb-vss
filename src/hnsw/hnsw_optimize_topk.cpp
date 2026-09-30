@@ -109,7 +109,7 @@ public:
 		}
 
 		auto &get = (*get_ptr)->Cast<LogicalGet>();
-		if (get.function.name != "seq_scan") {
+		if (get.function.GetName() != "seq_scan") {
 			return false;
 		}
 
@@ -194,7 +194,7 @@ public:
 		}
 
 		// Replace the aggregate with a index scan + projection
-		get.function = HNSWIndexScanFunction::GetFunction();
+		get.function = BoundTableFunction(HNSWIndexScanFunction::GetFunction());
 		const auto cardinality = get.function.cardinality(context, bind_data.get());
 		get.has_estimated_cardinality = cardinality->has_estimated_cardinality;
 		get.estimated_cardinality = cardinality->estimated_cardinality;

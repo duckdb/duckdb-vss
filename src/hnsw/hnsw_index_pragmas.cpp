@@ -222,7 +222,8 @@ static void CompactIndexPragma(ClientContext &context, const FunctionParameters 
 //-------------------------------------------------------------------------
 void HNSWModule::RegisterIndexPragmas(ExtensionLoader &loader) {
 	loader.RegisterFunction(
-	    PragmaFunction::PragmaCall("hnsw_compact_index", CompactIndexPragma, {LogicalType::VARCHAR}));
+	    PragmaFunction::PragmaCall("hnsw_compact_index", CompactIndexPragma,
+	                               FunctionSignature().AddPositionalOnly("index_name", LogicalType::VARCHAR)));
 
 	// TODO: This is kind of ugly and maybe should just take a parameter instead...
 	TableFunction info_function("pragma_hnsw_index_info", {}, HNSWIndexInfoExecute, HNSWindexInfoBind,
