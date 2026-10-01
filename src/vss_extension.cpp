@@ -1,6 +1,7 @@
 #include "vss_extension.hpp"
-#include "duckdb/main/extension/extension_loader.hpp"
 
+#include "aggregate/array_avg.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 #include "hnsw/hnsw.hpp"
 
 namespace duckdb {
@@ -8,6 +9,9 @@ namespace duckdb {
 static void LoadInternal(ExtensionLoader &loader) {
 	// Register the HNSW index module
 	HNSWModule::Register(loader);
+
+	// Register vector aggregate functions
+	ArrayAvgFunction::Register(loader);
 }
 
 void VssExtension::Load(ExtensionLoader &loader) {
