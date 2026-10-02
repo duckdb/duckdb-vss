@@ -453,7 +453,7 @@ bool HNSWIndexJoinOptimizer::TryOptimize(Binder &binder, ClientContext &context,
 
 	auto &delim_get = (*delim_get_ptr)->Cast<LogicalDelimGet>();
 	auto &inner_get = (*inner_get_ptr)->Cast<LogicalGet>();
-	if (inner_get.function.name != "seq_scan") {
+	if (inner_get.function.GetName() != "seq_scan") {
 		return false;
 	}
 
@@ -847,7 +847,7 @@ bool HNSWIndexJoinOptimizer::TryOptimizeArgMin(Binder &binder, ClientContext &co
 	}
 	auto &delim_get = (*delim_get_ptr)->Cast<LogicalDelimGet>();
 	auto &inner_get = (*inner_get_ptr)->Cast<LogicalGet>();
-	if (inner_get.function.name != "seq_scan") {
+	if (inner_get.function.GetName() != "seq_scan") {
 		return false;
 	}
 
@@ -1205,11 +1205,11 @@ bool HNSWIndexJoinOptimizer::TryOptimizeArgMinCte(Binder &binder, ClientContext 
 	auto &cp_rhs = cross_product.children[1];
 	unique_ptr<LogicalOperator> *corr_source_ptr = nullptr;
 	unique_ptr<LogicalOperator> *inner_get_ptr = nullptr;
-	if (cp_lhs->type == LogicalOperatorType::LOGICAL_GET && cp_lhs->Cast<LogicalGet>().function.name == "seq_scan") {
+	if (cp_lhs->type == LogicalOperatorType::LOGICAL_GET && cp_lhs->Cast<LogicalGet>().function.GetName() == "seq_scan") {
 		inner_get_ptr = &cp_lhs;
 		corr_source_ptr = &cp_rhs;
 	} else if (cp_rhs->type == LogicalOperatorType::LOGICAL_GET &&
-	           cp_rhs->Cast<LogicalGet>().function.name == "seq_scan") {
+	           cp_rhs->Cast<LogicalGet>().function.GetName() == "seq_scan") {
 		inner_get_ptr = &cp_rhs;
 		corr_source_ptr = &cp_lhs;
 	} else {
