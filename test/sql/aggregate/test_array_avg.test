@@ -1,0 +1,88 @@
+# name: test/sql/aggregate/test_array_avg.test
+# description: Test array_avg() and vector_avg() vector centroid aggregation for ARRAY types
+# group: [aggregate]
+
+require vss
+
+# 1. Simple float array aggregation
+statement ok
+CREATE TABLE vectors (id INT, v FLOAT[3]);
+
+statement ok
+INSERT INTO vectors VALUES
+    (1, [1.0, 2.0, 3.0]::FLOAT[3]),
+    (2, [3.0, 4.0, 5.0]::FLOAT[3]),
+    (3, [5.0, 6.0, 7.0]::FLOAT[3]);
+
+query I
+SELECT array_avg(v) FROM vectors;
+----
+[3.0, 4.0, 5.0]
+
+query I
+SELECT vector_avg(v) FROM vectors;
+----
+[3.0, 4.0, 5.0]
+
+# 2. GROUP BY vector centroid aggregation
+statement ok
+CREATE TABLE grouped_vectors (cat VARCHAR, v FLOAT[2]);
+
+statement ok
+INSERT INTO grouped_vectors VALUES
+    ('A', [10.0, 20.0]::FLOAT[2]),
+    ('A', [20.0, 40.0]::FLOAT[2]),
+    ('B', [100.0, 200.0]::FLOAT[2]),
+    ('B', [300.0, 400.0]::FLOAT[2]);
+
+query II
+SELECT cat, array_avg(v) FROM grouped_vectors GROUP BY cat ORDER BY cat;
+----
+A	[15.0, 30.0]
+B	[200.0, 300.0]
+
+# 3. DOUBLE array support
+query I
+SELECT array_avg(d) FROM (VALUES 
+    ([1.5, 2.5, 3.5]::DOUBLE[3]), 
+    ([4.5, 5.5, 6.5]::DOUBLE[3])
+) t(d);
+----
+[3.0, 4.0, 5.0]
+
+# 4. NULL handling
+statement ok
+CREATE TABLE null_vectors (v FLOAT[2]);
+
+statement ok
+INSERT INTO null_vectors VALUES
+    ([2.0, 4.0]::FLOAT[2]),
+    (NULL),
+    ([4.0, 8.0]::FLOAT[2]);
+
+# Ignores NULL row, averages the 2 valid rows
+query I
+SELECT array_avg(v) FROM null_vectors;
+----
+[3.0, 6.0]
+
+# All NULL table returns NULL
+statement ok
+CREATE TABLE all_nulls (v FLOAT[2]);
+
+statement ok
+INSERT INTO all_nulls VALUES (NULL), (NULL);
+
+query I
+SELECT array_avg(v) FROM all_nulls;
+----
+NULL
+
+# Empty table returns NULL
+statement ok
+CREATE TABLE empty_table (v FLOAT[2]);
+
+query I
+SELECT array_avg(v) FROM empty_table;
+----
+NULL
