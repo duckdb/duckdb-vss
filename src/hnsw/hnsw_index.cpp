@@ -407,7 +407,7 @@ void HNSWIndex::ResetMultiScan(IndexScanState &state) {
 	scan_state.row_ids.clear();
 }
 
-void HNSWIndex::CommitDrop(IndexLock &index_lock) {
+void HNSWIndex::ResetStorage(IndexLock &index_lock) {
 	// Acquire an exclusive lock to drop the index
 	auto lock = rwlock.GetExclusiveLock();
 
