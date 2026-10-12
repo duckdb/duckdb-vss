@@ -19,9 +19,9 @@
 
 namespace duckdb {
 
-BindInfo HNSWIndexScanBindInfo(const optional_ptr<FunctionData> bind_data_p) {
+optional_ptr<TableCatalogEntry> HNSWIndexScanGetTableEntry(optional_ptr<const FunctionData> bind_data_p) {
 	auto &bind_data = bind_data_p->Cast<HNSWIndexScanBindData>();
-	return BindInfo(bind_data.table);
+	return &bind_data.table;
 }
 
 //-------------------------------------------------------------------------
@@ -274,7 +274,7 @@ TableFunction HNSWIndexScanFunction::GetFunction() {
 	func.table_scan_progress = nullptr;
 	func.projection_pushdown = true;
 	func.filter_pushdown = true;
-	func.get_bind_info = HNSWIndexScanBindInfo;
+	func.get_table_entry = HNSWIndexScanGetTableEntry;
 
 	return func;
 }
