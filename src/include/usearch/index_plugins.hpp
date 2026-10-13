@@ -3,15 +3,16 @@
 #include <float.h>  // `_Float16`
 #include <stdlib.h> // `aligned_alloc`
 
+#include <atomic>  // `std::atomic`
+#include <chrono>  // `std::chrono`
 #include <cstring> // `std::strncmp`
-#include <numeric> // `std::iota`
 #include <thread>  // `std::thread`
-#include <vector>  // `std::vector`
-
-#include <atomic> // `std::atomic`
-#include <thread> // `std::thread`
 
 #include <usearch/index.hpp> // `expected_gt` and macros
+
+#if defined(USEARCH_DEFINED_LINUX)
+#include <sys/auxv.h> // `getauxval()`
+#endif
 
 #if !defined(USEARCH_USE_OPENMP)
 #define USEARCH_USE_OPENMP 0
@@ -21,42 +22,44 @@
 #include <omp.h> // `omp_get_num_threads()`
 #endif
 
-#if defined(USEARCH_DEFINED_LINUX)
-#include <sys/auxv.h> // `getauxval()`
+#if !defined(USEARCH_USE_NUMKONG)
+#define USEARCH_USE_NUMKONG 0
 #endif
 
-#if !defined(USEARCH_USE_FP16LIB)
-#if defined(__AVX512F__)
-#define USEARCH_USE_FP16LIB 0
-#elif defined(USEARCH_DEFINED_ARM)
-#include <arm_fp16.h> // `__fp16`
-#define USEARCH_USE_FP16LIB 0
-#else
-#define USEARCH_USE_FP16LIB 1
-#endif
-#endif
-
-#if USEARCH_USE_FP16LIB
-#include <fp16/fp16.h>
-#endif
-
-#if !defined(USEARCH_USE_SIMSIMD)
-#define USEARCH_USE_SIMSIMD 0
-#endif
-
-#if USEARCH_USE_SIMSIMD
+#if USEARCH_USE_NUMKONG
 // Propagate the `f16` settings
-#if !defined(SIMSIMD_NATIVE_F16)
-#define SIMSIMD_NATIVE_F16 !USEARCH_USE_FP16LIB
+#if defined(USEARCH_CAN_COMPILE_FP16) || defined(USEARCH_CAN_COMPILE_FLOAT16)
+#if USEARCH_CAN_COMPILE_FP16 || USEARCH_CAN_COMPILE_FLOAT16
+#define NK_NATIVE_F16 1
+#else
+#define NK_NATIVE_F16 0
 #endif
-#define SIMSIMD_DYNAMIC_DISPATCH 0
+#endif
+// Propagate the `bf16` settings
+#if defined(USEARCH_CAN_COMPILE_BF16) || defined(USEARCH_CAN_COMPILE_BFLOAT16)
+#if USEARCH_CAN_COMPILE_BF16 || USEARCH_CAN_COMPILE_BFLOAT16
+#define NK_NATIVE_BF16 1
+#else
+#define NK_NATIVE_BF16 0
+#endif
+#endif
 // No problem, if some of the functions are unused or undefined
 #pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wall"
+#pragma GCC diagnostic ignored "-Wunused"
 #pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#pragma GCC diagnostic ignored "-Wunused-variable"
+#pragma GCC diagnostic ignored "-Wunused-but-set-variable"
+#if defined(_MSC_VER)
 #pragma warning(push)
-#pragma warning(disable : 4101)
-#include <simsimd/simsimd.h>
+#pragma warning(disable : 4101) // "Unused variables"
+#pragma warning(disable : 4068) // "Unknown pragmas", when MSVC tries to read GCC pragmas
+#endif                          // _MSC_VER
+#include <numkong/numkong.h>
+#ifdef _MSC_VER
 #pragma warning(pop)
+#endif // _MSC_VER
 #pragma GCC diagnostic pop
 #endif
 
@@ -70,22 +73,19 @@ struct uuid_t {
     std::uint8_t octets[16];
 };
 
+class bf16_bits_t;
 class f16_bits_t;
-class i8_converted_t;
+class e5m2_bits_t;
+class e4m3_bits_t;
+class e3m2_bits_t;
+class e2m3_bits_t;
 
-#if !USEARCH_USE_FP16LIB
-#if USEARCH_USE_SIMSIMD
-using f16_native_t = simsimd_f16_t;
-#elif defined(USEARCH_DEFINED_ARM)
-using f16_native_t = __fp16;
-#else
-using f16_native_t = _Float16;
-#endif
-using f16_t = f16_native_t;
-#else
-using f16_native_t = void;
+using bf16_t = bf16_bits_t;
 using f16_t = f16_bits_t;
-#endif
+using e5m2_t = e5m2_bits_t;
+using e4m3_t = e4m3_bits_t;
+using e3m2_t = e3m2_bits_t;
+using e2m3_t = e2m3_bits_t;
 
 using f64_t = double;
 using f32_t = float;
@@ -100,6 +100,17 @@ using i32_t = std::int32_t;
 using i16_t = std::int16_t;
 using i8_t = std::int8_t;
 
+/**
+ *  @brief  Reinterpret-cast between float and uint32 without UB on most compilers.
+ */
+union fu32_t {
+    float f;
+    std::uint32_t u;
+};
+
+/**
+ *  @brief  Enumerates the most commonly used distance metrics, mostly for dense vector representations.
+ */
 enum class metric_kind_t : std::uint8_t {
     unknown_k = 0,
     // Classics:
@@ -112,24 +123,35 @@ enum class metric_kind_t : std::uint8_t {
     haversine_k = 'h',
     divergence_k = 'd',
 
-    // Sets:
-    jaccard_k = 'j',
+    // Dense Sets:
     hamming_k = 'b',
     tanimoto_k = 't',
     sorensen_k = 's',
+
+    // Sparse Sets:
+    jaccard_k = 'j',
 };
 
+/**
+ *  @brief  Enumerates the most commonly used scalar types, mostly for dense vector representations.
+ *          Doesn't include logical types, like complex numbers or quaternions.
+ */
 enum class scalar_kind_t : std::uint8_t {
     unknown_k = 0,
     // Custom:
     b1x8_k = 1,
     u40_k = 2,
     uuid_k = 3,
+    bf16_k = 4,
+    // Mini-floats:
+    e5m2_k = 5, ///< FP8 IEEE 754: 1 sign + 5 exponent + 2 mantissa, range +/-57344
+    e4m3_k = 6, ///< FP8 OCP: 1 sign + 4 exponent + 3 mantissa, range +/-448
+    e3m2_k = 8, ///< FP6: 1 sign + 3 exponent + 2 mantissa, range +/-28
+    e2m3_k = 7, ///< FP6: 1 sign + 2 exponent + 3 mantissa, range +/-7.5
     // Common:
     f64_k = 10,
     f32_k = 11,
     f16_k = 12,
-    f8_k = 13,
     // Common Integral:
     u64_k = 14,
     u32_k = 15,
@@ -141,12 +163,9 @@ enum class scalar_kind_t : std::uint8_t {
     i8_k = 23,
 };
 
-enum class prefetching_kind_t {
-    none_k,
-    cpu_k,
-    io_uring_k,
-};
-
+/**
+ *  @brief  Maps a scalar type to its corresponding scalar_kind_t enumeration value.
+ */
 template <typename scalar_at> scalar_kind_t scalar_kind() noexcept {
     if (std::is_same<scalar_at, b1x8_t>())
         return scalar_kind_t::b1x8_k;
@@ -160,6 +179,16 @@ template <typename scalar_at> scalar_kind_t scalar_kind() noexcept {
         return scalar_kind_t::f32_k;
     if (std::is_same<scalar_at, f16_t>())
         return scalar_kind_t::f16_k;
+    if (std::is_same<scalar_at, bf16_t>())
+        return scalar_kind_t::bf16_k;
+    if (std::is_same<scalar_at, e5m2_t>())
+        return scalar_kind_t::e5m2_k;
+    if (std::is_same<scalar_at, e4m3_t>())
+        return scalar_kind_t::e4m3_k;
+    if (std::is_same<scalar_at, e3m2_t>())
+        return scalar_kind_t::e3m2_k;
+    if (std::is_same<scalar_at, e2m3_t>())
+        return scalar_kind_t::e2m3_k;
     if (std::is_same<scalar_at, i8_t>())
         return scalar_kind_t::i8_k;
     if (std::is_same<scalar_at, u64_t>())
@@ -181,55 +210,128 @@ template <typename scalar_at> scalar_kind_t scalar_kind() noexcept {
     return scalar_kind_t::unknown_k;
 }
 
+/**
+ *  @brief  Converts an angle from degrees to radians.
+ */
 template <typename at> at angle_to_radians(at angle) noexcept { return angle * at(3.14159265358979323846) / at(180); }
 
+/**
+ *  @brief  Readability helper to compute the square of a given value.
+ */
 template <typename at> at square(at value) noexcept { return value * value; }
 
+/**
+ *  @brief  Clamps a value between a lower and upper bound using a custom comparator. Similar to `std::clamp`.
+ *          https://en.cppreference.com/w/cpp/algorithm/clamp
+ */
 template <typename at, typename compare_at> inline at clamp(at v, at lo, at hi, compare_at comp) noexcept {
     return comp(v, lo) ? lo : comp(hi, v) ? hi : v;
 }
+
+/**
+ *  @brief  Clamps a value between a lower and upper bound. Similar to `std::clamp`.
+ *          https://en.cppreference.com/w/cpp/algorithm/clamp
+ */
 template <typename at> inline at clamp(at v, at lo, at hi) noexcept {
     return usearch::clamp(v, lo, hi, std::less<at>{});
 }
 
-inline bool str_equals(char const* begin, std::size_t len, char const* other_begin) noexcept {
-    std::size_t other_len = std::strlen(other_begin);
-    return len == other_len && std::strncmp(begin, other_begin, len) == 0;
+/**
+ *  @brief  Compares two strings for equality, given a length for the first string.
+ */
+inline bool str_equals(char const* first_begin, std::size_t first_len, char const* second_begin) noexcept {
+    std::size_t second_len = std::strlen(second_begin);
+    return first_len == second_len && std::strncmp(first_begin, second_begin, first_len) == 0;
 }
 
+/**
+ *  @brief  Returns the number of bits required to represent a scalar type.
+ */
 inline std::size_t bits_per_scalar(scalar_kind_t scalar_kind) noexcept {
     switch (scalar_kind) {
-    case scalar_kind_t::f64_k: return 64;
-    case scalar_kind_t::f32_k: return 32;
-    case scalar_kind_t::f16_k: return 16;
-    case scalar_kind_t::i8_k: return 8;
+    case scalar_kind_t::uuid_k: return 128;
+    case scalar_kind_t::u40_k: return 40;
+    case scalar_kind_t::bf16_k: return 16;
     case scalar_kind_t::b1x8_k: return 1;
+    case scalar_kind_t::u64_k: return 64;
+    case scalar_kind_t::i64_k: return 64;
+    case scalar_kind_t::f64_k: return 64;
+    case scalar_kind_t::u32_k: return 32;
+    case scalar_kind_t::i32_k: return 32;
+    case scalar_kind_t::f32_k: return 32;
+    case scalar_kind_t::u16_k: return 16;
+    case scalar_kind_t::i16_k: return 16;
+    case scalar_kind_t::f16_k: return 16;
+    case scalar_kind_t::u8_k: return 8;
+    case scalar_kind_t::i8_k: return 8;
+    case scalar_kind_t::e5m2_k: return 8;
+    case scalar_kind_t::e4m3_k: return 8;
+    case scalar_kind_t::e2m3_k: return 8;
+    case scalar_kind_t::e3m2_k: return 8;
     default: return 0;
     }
 }
 
+/**
+ *  @brief  Returns the number of bits in a scalar word for a given scalar type.
+ *          Equivalent to `bits_per_scalar` for types that are not bit-packed.
+ */
 inline std::size_t bits_per_scalar_word(scalar_kind_t scalar_kind) noexcept {
     switch (scalar_kind) {
-    case scalar_kind_t::f64_k: return 64;
-    case scalar_kind_t::f32_k: return 32;
-    case scalar_kind_t::f16_k: return 16;
-    case scalar_kind_t::i8_k: return 8;
+    case scalar_kind_t::uuid_k: return 128;
+    case scalar_kind_t::u40_k: return 40;
+    case scalar_kind_t::bf16_k: return 16;
     case scalar_kind_t::b1x8_k: return 8;
+    case scalar_kind_t::u64_k: return 64;
+    case scalar_kind_t::i64_k: return 64;
+    case scalar_kind_t::f64_k: return 64;
+    case scalar_kind_t::u32_k: return 32;
+    case scalar_kind_t::i32_k: return 32;
+    case scalar_kind_t::f32_k: return 32;
+    case scalar_kind_t::u16_k: return 16;
+    case scalar_kind_t::i16_k: return 16;
+    case scalar_kind_t::f16_k: return 16;
+    case scalar_kind_t::u8_k: return 8;
+    case scalar_kind_t::i8_k: return 8;
+    case scalar_kind_t::e5m2_k: return 8;
+    case scalar_kind_t::e4m3_k: return 8;
+    case scalar_kind_t::e2m3_k: return 8;
+    case scalar_kind_t::e3m2_k: return 8;
     default: return 0;
     }
 }
 
+/**
+ *  @brief  Returns the string name of a given scalar type.
+ */
 inline char const* scalar_kind_name(scalar_kind_t scalar_kind) noexcept {
     switch (scalar_kind) {
-    case scalar_kind_t::f32_k: return "f32";
-    case scalar_kind_t::f16_k: return "f16";
-    case scalar_kind_t::f64_k: return "f64";
-    case scalar_kind_t::i8_k: return "i8";
+    case scalar_kind_t::uuid_k: return "uuid";
+    case scalar_kind_t::u40_k: return "u40";
+    case scalar_kind_t::bf16_k: return "bf16";
     case scalar_kind_t::b1x8_k: return "b1x8";
+    case scalar_kind_t::u64_k: return "u64";
+    case scalar_kind_t::i64_k: return "i64";
+    case scalar_kind_t::f64_k: return "f64";
+    case scalar_kind_t::u32_k: return "u32";
+    case scalar_kind_t::i32_k: return "i32";
+    case scalar_kind_t::f32_k: return "f32";
+    case scalar_kind_t::u16_k: return "u16";
+    case scalar_kind_t::i16_k: return "i16";
+    case scalar_kind_t::f16_k: return "f16";
+    case scalar_kind_t::u8_k: return "u8";
+    case scalar_kind_t::i8_k: return "i8";
+    case scalar_kind_t::e5m2_k: return "e5m2";
+    case scalar_kind_t::e4m3_k: return "e4m3";
+    case scalar_kind_t::e2m3_k: return "e2m3";
+    case scalar_kind_t::e3m2_k: return "e3m2";
     default: return "";
     }
 }
 
+/**
+ *  @brief  Returns the string name of a given distance metric.
+ */
 inline char const* metric_kind_name(metric_kind_t metric) noexcept {
     switch (metric) {
     case metric_kind_t::unknown_k: return "unknown";
@@ -243,28 +345,52 @@ inline char const* metric_kind_name(metric_kind_t metric) noexcept {
     case metric_kind_t::hamming_k: return "hamming";
     case metric_kind_t::tanimoto_k: return "tanimoto";
     case metric_kind_t::sorensen_k: return "sorensen";
+    default: return "";
     }
-    return "";
 }
+
+/**
+ *  @brief  Parses a string to identify the corresponding `scalar_kind_t` enumeration value.
+ */
 inline expected_gt<scalar_kind_t> scalar_kind_from_name(char const* name, std::size_t len) {
     expected_gt<scalar_kind_t> parsed;
-    if (str_equals(name, len, "f32"))
-        parsed.result = scalar_kind_t::f32_k;
-    else if (str_equals(name, len, "f64"))
+    if (str_equals(name, len, "f64"))
         parsed.result = scalar_kind_t::f64_k;
+    else if (str_equals(name, len, "f32"))
+        parsed.result = scalar_kind_t::f32_k;
+    else if (str_equals(name, len, "bf16"))
+        parsed.result = scalar_kind_t::bf16_k;
     else if (str_equals(name, len, "f16"))
         parsed.result = scalar_kind_t::f16_k;
+    else if (str_equals(name, len, "e5m2"))
+        parsed.result = scalar_kind_t::e5m2_k;
+    else if (str_equals(name, len, "e4m3"))
+        parsed.result = scalar_kind_t::e4m3_k;
+    else if (str_equals(name, len, "e3m2"))
+        parsed.result = scalar_kind_t::e3m2_k;
+    else if (str_equals(name, len, "e2m3"))
+        parsed.result = scalar_kind_t::e2m3_k;
     else if (str_equals(name, len, "i8"))
         parsed.result = scalar_kind_t::i8_k;
+    else if (str_equals(name, len, "u8"))
+        parsed.result = scalar_kind_t::u8_k;
+    else if (str_equals(name, len, "b1"))
+        parsed.result = scalar_kind_t::b1x8_k;
     else
-        parsed.failed("Unknown type, choose: f32, f16, f64, i8");
+        parsed.failed("Unknown type, choose: f64, f32, bf16, f16, e5m2, e4m3, e3m2, e2m3, i8, u8, b1");
     return parsed;
 }
 
+/**
+ *  @brief  Parses a string to identify the corresponding `scalar_kind_t` enumeration value.
+ */
 inline expected_gt<scalar_kind_t> scalar_kind_from_name(char const* name) {
     return scalar_kind_from_name(name, std::strlen(name));
 }
 
+/**
+ *  @brief  Parses a string to identify the corresponding `metric_kind_t` enumeration value.
+ */
 inline expected_gt<metric_kind_t> metric_from_name(char const* name, std::size_t len) {
     expected_gt<metric_kind_t> parsed;
     if (str_equals(name, len, "l2sq") || str_equals(name, len, "euclidean_sq")) {
@@ -291,28 +417,147 @@ inline expected_gt<metric_kind_t> metric_from_name(char const* name, std::size_t
     return parsed;
 }
 
+/**
+ *  @brief  Parses a string to identify the corresponding `metric_kind_t` enumeration value.
+ */
 inline expected_gt<metric_kind_t> metric_from_name(char const* name) {
     return metric_from_name(name, std::strlen(name));
 }
 
+/**
+ *  @brief Convenience function to upcast a half-precision floating point number to a single-precision one.
+ */
 inline float f16_to_f32(std::uint16_t u16) noexcept {
-#if !USEARCH_USE_FP16LIB
-    f16_native_t f16;
-    std::memcpy(&f16, &u16, sizeof(std::uint16_t));
-    return float(f16);
+#if USEARCH_USE_NUMKONG
+    nk_f32_t result;
+    nk_f16_to_f32_serial((nk_f16_t const*)&u16, &result);
+    return result;
 #else
-    return fp16_ieee_to_fp32_value(u16);
+    std::uint32_t sign = (u16 >> 15) & 1;
+    std::uint32_t exponent = (u16 >> 10) & 0x1F;
+    std::uint32_t mantissa = u16 & 0x03FF;
+    fu32_t conv;
+    if (exponent == 0) {
+        if (mantissa == 0) {
+            conv.u = sign << 31;
+        } else {
+            // Denormal: use FPU normalization trick
+            fu32_t temp;
+            temp.f = (float)mantissa;
+            conv.u = (sign << 31) | (temp.u - 0x0C000000u);
+        }
+    } else if (exponent == 31) {
+        conv.u = (sign << 31) | 0x7F800000u | (mantissa << 13);
+    } else {
+        conv.u = (sign << 31) | ((exponent + 112u) << 23) | (mantissa << 13);
+    }
+    return conv.f;
 #endif
 }
 
+/**
+ *  @brief Convenience function to downcast a single-precision floating point number to a half-precision one.
+ */
 inline std::uint16_t f32_to_f16(float f32) noexcept {
-#if !USEARCH_USE_FP16LIB
-    f16_native_t f16 = f16_native_t(f32);
+#if USEARCH_USE_NUMKONG
+    nk_f16_t result;
+    nk_f32_to_f16_serial((nk_f32_t const*)&f32, &result);
     std::uint16_t u16;
-    std::memcpy(&u16, &f16, sizeof(std::uint16_t));
+    std::memcpy(&u16, &result, sizeof(u16));
     return u16;
 #else
-    return fp16_ieee_from_fp32_value(f32);
+    fu32_t conv;
+    conv.f = f32;
+    std::uint32_t sign = (conv.u >> 31) & 1;
+    std::uint32_t exponent = (conv.u >> 23) & 0xFF;
+    std::uint32_t mantissa = conv.u & 0x007FFFFFu;
+    std::uint16_t result;
+    if (exponent == 0) {
+        result = (std::uint16_t)(sign << 15);
+    } else if (exponent == 255) {
+        std::uint16_t payload = (std::uint16_t)(mantissa >> 13);
+        if (mantissa != 0 && payload == 0)
+            payload = 1;
+        result = (std::uint16_t)((sign << 15) | 0x7C00 | payload);
+    } else if (exponent <= 102) {
+        if (exponent == 102 && mantissa > 0)
+            result = (std::uint16_t)((sign << 15) | 0x0001);
+        else
+            result = (std::uint16_t)(sign << 15);
+    } else if (exponent < 113) {
+        // Denormal range with RNE rounding
+        unsigned shift = 113 - exponent;
+        unsigned shift_amount = shift + 13;
+        std::uint64_t full_mant = 0x00800000ULL | mantissa;
+        std::uint32_t mant = (std::uint32_t)(full_mant >> shift_amount);
+        std::uint32_t round_bit = (std::uint32_t)((full_mant >> (shift_amount - 1)) & 1);
+        std::uint64_t sticky_bits = full_mant & ((1ULL << (shift_amount - 1)) - 1);
+        if (round_bit && (sticky_bits || (mant & 1)))
+            mant++;
+        result = (std::uint16_t)((sign << 15) | mant);
+    } else if (exponent < 143) {
+        // Normal range with RNE rounding
+        std::uint32_t f16_exp = exponent - 112;
+        std::uint32_t f16_mant = mantissa >> 13;
+        std::uint32_t round_bit = (mantissa >> 12) & 1;
+        std::uint32_t sticky_bits = mantissa & 0xFFF;
+        if (round_bit && (sticky_bits || (f16_mant & 1))) {
+            f16_mant++;
+            if (f16_mant > 0x3FF) {
+                f16_mant = 0;
+                f16_exp++;
+            }
+        }
+        if (f16_exp > 30)
+            result = (std::uint16_t)((sign << 15) | 0x7C00);
+        else
+            result = (std::uint16_t)((sign << 15) | (f16_exp << 10) | f16_mant);
+    } else {
+        result = (std::uint16_t)((sign << 15) | 0x7C00);
+    }
+    return result;
+#endif
+}
+
+/**
+ *  @brief Convenience function to upcast a brain-floating point number to a single-precision one.
+ *  https://github.com/ashvardanian/NumKong/blob/7e58e9fee9e096238cf29f7c30774fa3dcd0fe85/include/numkong/cast/serial.h#L226-L244
+ */
+inline float bf16_to_f32(std::uint16_t u16) noexcept {
+#if USEARCH_USE_NUMKONG
+    nk_f32_t result;
+    nk_bf16_to_f32_serial((nk_bf16_t const*)&u16, &result);
+    return result;
+#else
+    union float_or_unsigned_int_t {
+        float f;
+        unsigned int i;
+    } conv;
+    conv.i = u16 << 16; // Zero extends the mantissa
+    return conv.f;
+#endif
+}
+
+/**
+ *  @brief Convenience function to downcast a single-precision floating point number to a brain-floating point one.
+ *  https://github.com/ashvardanian/NumKong/blob/7e58e9fee9e096238cf29f7c30774fa3dcd0fe85/include/numkong/cast/serial.h#L244-L262
+ */
+inline std::uint16_t f32_to_bf16(float f32) noexcept {
+#if USEARCH_USE_NUMKONG
+    nk_bf16_t result;
+    nk_f32_to_bf16_serial((nk_f32_t const*)&f32, &result);
+    std::uint16_t u16;
+    std::memcpy(&u16, &result, sizeof(u16));
+    return u16;
+#else
+    union float_or_unsigned_int_t {
+        float f;
+        unsigned int i;
+    } conv;
+    conv.f = f32;
+    conv.i >>= 16;
+    conv.i &= 0xFFFF;
+    return (unsigned short)conv.i;
 #endif
 }
 
@@ -334,23 +579,25 @@ class f16_bits_t {
     inline operator float() const noexcept { return f16_to_f32(uint16_); }
     inline explicit operator bool() const noexcept { return f16_to_f32(uint16_) > 0.5f; }
 
-    inline f16_bits_t(i8_converted_t) noexcept;
-    inline f16_bits_t(bool v) noexcept : uint16_(f32_to_f16(v)) {}
+    inline f16_bits_t(int v) noexcept : uint16_(f32_to_f16(static_cast<float>(v))) {}
+    inline f16_bits_t(bool v) noexcept : uint16_(f32_to_f16(static_cast<float>(v))) {}
     inline f16_bits_t(float v) noexcept : uint16_(f32_to_f16(v)) {}
     inline f16_bits_t(double v) noexcept : uint16_(f32_to_f16(static_cast<float>(v))) {}
+
+    inline bool operator<(f16_bits_t const& other) const noexcept { return float(*this) < float(other); }
 
     inline f16_bits_t operator+(f16_bits_t other) const noexcept { return {float(*this) + float(other)}; }
     inline f16_bits_t operator-(f16_bits_t other) const noexcept { return {float(*this) - float(other)}; }
     inline f16_bits_t operator*(f16_bits_t other) const noexcept { return {float(*this) * float(other)}; }
     inline f16_bits_t operator/(f16_bits_t other) const noexcept { return {float(*this) / float(other)}; }
-    inline f16_bits_t operator+(float other) const noexcept { return {float(*this) + other}; }
-    inline f16_bits_t operator-(float other) const noexcept { return {float(*this) - other}; }
-    inline f16_bits_t operator*(float other) const noexcept { return {float(*this) * other}; }
-    inline f16_bits_t operator/(float other) const noexcept { return {float(*this) / other}; }
-    inline f16_bits_t operator+(double other) const noexcept { return {float(*this) + other}; }
-    inline f16_bits_t operator-(double other) const noexcept { return {float(*this) - other}; }
-    inline f16_bits_t operator*(double other) const noexcept { return {float(*this) * other}; }
-    inline f16_bits_t operator/(double other) const noexcept { return {float(*this) / other}; }
+    inline float operator+(float other) const noexcept { return float(*this) + other; }
+    inline float operator-(float other) const noexcept { return float(*this) - other; }
+    inline float operator*(float other) const noexcept { return float(*this) * other; }
+    inline float operator/(float other) const noexcept { return float(*this) / other; }
+    inline double operator+(double other) const noexcept { return float(*this) + other; }
+    inline double operator-(double other) const noexcept { return float(*this) - other; }
+    inline double operator*(double other) const noexcept { return float(*this) * other; }
+    inline double operator/(double other) const noexcept { return float(*this) / other; }
 
     inline f16_bits_t& operator+=(float v) noexcept {
         uint16_ = f32_to_f16(v + f16_to_f32(uint16_));
@@ -373,6 +620,730 @@ class f16_bits_t {
     }
 };
 
+#if USEARCH_USE_OPENMP
+#pragma omp declare reduction(+ : unum::usearch::f16_bits_t : omp_out = omp_out + omp_in)                              \
+    initializer(omp_priv = unum::usearch::f16_bits_t())
+#endif
+
+/**
+ *  @brief  Numeric type for brain-floating point half-precision floating point.
+ *          If hardware support isn't available, falls back to a hardware
+ *          agnostic in-software implementation.
+ */
+class bf16_bits_t {
+    std::uint16_t uint16_{};
+
+  public:
+    inline bf16_bits_t() noexcept : uint16_(0) {}
+    inline bf16_bits_t(bf16_bits_t&&) = default;
+    inline bf16_bits_t& operator=(bf16_bits_t&&) = default;
+    inline bf16_bits_t(bf16_bits_t const&) = default;
+    inline bf16_bits_t& operator=(bf16_bits_t const&) = default;
+
+    inline operator float() const noexcept { return bf16_to_f32(uint16_); }
+    inline explicit operator bool() const noexcept { return bf16_to_f32(uint16_) > 0.5f; }
+
+    inline bf16_bits_t(int v) noexcept : uint16_(f32_to_bf16(static_cast<float>(v))) {}
+    inline bf16_bits_t(bool v) noexcept : uint16_(f32_to_bf16(static_cast<float>(v))) {}
+    inline bf16_bits_t(float v) noexcept : uint16_(f32_to_bf16(v)) {}
+    inline bf16_bits_t(double v) noexcept : uint16_(f32_to_bf16(static_cast<float>(v))) {}
+
+    inline bool operator<(bf16_bits_t const& other) const noexcept { return float(*this) < float(other); }
+
+    inline bf16_bits_t operator+(bf16_bits_t other) const noexcept { return {float(*this) + float(other)}; }
+    inline bf16_bits_t operator-(bf16_bits_t other) const noexcept { return {float(*this) - float(other)}; }
+    inline bf16_bits_t operator*(bf16_bits_t other) const noexcept { return {float(*this) * float(other)}; }
+    inline bf16_bits_t operator/(bf16_bits_t other) const noexcept { return {float(*this) / float(other)}; }
+    inline float operator+(float other) const noexcept { return float(*this) + other; }
+    inline float operator-(float other) const noexcept { return float(*this) - other; }
+    inline float operator*(float other) const noexcept { return float(*this) * other; }
+    inline float operator/(float other) const noexcept { return float(*this) / other; }
+    inline double operator+(double other) const noexcept { return float(*this) + other; }
+    inline double operator-(double other) const noexcept { return float(*this) - other; }
+    inline double operator*(double other) const noexcept { return float(*this) * other; }
+    inline double operator/(double other) const noexcept { return float(*this) / other; }
+
+    inline bf16_bits_t& operator+=(float v) noexcept {
+        uint16_ = f32_to_bf16(v + bf16_to_f32(uint16_));
+        return *this;
+    }
+
+    inline bf16_bits_t& operator-=(float v) noexcept {
+        uint16_ = f32_to_bf16(v - bf16_to_f32(uint16_));
+        return *this;
+    }
+
+    inline bf16_bits_t& operator*=(float v) noexcept {
+        uint16_ = f32_to_bf16(v * bf16_to_f32(uint16_));
+        return *this;
+    }
+
+    inline bf16_bits_t& operator/=(float v) noexcept {
+        uint16_ = f32_to_bf16(v / bf16_to_f32(uint16_));
+        return *this;
+    }
+
+    inline bf16_bits_t& operator=(float v) noexcept {
+        uint16_ = f32_to_bf16(v);
+        return *this;
+    }
+};
+
+#if USEARCH_USE_OPENMP
+#pragma omp declare reduction(+ : unum::usearch::bf16_bits_t : omp_out = omp_out + omp_in)                             \
+    initializer(omp_priv = unum::usearch::bf16_bits_t())
+#endif
+
+/**
+ *  @brief Convenience function to upcast an FP8 E5M2 value to single-precision.
+ *         E5M2: 1 sign + 5 exponent (bias=15) + 2 mantissa, range +/-57344, supports inf/NaN.
+ */
+inline float e5m2_to_f32(std::uint8_t u8) noexcept {
+#if USEARCH_USE_NUMKONG
+    nk_f32_t result;
+    nk_e5m2_to_f32_serial((nk_e5m2_t const*)&u8, &result);
+    return result;
+#else
+    // 128-entry LUT for the 7-bit magnitude, sign handled separately.
+    static std::uint32_t const lut[128] = {
+        0x00000000, 0x37800000, 0x38000000, 0x38400000, // exp=0  sub
+        0x38800000, 0x38A00000, 0x38C00000, 0x38E00000, // exp=1
+        0x39000000, 0x39200000, 0x39400000, 0x39600000, // exp=2
+        0x39800000, 0x39A00000, 0x39C00000, 0x39E00000, // exp=3
+        0x3A000000, 0x3A200000, 0x3A400000, 0x3A600000, // exp=4
+        0x3A800000, 0x3AA00000, 0x3AC00000, 0x3AE00000, // exp=5
+        0x3B000000, 0x3B200000, 0x3B400000, 0x3B600000, // exp=6
+        0x3B800000, 0x3BA00000, 0x3BC00000, 0x3BE00000, // exp=7
+        0x3C000000, 0x3C200000, 0x3C400000, 0x3C600000, // exp=8
+        0x3C800000, 0x3CA00000, 0x3CC00000, 0x3CE00000, // exp=9
+        0x3D000000, 0x3D200000, 0x3D400000, 0x3D600000, // exp=10
+        0x3D800000, 0x3DA00000, 0x3DC00000, 0x3DE00000, // exp=11
+        0x3E000000, 0x3E200000, 0x3E400000, 0x3E600000, // exp=12
+        0x3E800000, 0x3EA00000, 0x3EC00000, 0x3EE00000, // exp=13
+        0x3F000000, 0x3F200000, 0x3F400000, 0x3F600000, // exp=14
+        0x3F800000, 0x3FA00000, 0x3FC00000, 0x3FE00000, // exp=15
+        0x40000000, 0x40200000, 0x40400000, 0x40600000, // exp=16
+        0x40800000, 0x40A00000, 0x40C00000, 0x40E00000, // exp=17
+        0x41000000, 0x41200000, 0x41400000, 0x41600000, // exp=18
+        0x41800000, 0x41A00000, 0x41C00000, 0x41E00000, // exp=19
+        0x42000000, 0x42200000, 0x42400000, 0x42600000, // exp=20
+        0x42800000, 0x42A00000, 0x42C00000, 0x42E00000, // exp=21
+        0x43000000, 0x43200000, 0x43400000, 0x43600000, // exp=22
+        0x43800000, 0x43A00000, 0x43C00000, 0x43E00000, // exp=23
+        0x44000000, 0x44200000, 0x44400000, 0x44600000, // exp=24
+        0x44800000, 0x44A00000, 0x44C00000, 0x44E00000, // exp=25
+        0x45000000, 0x45200000, 0x45400000, 0x45600000, // exp=26
+        0x45800000, 0x45A00000, 0x45C00000, 0x45E00000, // exp=27
+        0x46000000, 0x46200000, 0x46400000, 0x46600000, // exp=28
+        0x46800000, 0x46A00000, 0x46C00000, 0x46E00000, // exp=29
+        0x47000000, 0x47200000, 0x47400000, 0x47600000, // exp=30
+        0x7F800000, 0x7FC00000, 0x7FC00000, 0x7FC00000, // inf, nan
+    };
+    std::uint32_t sign = (std::uint32_t)(u8 & 0x80) << 24;
+    fu32_t conv;
+    conv.u = sign | lut[u8 & 0x7F];
+    return conv.f;
+#endif
+}
+
+/**
+ *  @brief Convenience function to downcast a single-precision value to FP8 E5M2.
+ *         Uses RNE rounding. Overflow → inf, NaN → NaN, subnormals handled.
+ */
+inline std::uint8_t f32_to_e5m2(float f32) noexcept {
+#if USEARCH_USE_NUMKONG
+    nk_e5m2_t result;
+    nk_f32_to_e5m2_serial((nk_f32_t const*)&f32, &result);
+    return result;
+#else
+    fu32_t conv;
+    conv.f = f32;
+    std::uint32_t sign_bit = conv.u >> 31;
+    std::uint32_t abs_bits = conv.u & 0x7FFFFFFFu;
+    std::uint8_t sign = (std::uint8_t)(sign_bit << 7);
+
+    // NaN or inf
+    if (abs_bits >= 0x7F800000u) {
+        std::uint8_t mant = (abs_bits > 0x7F800000u) ? 0x01u : 0x00u;
+        return (std::uint8_t)(sign | 0x7Cu | mant);
+    }
+    if (abs_bits == 0)
+        return sign;
+
+    float abs_x = sign_bit ? -f32 : f32;
+
+    // Subnormal range: |x| < 2^-14
+    if (abs_x < (1.0f / 16384.0f)) {
+        float scaled = abs_x * 65536.0f;
+        int mant = (int)scaled;
+        float frac = scaled - (float)mant;
+        if (frac > 0.5f || (frac == 0.5f && (mant & 1)))
+            ++mant;
+        if (mant > 3)
+            return (std::uint8_t)(sign | 0x04u);
+        return (std::uint8_t)(sign | (std::uint8_t)mant);
+    }
+
+    int exp = (int)((abs_bits >> 23) & 0xFFu) - 127;
+    std::uint32_t mantissa = abs_bits & 0x7FFFFFu;
+    std::uint32_t significand = (1u << 23) | mantissa;
+    int shift = 23 - 2;
+    std::uint32_t remainder_mask = (1u << shift) - 1;
+    std::uint32_t remainder = significand & remainder_mask;
+    std::uint32_t halfway = 1u << (shift - 1);
+    std::uint32_t significand_rounded = significand >> shift;
+    if (remainder > halfway || (remainder == halfway && (significand_rounded & 1)))
+        ++significand_rounded;
+    if (significand_rounded == (1u << 3)) {
+        significand_rounded >>= 1;
+        ++exp;
+    }
+    if (exp > 15)
+        return (std::uint8_t)(sign | 0x7Cu); // overflow → inf
+    if (exp < -14) {
+        float scaled = abs_x * 65536.0f;
+        int mant = (int)scaled;
+        float frac = scaled - (float)mant;
+        if (frac > 0.5f || (frac == 0.5f && (mant & 1)))
+            ++mant;
+        if (mant > 3)
+            return (std::uint8_t)(sign | 0x04u);
+        return (std::uint8_t)(sign | (std::uint8_t)mant);
+    }
+
+    std::uint8_t exp_field = (std::uint8_t)(exp + 15);
+    std::uint8_t mant_field = (std::uint8_t)(significand_rounded & 0x03u);
+    return (std::uint8_t)(sign | (exp_field << 2) | mant_field);
+#endif
+}
+
+/**
+ *  @brief Convenience function to upcast an FP8 E4M3 value to single-precision.
+ *         E4M3: 1 sign + 4 exponent (bias=7) + 3 mantissa, range +/-448, no inf.
+ */
+inline float e4m3_to_f32(std::uint8_t u8) noexcept {
+#if USEARCH_USE_NUMKONG
+    nk_f32_t result;
+    nk_e4m3_to_f32_serial((nk_e4m3_t const*)&u8, &result);
+    return result;
+#else
+    static std::uint32_t const lut[128] = {
+        0x00000000, 0x3B000000, 0x3B800000, 0x3BC00000, 0x3C000000, 0x3C200000, 0x3C400000, 0x3C600000, // exp=0 sub
+        0x3C800000, 0x3C900000, 0x3CA00000, 0x3CB00000, 0x3CC00000, 0x3CD00000, 0x3CE00000, 0x3CF00000, // exp=1
+        0x3D000000, 0x3D100000, 0x3D200000, 0x3D300000, 0x3D400000, 0x3D500000, 0x3D600000, 0x3D700000, // exp=2
+        0x3D800000, 0x3D900000, 0x3DA00000, 0x3DB00000, 0x3DC00000, 0x3DD00000, 0x3DE00000, 0x3DF00000, // exp=3
+        0x3E000000, 0x3E100000, 0x3E200000, 0x3E300000, 0x3E400000, 0x3E500000, 0x3E600000, 0x3E700000, // exp=4
+        0x3E800000, 0x3E900000, 0x3EA00000, 0x3EB00000, 0x3EC00000, 0x3ED00000, 0x3EE00000, 0x3EF00000, // exp=5
+        0x3F000000, 0x3F100000, 0x3F200000, 0x3F300000, 0x3F400000, 0x3F500000, 0x3F600000, 0x3F700000, // exp=6
+        0x3F800000, 0x3F900000, 0x3FA00000, 0x3FB00000, 0x3FC00000, 0x3FD00000, 0x3FE00000, 0x3FF00000, // exp=7
+        0x40000000, 0x40100000, 0x40200000, 0x40300000, 0x40400000, 0x40500000, 0x40600000, 0x40700000, // exp=8
+        0x40800000, 0x40900000, 0x40A00000, 0x40B00000, 0x40C00000, 0x40D00000, 0x40E00000, 0x40F00000, // exp=9
+        0x41000000, 0x41100000, 0x41200000, 0x41300000, 0x41400000, 0x41500000, 0x41600000, 0x41700000, // exp=10
+        0x41800000, 0x41900000, 0x41A00000, 0x41B00000, 0x41C00000, 0x41D00000, 0x41E00000, 0x41F00000, // exp=11
+        0x42000000, 0x42100000, 0x42200000, 0x42300000, 0x42400000, 0x42500000, 0x42600000, 0x42700000, // exp=12
+        0x42800000, 0x42900000, 0x42A00000, 0x42B00000, 0x42C00000, 0x42D00000, 0x42E00000, 0x42F00000, // exp=13
+        0x43000000, 0x43100000, 0x43200000, 0x43300000, 0x43400000, 0x43500000, 0x43600000, 0x43700000, // exp=14
+        0x43800000, 0x43900000, 0x43A00000, 0x43B00000, 0x43C00000, 0x43D00000, 0x43E00000, 0x7FC00000, // exp=15
+    };
+    std::uint32_t sign = (std::uint32_t)(u8 & 0x80) << 24;
+    fu32_t conv;
+    conv.u = sign | lut[u8 & 0x7F];
+    return conv.f;
+#endif
+}
+
+/**
+ *  @brief Convenience function to downcast a single-precision value to FP8 E4M3.
+ *         Uses RNE rounding. Overflow saturates to +/-448 (no inf in E4M3FN).
+ */
+inline std::uint8_t f32_to_e4m3(float f32) noexcept {
+#if USEARCH_USE_NUMKONG
+    nk_e4m3_t result;
+    nk_f32_to_e4m3_serial((nk_f32_t const*)&f32, &result);
+    return result;
+#else
+    fu32_t conv;
+    conv.f = f32;
+    std::uint32_t sign_bit = conv.u >> 31;
+    std::uint32_t abs_bits = conv.u & 0x7FFFFFFFu;
+    std::uint8_t sign = (std::uint8_t)(sign_bit << 7);
+
+    // NaN → E4M3FN NaN
+    if (abs_bits > 0x7F800000u)
+        return (std::uint8_t)(sign | 0x7Fu);
+    // Inf → saturate to max (448)
+    if (abs_bits == 0x7F800000u)
+        return (std::uint8_t)(sign | 0x7Eu);
+    if (abs_bits == 0)
+        return sign;
+
+    float abs_x = sign_bit ? -f32 : f32;
+
+    // Subnormal range: |x| < 2^-6
+    if (abs_x < (1.0f / 64.0f)) {
+        float scaled = abs_x * 512.0f;
+        int mant = (int)scaled;
+        float frac = scaled - (float)mant;
+        if (frac > 0.5f || (frac == 0.5f && (mant & 1)))
+            ++mant;
+        if (mant > 7)
+            return (std::uint8_t)(sign | 0x08u);
+        return (std::uint8_t)(sign | (std::uint8_t)mant);
+    }
+
+    int exp = (int)((abs_bits >> 23) & 0xFFu) - 127;
+    std::uint32_t mantissa = abs_bits & 0x7FFFFFu;
+    std::uint32_t significand = (1u << 23) | mantissa;
+    int shift = 23 - 3;
+    std::uint32_t remainder_mask = (1u << shift) - 1;
+    std::uint32_t remainder = significand & remainder_mask;
+    std::uint32_t halfway = 1u << (shift - 1);
+    std::uint32_t significand_rounded = significand >> shift;
+    if (remainder > halfway || (remainder == halfway && (significand_rounded & 1)))
+        ++significand_rounded;
+    if (significand_rounded == (1u << 4)) {
+        significand_rounded >>= 1;
+        ++exp;
+    }
+    // Overflow → saturate to max (0x7E = 448)
+    if (exp > 8)
+        return (std::uint8_t)(sign | 0x7Eu);
+    if (exp < -6) {
+        float scaled = abs_x * 512.0f;
+        int mant = (int)scaled;
+        float frac = scaled - (float)mant;
+        if (frac > 0.5f || (frac == 0.5f && (mant & 1)))
+            ++mant;
+        if (mant > 7)
+            return (std::uint8_t)(sign | 0x08u);
+        return (std::uint8_t)(sign | (std::uint8_t)mant);
+    }
+
+    std::uint8_t exp_field = (std::uint8_t)(exp + 7);
+    std::uint8_t mant_field = (std::uint8_t)(significand_rounded & 0x07u);
+    // Clamp to avoid NaN encoding (0x7F)
+    if (exp_field == 15 && mant_field > 6)
+        mant_field = 6;
+    return (std::uint8_t)(sign | (exp_field << 3) | mant_field);
+#endif
+}
+
+/**
+ *  @brief  Numeric type for FP8 E5M2 (IEEE 754-like) floating point.
+ *          1 sign + 5 exponent + 2 mantissa bits, range +/-57344.
+ */
+class e5m2_bits_t {
+    std::uint8_t uint8_{};
+
+  public:
+    inline e5m2_bits_t() noexcept : uint8_(0) {}
+    inline e5m2_bits_t(e5m2_bits_t&&) = default;
+    inline e5m2_bits_t& operator=(e5m2_bits_t&&) = default;
+    inline e5m2_bits_t(e5m2_bits_t const&) = default;
+    inline e5m2_bits_t& operator=(e5m2_bits_t const&) = default;
+
+    inline operator float() const noexcept { return e5m2_to_f32(uint8_); }
+    inline explicit operator bool() const noexcept { return e5m2_to_f32(uint8_) > 0.5f; }
+
+    inline e5m2_bits_t(int v) noexcept : uint8_(f32_to_e5m2(static_cast<float>(v))) {}
+    inline e5m2_bits_t(bool v) noexcept : uint8_(f32_to_e5m2(static_cast<float>(v))) {}
+    inline e5m2_bits_t(float v) noexcept : uint8_(f32_to_e5m2(v)) {}
+    inline e5m2_bits_t(double v) noexcept : uint8_(f32_to_e5m2(static_cast<float>(v))) {}
+
+    inline bool operator<(e5m2_bits_t const& other) const noexcept { return float(*this) < float(other); }
+
+    inline e5m2_bits_t operator+(e5m2_bits_t other) const noexcept { return {float(*this) + float(other)}; }
+    inline e5m2_bits_t operator-(e5m2_bits_t other) const noexcept { return {float(*this) - float(other)}; }
+    inline e5m2_bits_t operator*(e5m2_bits_t other) const noexcept { return {float(*this) * float(other)}; }
+    inline e5m2_bits_t operator/(e5m2_bits_t other) const noexcept { return {float(*this) / float(other)}; }
+    inline float operator+(float other) const noexcept { return float(*this) + other; }
+    inline float operator-(float other) const noexcept { return float(*this) - other; }
+    inline float operator*(float other) const noexcept { return float(*this) * other; }
+    inline float operator/(float other) const noexcept { return float(*this) / other; }
+    inline double operator+(double other) const noexcept { return float(*this) + other; }
+    inline double operator-(double other) const noexcept { return float(*this) - other; }
+    inline double operator*(double other) const noexcept { return float(*this) * other; }
+    inline double operator/(double other) const noexcept { return float(*this) / other; }
+
+    inline e5m2_bits_t& operator+=(float v) noexcept {
+        uint8_ = f32_to_e5m2(v + e5m2_to_f32(uint8_));
+        return *this;
+    }
+    inline e5m2_bits_t& operator-=(float v) noexcept {
+        uint8_ = f32_to_e5m2(v - e5m2_to_f32(uint8_));
+        return *this;
+    }
+    inline e5m2_bits_t& operator*=(float v) noexcept {
+        uint8_ = f32_to_e5m2(v * e5m2_to_f32(uint8_));
+        return *this;
+    }
+    inline e5m2_bits_t& operator/=(float v) noexcept {
+        uint8_ = f32_to_e5m2(v / e5m2_to_f32(uint8_));
+        return *this;
+    }
+    inline e5m2_bits_t& operator=(float v) noexcept {
+        uint8_ = f32_to_e5m2(v);
+        return *this;
+    }
+};
+
+/**
+ *  @brief  Numeric type for FP8 E4M3 (OCP) floating point.
+ *          1 sign + 4 exponent + 3 mantissa bits, range +/-448.
+ */
+class e4m3_bits_t {
+    std::uint8_t uint8_{};
+
+  public:
+    inline e4m3_bits_t() noexcept : uint8_(0) {}
+    inline e4m3_bits_t(e4m3_bits_t&&) = default;
+    inline e4m3_bits_t& operator=(e4m3_bits_t&&) = default;
+    inline e4m3_bits_t(e4m3_bits_t const&) = default;
+    inline e4m3_bits_t& operator=(e4m3_bits_t const&) = default;
+
+    inline operator float() const noexcept { return e4m3_to_f32(uint8_); }
+    inline explicit operator bool() const noexcept { return e4m3_to_f32(uint8_) > 0.5f; }
+
+    inline e4m3_bits_t(int v) noexcept : uint8_(f32_to_e4m3(static_cast<float>(v))) {}
+    inline e4m3_bits_t(bool v) noexcept : uint8_(f32_to_e4m3(static_cast<float>(v))) {}
+    inline e4m3_bits_t(float v) noexcept : uint8_(f32_to_e4m3(v)) {}
+    inline e4m3_bits_t(double v) noexcept : uint8_(f32_to_e4m3(static_cast<float>(v))) {}
+
+    inline bool operator<(e4m3_bits_t const& other) const noexcept { return float(*this) < float(other); }
+
+    inline e4m3_bits_t operator+(e4m3_bits_t other) const noexcept { return {float(*this) + float(other)}; }
+    inline e4m3_bits_t operator-(e4m3_bits_t other) const noexcept { return {float(*this) - float(other)}; }
+    inline e4m3_bits_t operator*(e4m3_bits_t other) const noexcept { return {float(*this) * float(other)}; }
+    inline e4m3_bits_t operator/(e4m3_bits_t other) const noexcept { return {float(*this) / float(other)}; }
+    inline float operator+(float other) const noexcept { return float(*this) + other; }
+    inline float operator-(float other) const noexcept { return float(*this) - other; }
+    inline float operator*(float other) const noexcept { return float(*this) * other; }
+    inline float operator/(float other) const noexcept { return float(*this) / other; }
+    inline double operator+(double other) const noexcept { return float(*this) + other; }
+    inline double operator-(double other) const noexcept { return float(*this) - other; }
+    inline double operator*(double other) const noexcept { return float(*this) * other; }
+    inline double operator/(double other) const noexcept { return float(*this) / other; }
+
+    inline e4m3_bits_t& operator+=(float v) noexcept {
+        uint8_ = f32_to_e4m3(v + e4m3_to_f32(uint8_));
+        return *this;
+    }
+    inline e4m3_bits_t& operator-=(float v) noexcept {
+        uint8_ = f32_to_e4m3(v - e4m3_to_f32(uint8_));
+        return *this;
+    }
+    inline e4m3_bits_t& operator*=(float v) noexcept {
+        uint8_ = f32_to_e4m3(v * e4m3_to_f32(uint8_));
+        return *this;
+    }
+    inline e4m3_bits_t& operator/=(float v) noexcept {
+        uint8_ = f32_to_e4m3(v / e4m3_to_f32(uint8_));
+        return *this;
+    }
+    inline e4m3_bits_t& operator=(float v) noexcept {
+        uint8_ = f32_to_e4m3(v);
+        return *this;
+    }
+};
+
+/**
+ *  @brief Convenience function to upcast an FP6 E2M3 value to single-precision.
+ *         E2M3: 1 sign + 2 exponent (bias=1) + 3 mantissa, stored as 0b00SEEMMM, range +/-7.5.
+ */
+inline float e2m3_to_f32(std::uint8_t u8) noexcept {
+#if USEARCH_USE_NUMKONG
+    nk_f32_t result;
+    nk_e2m3_to_f32_serial((nk_e2m3_t const*)&u8, &result);
+    return result;
+#else
+    static std::uint32_t const lut[64] = {
+        0x00000000, 0x3E000000, 0x3E800000, 0x3EC00000, 0x3F000000, 0x3F200000, 0x3F400000, 0x3F600000, // positive
+        0x3F800000, 0x3F900000, 0x3FA00000, 0x3FB00000, 0x3FC00000, 0x3FD00000, 0x3FE00000, 0x3FF00000, // positive
+        0x40000000, 0x40100000, 0x40200000, 0x40300000, 0x40400000, 0x40500000, 0x40600000, 0x40700000, // positive
+        0x40800000, 0x40900000, 0x40A00000, 0x40B00000, 0x40C00000, 0x40D00000, 0x40E00000, 0x40F00000, // positive
+        0x80000000, 0xBE000000, 0xBE800000, 0xBEC00000, 0xBF000000, 0xBF200000, 0xBF400000, 0xBF600000, // negative
+        0xBF800000, 0xBF900000, 0xBFA00000, 0xBFB00000, 0xBFC00000, 0xBFD00000, 0xBFE00000, 0xBFF00000, // negative
+        0xC0000000, 0xC0100000, 0xC0200000, 0xC0300000, 0xC0400000, 0xC0500000, 0xC0600000, 0xC0700000, // negative
+        0xC0800000, 0xC0900000, 0xC0A00000, 0xC0B00000, 0xC0C00000, 0xC0D00000, 0xC0E00000, 0xC0F00000, // negative
+    };
+    fu32_t conv;
+    conv.u = lut[u8 & 0x3F];
+    return conv.f;
+#endif
+}
+
+/**
+ *  @brief Convenience function to downcast a single-precision value to FP6 E2M3.
+ */
+inline std::uint8_t f32_to_e2m3(float f32) noexcept {
+#if USEARCH_USE_NUMKONG
+    nk_e2m3_t result;
+    nk_f32_to_e2m3_serial((nk_f32_t const*)&f32, &result);
+    return result;
+#else
+    fu32_t conv;
+    conv.f = f32;
+    std::uint32_t sign_bit = conv.u >> 31;
+    std::uint32_t abs_bits = conv.u & 0x7FFFFFFFu;
+    std::uint8_t sign = (std::uint8_t)(sign_bit << 5);
+    if (abs_bits == 0)
+        return sign;
+    float abs_x = sign_bit ? -f32 : f32;
+    // E2M3: bias=1, 2 exp bits, 3 mant bits, max normal = 7.5, min subnormal = 0.125
+    if (abs_x >= 7.5f)
+        return (std::uint8_t)(sign | 0x1Fu); // saturate to max
+    if (abs_x < 0.0625f)
+        return sign; // underflow to zero
+    // Subnormal range: abs_x < 1.0 (min normal = 2^(1-1) = 1.0)
+    if (abs_x < 1.0f) {
+        // Subnormals: value = mant * 2^(-3) = mant/8, so mant = round(abs_x * 8)
+        std::uint32_t mant = (std::uint32_t)(abs_x * 8.0f + 0.5f);
+        if (mant > 7)
+            mant = 7;
+        if (mant == 0)
+            return sign;
+        return (std::uint8_t)(sign | mant);
+    }
+    // Normal range: value = (1 + mant/8) * 2^(exp-1)
+    // Find exponent: exp-1 = floor(log2(abs_x)), so exp = floor(log2(abs_x)) + 1
+    int exp_val;
+    float frac = std::frexp(abs_x, &exp_val); // abs_x = frac * 2^exp_val, frac in [0.5, 1)
+    // frexp returns frac in [0.5, 1), but we want significand in [1, 2)
+    // so significand = frac * 2, and true_exp = exp_val - 1
+    float significand = frac * 2.0f; // [1.0, 2.0)
+    int biased_exp = exp_val;        // exp_val - 1 + bias(1) = exp_val
+    if (biased_exp < 1) {
+        // Fell into subnormal, handled above
+        std::uint32_t mant = (std::uint32_t)(abs_x * 8.0f + 0.5f);
+        if (mant > 7)
+            mant = 7;
+        return (std::uint8_t)(sign | mant);
+    }
+    if (biased_exp > 3)
+        biased_exp = 3; // clamp to max exp
+    // Round mantissa: 3 mant bits, significand in [1, 2)
+    std::uint32_t mant = (std::uint32_t)((significand - 1.0f) * 8.0f + 0.5f);
+    if (mant > 7) {
+        mant = 0;
+        biased_exp++;
+    }
+    if (biased_exp > 3)
+        return (std::uint8_t)(sign | 0x1Fu); // overflow
+    return (std::uint8_t)(sign | (biased_exp << 3) | mant);
+#endif
+}
+
+/**
+ *  @brief Convenience function to upcast an FP6 E3M2 value to single-precision.
+ *         E3M2: 1 sign + 3 exponent (bias=3) + 2 mantissa, stored as 0b00SEEEMM, range +/-28.
+ */
+inline float e3m2_to_f32(std::uint8_t u8) noexcept {
+#if USEARCH_USE_NUMKONG
+    nk_f32_t result;
+    nk_e3m2_to_f32_serial((nk_e3m2_t const*)&u8, &result);
+    return result;
+#else
+    static std::uint32_t const lut[64] = {
+        0x00000000, 0x3D800000, 0x3E000000, 0x3E400000, 0x3E800000, 0x3EA00000, 0x3EC00000, 0x3EE00000, // positive
+        0x3F000000, 0x3F200000, 0x3F400000, 0x3F600000, 0x3F800000, 0x3FA00000, 0x3FC00000, 0x3FE00000, // positive
+        0x40000000, 0x40200000, 0x40400000, 0x40600000, 0x40800000, 0x40A00000, 0x40C00000, 0x40E00000, // positive
+        0x41000000, 0x41200000, 0x41400000, 0x41600000, 0x41800000, 0x41A00000, 0x41C00000, 0x41E00000, // positive
+        0x80000000, 0xBD800000, 0xBE000000, 0xBE400000, 0xBE800000, 0xBEA00000, 0xBEC00000, 0xBEE00000, // negative
+        0xBF000000, 0xBF200000, 0xBF400000, 0xBF600000, 0xBF800000, 0xBFA00000, 0xBFC00000, 0xBFE00000, // negative
+        0xC0000000, 0xC0200000, 0xC0400000, 0xC0600000, 0xC0800000, 0xC0A00000, 0xC0C00000, 0xC0E00000, // negative
+        0xC1000000, 0xC1200000, 0xC1400000, 0xC1600000, 0xC1800000, 0xC1A00000, 0xC1C00000, 0xC1E00000, // negative
+    };
+    fu32_t conv;
+    conv.u = lut[u8 & 0x3F];
+    return conv.f;
+#endif
+}
+
+/**
+ *  @brief Convenience function to downcast a single-precision value to FP6 E3M2.
+ */
+inline std::uint8_t f32_to_e3m2(float f32) noexcept {
+#if USEARCH_USE_NUMKONG
+    nk_e3m2_t result;
+    nk_f32_to_e3m2_serial((nk_f32_t const*)&f32, &result);
+    return result;
+#else
+    fu32_t conv;
+    conv.f = f32;
+    std::uint32_t sign_bit = conv.u >> 31;
+    std::uint32_t abs_bits = conv.u & 0x7FFFFFFFu;
+    std::uint8_t sign = (std::uint8_t)(sign_bit << 5);
+    if (abs_bits == 0)
+        return sign;
+    float abs_x = sign_bit ? -f32 : f32;
+    // E3M2: bias=3, 3 exp bits, 2 mant bits, max normal = 28.0, min subnormal = 0.0625
+    if (abs_x >= 28.0f)
+        return (std::uint8_t)(sign | 0x1Fu); // saturate to max
+    if (abs_x < 0.03125f)
+        return sign; // underflow to zero
+    // Subnormal range: abs_x < 0.25 (min normal = 2^(1-3) = 0.25)
+    if (abs_x < 0.25f) {
+        // Subnormals: value = mant * 2^(-4) = mant/16, so mant = round(abs_x * 16)
+        std::uint32_t mant = (std::uint32_t)(abs_x * 16.0f + 0.5f);
+        if (mant > 3)
+            mant = 3;
+        if (mant == 0)
+            return sign;
+        return (std::uint8_t)(sign | mant);
+    }
+    // Normal range: value = (1 + mant/4) * 2^(exp-3)
+    int exp_val;
+    float frac = std::frexp(abs_x, &exp_val);
+    float significand = frac * 2.0f;
+    int biased_exp = exp_val - 1 + 3; // true_exp = exp_val - 1, biased = true_exp + 3
+    if (biased_exp < 1) {
+        std::uint32_t mant = (std::uint32_t)(abs_x * 16.0f + 0.5f);
+        if (mant > 3)
+            mant = 3;
+        return (std::uint8_t)(sign | mant);
+    }
+    if (biased_exp > 7)
+        biased_exp = 7;
+    std::uint32_t mant = (std::uint32_t)((significand - 1.0f) * 4.0f + 0.5f);
+    if (mant > 3) {
+        mant = 0;
+        biased_exp++;
+    }
+    if (biased_exp > 7)
+        return (std::uint8_t)(sign | 0x1Fu);
+    return (std::uint8_t)(sign | (biased_exp << 2) | mant);
+#endif
+}
+
+/**
+ *  @brief  Numeric type for FP6 E2M3 floating point.
+ *          1 sign + 2 exponent + 3 mantissa bits, stored as 0b00SEEMMM, range +/-7.5.
+ */
+class e2m3_bits_t {
+    std::uint8_t uint8_{};
+
+  public:
+    inline e2m3_bits_t() noexcept : uint8_(0) {}
+    inline e2m3_bits_t(e2m3_bits_t&&) = default;
+    inline e2m3_bits_t& operator=(e2m3_bits_t&&) = default;
+    inline e2m3_bits_t(e2m3_bits_t const&) = default;
+    inline e2m3_bits_t& operator=(e2m3_bits_t const&) = default;
+
+    inline operator float() const noexcept { return e2m3_to_f32(uint8_); }
+    inline explicit operator bool() const noexcept { return e2m3_to_f32(uint8_) > 0.5f; }
+
+    inline e2m3_bits_t(int v) noexcept : uint8_(f32_to_e2m3(static_cast<float>(v))) {}
+    inline e2m3_bits_t(bool v) noexcept : uint8_(f32_to_e2m3(static_cast<float>(v))) {}
+    inline e2m3_bits_t(float v) noexcept : uint8_(f32_to_e2m3(v)) {}
+    inline e2m3_bits_t(double v) noexcept : uint8_(f32_to_e2m3(static_cast<float>(v))) {}
+
+    inline bool operator<(e2m3_bits_t const& other) const noexcept { return float(*this) < float(other); }
+
+    inline e2m3_bits_t operator+(e2m3_bits_t other) const noexcept { return {float(*this) + float(other)}; }
+    inline e2m3_bits_t operator-(e2m3_bits_t other) const noexcept { return {float(*this) - float(other)}; }
+    inline e2m3_bits_t operator*(e2m3_bits_t other) const noexcept { return {float(*this) * float(other)}; }
+    inline e2m3_bits_t operator/(e2m3_bits_t other) const noexcept { return {float(*this) / float(other)}; }
+    inline float operator+(float other) const noexcept { return float(*this) + other; }
+    inline float operator-(float other) const noexcept { return float(*this) - other; }
+    inline float operator*(float other) const noexcept { return float(*this) * other; }
+    inline float operator/(float other) const noexcept { return float(*this) / other; }
+    inline double operator+(double other) const noexcept { return float(*this) + other; }
+    inline double operator-(double other) const noexcept { return float(*this) - other; }
+    inline double operator*(double other) const noexcept { return float(*this) * other; }
+    inline double operator/(double other) const noexcept { return float(*this) / other; }
+
+    inline e2m3_bits_t& operator+=(float v) noexcept {
+        uint8_ = f32_to_e2m3(v + e2m3_to_f32(uint8_));
+        return *this;
+    }
+    inline e2m3_bits_t& operator-=(float v) noexcept {
+        uint8_ = f32_to_e2m3(v - e2m3_to_f32(uint8_));
+        return *this;
+    }
+    inline e2m3_bits_t& operator*=(float v) noexcept {
+        uint8_ = f32_to_e2m3(v * e2m3_to_f32(uint8_));
+        return *this;
+    }
+    inline e2m3_bits_t& operator/=(float v) noexcept {
+        uint8_ = f32_to_e2m3(v / e2m3_to_f32(uint8_));
+        return *this;
+    }
+    inline e2m3_bits_t& operator=(float v) noexcept {
+        uint8_ = f32_to_e2m3(v);
+        return *this;
+    }
+};
+
+/**
+ *  @brief  Numeric type for FP6 E3M2 floating point.
+ *          1 sign + 3 exponent + 2 mantissa bits, stored as 0b00SEEEMM, range +/-28.
+ */
+class e3m2_bits_t {
+    std::uint8_t uint8_{};
+
+  public:
+    inline e3m2_bits_t() noexcept : uint8_(0) {}
+    inline e3m2_bits_t(e3m2_bits_t&&) = default;
+    inline e3m2_bits_t& operator=(e3m2_bits_t&&) = default;
+    inline e3m2_bits_t(e3m2_bits_t const&) = default;
+    inline e3m2_bits_t& operator=(e3m2_bits_t const&) = default;
+
+    inline operator float() const noexcept { return e3m2_to_f32(uint8_); }
+    inline explicit operator bool() const noexcept { return e3m2_to_f32(uint8_) > 0.5f; }
+
+    inline e3m2_bits_t(int v) noexcept : uint8_(f32_to_e3m2(static_cast<float>(v))) {}
+    inline e3m2_bits_t(bool v) noexcept : uint8_(f32_to_e3m2(static_cast<float>(v))) {}
+    inline e3m2_bits_t(float v) noexcept : uint8_(f32_to_e3m2(v)) {}
+    inline e3m2_bits_t(double v) noexcept : uint8_(f32_to_e3m2(static_cast<float>(v))) {}
+
+    inline bool operator<(e3m2_bits_t const& other) const noexcept { return float(*this) < float(other); }
+
+    inline e3m2_bits_t operator+(e3m2_bits_t other) const noexcept { return {float(*this) + float(other)}; }
+    inline e3m2_bits_t operator-(e3m2_bits_t other) const noexcept { return {float(*this) - float(other)}; }
+    inline e3m2_bits_t operator*(e3m2_bits_t other) const noexcept { return {float(*this) * float(other)}; }
+    inline e3m2_bits_t operator/(e3m2_bits_t other) const noexcept { return {float(*this) / float(other)}; }
+    inline float operator+(float other) const noexcept { return float(*this) + other; }
+    inline float operator-(float other) const noexcept { return float(*this) - other; }
+    inline float operator*(float other) const noexcept { return float(*this) * other; }
+    inline float operator/(float other) const noexcept { return float(*this) / other; }
+    inline double operator+(double other) const noexcept { return float(*this) + other; }
+    inline double operator-(double other) const noexcept { return float(*this) - other; }
+    inline double operator*(double other) const noexcept { return float(*this) * other; }
+    inline double operator/(double other) const noexcept { return float(*this) / other; }
+
+    inline e3m2_bits_t& operator+=(float v) noexcept {
+        uint8_ = f32_to_e3m2(v + e3m2_to_f32(uint8_));
+        return *this;
+    }
+    inline e3m2_bits_t& operator-=(float v) noexcept {
+        uint8_ = f32_to_e3m2(v - e3m2_to_f32(uint8_));
+        return *this;
+    }
+    inline e3m2_bits_t& operator*=(float v) noexcept {
+        uint8_ = f32_to_e3m2(v * e3m2_to_f32(uint8_));
+        return *this;
+    }
+    inline e3m2_bits_t& operator/=(float v) noexcept {
+        uint8_ = f32_to_e3m2(v / e3m2_to_f32(uint8_));
+        return *this;
+    }
+    inline e3m2_bits_t& operator=(float v) noexcept {
+        uint8_ = f32_to_e3m2(v);
+        return *this;
+    }
+};
+
+#if USEARCH_USE_OPENMP
+#pragma omp declare reduction(+ : unum::usearch::e5m2_bits_t : omp_out = omp_out + omp_in)                             \
+    initializer(omp_priv = unum::usearch::e5m2_bits_t())
+#pragma omp declare reduction(+ : unum::usearch::e4m3_bits_t : omp_out = omp_out + omp_in)                             \
+    initializer(omp_priv = unum::usearch::e4m3_bits_t())
+#pragma omp declare reduction(+ : unum::usearch::e2m3_bits_t : omp_out = omp_out + omp_in)                             \
+    initializer(omp_priv = unum::usearch::e2m3_bits_t())
+#pragma omp declare reduction(+ : unum::usearch::e3m2_bits_t : omp_out = omp_out + omp_in)                             \
+    initializer(omp_priv = unum::usearch::e3m2_bits_t())
+#endif
+
 /**
  *  @brief  An STL-based executor or a "thread-pool" for parallel execution.
  *          Isn't efficient for small batches, as it recreates the threads on every call.
@@ -382,14 +1353,16 @@ class executor_stl_t {
 
     struct jthread_t {
         std::thread native_;
+        bool initialized_ = false;
 
         jthread_t() = default;
         jthread_t(jthread_t&&) = default;
         jthread_t(jthread_t const&) = delete;
-        template <typename callable_at> jthread_t(callable_at&& func) : native_([=]() { func(); }) {}
+        template <typename callable_at>
+        jthread_t(callable_at&& func) : native_([=]() { func(); }), initialized_(true) {}
 
         ~jthread_t() {
-            if (native_.joinable())
+            if (initialized_ && native_.joinable())
                 native_.join();
         }
     };
@@ -414,13 +1387,16 @@ class executor_stl_t {
      */
     template <typename thread_aware_function_at>
     void fixed(std::size_t tasks, thread_aware_function_at&& thread_aware_function) noexcept(false) {
-        std::vector<jthread_t> threads_pool;
+        buffer_gt<jthread_t> threads_pool(threads_count_ - 1); // Allocate space for threads minus the main thread
         std::size_t tasks_per_thread = tasks;
         std::size_t threads_count = (std::min)(threads_count_, tasks);
         if (threads_count > 1) {
             tasks_per_thread = (tasks / threads_count) + ((tasks % threads_count) != 0);
             for (std::size_t thread_idx = 1; thread_idx < threads_count; ++thread_idx) {
-                threads_pool.emplace_back([=]() {
+                new (&threads_pool[thread_idx - 1]) jthread_t([=]() {
+#if USEARCH_USE_NUMKONG
+                    nk_configure_thread_(nk_capabilities());
+#endif
                     for (std::size_t task_idx = thread_idx * tasks_per_thread;
                          task_idx < (std::min)(tasks, thread_idx * tasks_per_thread + tasks_per_thread); ++task_idx)
                         thread_aware_function(thread_idx, task_idx);
@@ -439,14 +1415,17 @@ class executor_stl_t {
      */
     template <typename thread_aware_function_at>
     void dynamic(std::size_t tasks, thread_aware_function_at&& thread_aware_function) noexcept(false) {
-        std::vector<jthread_t> threads_pool;
+        buffer_gt<jthread_t> threads_pool(threads_count_ - 1);
         std::size_t tasks_per_thread = tasks;
         std::size_t threads_count = (std::min)(threads_count_, tasks);
         std::atomic_bool stop{false};
         if (threads_count > 1) {
             tasks_per_thread = (tasks / threads_count) + ((tasks % threads_count) != 0);
             for (std::size_t thread_idx = 1; thread_idx < threads_count; ++thread_idx) {
-                threads_pool.emplace_back([=, &stop]() {
+                new (&threads_pool[thread_idx - 1]) jthread_t([=, &stop]() {
+#if USEARCH_USE_NUMKONG
+                    nk_configure_thread_(nk_capabilities());
+#endif
                     for (std::size_t task_idx = thread_idx * tasks_per_thread;
                          task_idx < (std::min)(tasks, thread_idx * tasks_per_thread + tasks_per_thread) &&
                          !stop.load(std::memory_order_relaxed);
@@ -471,9 +1450,14 @@ class executor_stl_t {
     void parallel(thread_aware_function_at&& thread_aware_function) noexcept(false) {
         if (threads_count_ == 1)
             return thread_aware_function(0);
-        std::vector<jthread_t> threads_pool;
+        buffer_gt<jthread_t> threads_pool(threads_count_ - 1);
         for (std::size_t thread_idx = 1; thread_idx < threads_count_; ++thread_idx)
-            threads_pool.emplace_back([=]() { thread_aware_function(thread_idx); });
+            new (&threads_pool[thread_idx - 1]) jthread_t([=]() {
+#if USEARCH_USE_NUMKONG
+                nk_configure_thread_(nk_capabilities());
+#endif
+                thread_aware_function(thread_idx);
+            });
         thread_aware_function(0);
     }
 };
@@ -482,7 +1466,7 @@ class executor_stl_t {
 
 /**
  *  @brief  An OpenMP-based executor or a "thread-pool" for parallel execution.
- *          Is the preferred implementation, when available, and maximum performance is needed.
+ *          Is the preferred implementation, when available, and target environment has OpenMP.
  */
 class executor_openmp_t {
   public:
@@ -491,6 +1475,14 @@ class executor_openmp_t {
      */
     executor_openmp_t(std::size_t threads_count = 0) noexcept {
         omp_set_num_threads(static_cast<int>(threads_count ? threads_count : std::thread::hardware_concurrency()));
+#if USEARCH_USE_NUMKONG
+        nk_capability_t caps = nk_capabilities();
+        nk_configure_thread(caps);
+#pragma omp parallel
+        {
+            nk_configure_thread(caps);
+        }
+#endif
     }
 
     /**
@@ -548,7 +1540,9 @@ class executor_openmp_t {
     template <typename thread_aware_function_at>
     void parallel(thread_aware_function_at&& thread_aware_function) noexcept(false) {
 #pragma omp parallel
-        { thread_aware_function(omp_get_thread_num()); }
+        {
+            thread_aware_function(omp_get_thread_num());
+        }
     }
 };
 
@@ -561,7 +1555,8 @@ using executor_default_t = executor_stl_t;
 #endif
 
 /**
- *  @brief Uses OS-specific APIs for aligned memory allocations.
+ *  @brief  Uses OS-specific APIs for aligned memory allocations.
+ *          Available since C11, but only C++17, so we wrap the C version.
  */
 template <typename element_at = char, std::size_t alignment_ak = 64> //
 class aligned_allocator_gt {
@@ -577,15 +1572,24 @@ class aligned_allocator_gt {
     constexpr std::size_t alignment() const { return alignment_ak; }
 
     pointer allocate(size_type length) const {
-        std::size_t length_bytes = alignment_ak * divide_round_up<alignment_ak>(length * sizeof(value_type));
+        checked_size_result_t bytes = checked_mul(length, sizeof(value_type));
+        if (!bytes)
+            return nullptr;
+        checked_size_result_t length_bytes = checked_round_up(bytes.value, alignment_ak);
+        if (!length_bytes)
+            return nullptr;
+
         std::size_t alignment = alignment_ak;
-        // void* result = nullptr;
-        // int status = posix_memalign(&result, alignment, length_bytes);
-        // return status == 0 ? (pointer)result : nullptr;
 #if defined(USEARCH_DEFINED_WINDOWS)
-        return (pointer)_aligned_malloc(length_bytes, alignment);
+        return (pointer)_aligned_malloc(length_bytes.value, alignment);
+#elif defined(USEARCH_DEFINED_APPLE) || defined(USEARCH_DEFINED_ANDROID)
+        // Apple Clang keeps complaining that `aligned_alloc` is only available
+        // with macOS 10.15 and newer or Android API >= 28, so let's use `posix_memalign` there.
+        void* result = nullptr;
+        int status = posix_memalign(&result, alignment, length_bytes.value);
+        return status == 0 ? (pointer)result : nullptr;
 #else
-        return (pointer)aligned_alloc(alignment, length_bytes);
+        return (pointer)aligned_alloc(alignment, length_bytes.value);
 #endif
     }
 
@@ -600,6 +1604,10 @@ class aligned_allocator_gt {
 
 using aligned_allocator_t = aligned_allocator_gt<>;
 
+/**
+ *  @brief  A simple RAM-page allocator that uses the OS-specific APIs for memory allocation.
+ *          Shouldn't be used frequently, as system calls are slow.
+ */
 class page_allocator_t {
   public:
     static constexpr std::size_t page_size() { return 4096; }
@@ -610,11 +1618,15 @@ class page_allocator_t {
      *  @return A pointer to the allocated memory block, or `nullptr` if allocation fails.
      */
     byte_t* allocate(std::size_t count_bytes) const noexcept {
-        count_bytes = divide_round_up(count_bytes, page_size()) * page_size();
+        checked_size_result_t rounded_bytes = checked_round_up(count_bytes, page_size());
+        if (!rounded_bytes)
+            return nullptr;
+        count_bytes = rounded_bytes.value;
 #if defined(USEARCH_DEFINED_WINDOWS)
         return (byte_t*)(::VirtualAlloc(NULL, count_bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
 #else
-        return (byte_t*)mmap(NULL, count_bytes, PROT_WRITE | PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
+        auto* result = mmap(NULL, count_bytes, PROT_WRITE | PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        return (result == MAP_FAILED) ? nullptr : (byte_t*)result;
 #endif
     }
 
@@ -622,7 +1634,10 @@ class page_allocator_t {
 #if defined(USEARCH_DEFINED_WINDOWS)
         ::VirtualFree(page_pointer, 0, MEM_RELEASE);
 #else
-        count_bytes = divide_round_up(count_bytes, page_size()) * page_size();
+        checked_size_result_t rounded_bytes = checked_round_up(count_bytes, page_size());
+        if (!rounded_bytes)
+            return;
+        count_bytes = rounded_bytes.value;
         munmap(page_pointer, count_bytes);
 #endif
     }
@@ -649,6 +1664,7 @@ template <std::size_t alignment_ak = 1> class memory_mapping_allocator_gt {
     std::size_t last_usage_ = head_size();
     std::size_t last_capacity_ = min_capacity();
     std::size_t wasted_space_ = 0;
+    std::size_t total_allocated_ = 0;
 
   public:
     using value_type = byte_t;
@@ -659,13 +1675,15 @@ template <std::size_t alignment_ak = 1> class memory_mapping_allocator_gt {
     memory_mapping_allocator_gt() = default;
     memory_mapping_allocator_gt(memory_mapping_allocator_gt&& other) noexcept
         : last_arena_(exchange(other.last_arena_, nullptr)), last_usage_(exchange(other.last_usage_, 0)),
-          last_capacity_(exchange(other.last_capacity_, 0)), wasted_space_(exchange(other.wasted_space_, 0)) {}
+          last_capacity_(exchange(other.last_capacity_, 0)), wasted_space_(exchange(other.wasted_space_, 0)),
+          total_allocated_(exchange(other.total_allocated_, 0)) {}
 
     memory_mapping_allocator_gt& operator=(memory_mapping_allocator_gt&& other) noexcept {
         std::swap(last_arena_, other.last_arena_);
         std::swap(last_usage_, other.last_usage_);
         std::swap(last_capacity_, other.last_capacity_);
         std::swap(wasted_space_, other.wasted_space_);
+        std::swap(total_allocated_, other.total_allocated_);
         return *this;
     }
 
@@ -690,6 +1708,7 @@ template <std::size_t alignment_ak = 1> class memory_mapping_allocator_gt {
         last_usage_ = head_size();
         last_capacity_ = min_capacity();
         wasted_space_ = 0;
+        total_allocated_ = 0;
     }
 
     /**
@@ -714,41 +1733,46 @@ template <std::size_t alignment_ak = 1> class memory_mapping_allocator_gt {
      *  @return A pointer to the allocated memory block, or `nullptr` if allocation fails.
      */
     inline byte_t* allocate(std::size_t count_bytes) noexcept {
-        std::size_t extended_bytes = divide_round_up<alignment_ak>(count_bytes) * alignment_ak;
+        checked_size_result_t extended_bytes = checked_round_up(count_bytes, alignment_ak);
+        if (!extended_bytes)
+            return nullptr;
         std::unique_lock<std::mutex> lock(mutex_);
-        if (!last_arena_ || (last_usage_ + extended_bytes >= last_capacity_)) {
-            std::size_t new_cap = (std::max)(last_capacity_, ceil2(extended_bytes)) * capacity_multiplier();
-            byte_t* new_arena = page_allocator_t{}.allocate(new_cap);
+        checked_size_result_t next_usage = checked_add(last_usage_, extended_bytes.value);
+        if (!next_usage)
+            return nullptr;
+        if (!last_arena_ || (next_usage.value >= last_capacity_)) {
+            checked_size_result_t rounded_bytes = checked_ceil2(extended_bytes.value);
+            if (!rounded_bytes)
+                return nullptr;
+            checked_size_result_t new_cap =
+                checked_mul((std::max)(last_capacity_, rounded_bytes.value), capacity_multiplier());
+            if (!new_cap)
+                return nullptr;
+            checked_size_result_t new_total_allocated = checked_add(total_allocated_, new_cap.value);
+            if (!new_total_allocated)
+                return nullptr;
+            byte_t* new_arena = page_allocator_t{}.allocate(new_cap.value);
             if (!new_arena)
                 return nullptr;
             std::memcpy(new_arena, &last_arena_, sizeof(byte_t*));
-            std::memcpy(new_arena + sizeof(byte_t*), &new_cap, sizeof(std::size_t));
+            std::memcpy(new_arena + sizeof(byte_t*), &new_cap.value, sizeof(std::size_t));
 
             wasted_space_ += total_reserved();
             last_arena_ = new_arena;
-            last_capacity_ = new_cap;
+            last_capacity_ = new_cap.value;
             last_usage_ = head_size();
+            total_allocated_ = new_total_allocated.value;
         }
 
-        wasted_space_ += extended_bytes - count_bytes;
-        return last_arena_ + exchange(last_usage_, last_usage_ + extended_bytes);
+        wasted_space_ += extended_bytes.value - count_bytes;
+        return last_arena_ + exchange(last_usage_, last_usage_ + extended_bytes.value);
     }
 
     /**
      *  @brief Returns the amount of memory used by the allocator across all arenas.
      *  @return The amount of space in bytes.
      */
-    std::size_t total_allocated() const noexcept {
-        if (!last_arena_)
-            return 0;
-        std::size_t total_used = 0;
-        std::size_t last_capacity = last_capacity_;
-        do {
-            total_used += last_capacity;
-            last_capacity /= capacity_multiplier();
-        } while (last_capacity >= min_capacity());
-        return total_used;
-    }
+    std::size_t total_allocated() const noexcept { return total_allocated_; }
 
     /**
      *  @brief Returns the amount of wasted space due to alignment.
@@ -863,7 +1887,7 @@ template <typename mutex_at = unfair_shared_mutex_t> class shared_lock_gt {
  *          avoiding unnecessary conversions.
  */
 template <typename from_scalar_at, typename to_scalar_at> struct cast_gt {
-    inline bool operator()(byte_t const* input, std::size_t dim, byte_t* output) const {
+    static bool try_(byte_t const* input, std::size_t dim, byte_t* output) noexcept {
         from_scalar_at const* typed_input = reinterpret_cast<from_scalar_at const*>(input);
         to_scalar_at* typed_output = reinterpret_cast<to_scalar_at*>(output);
         auto converter = [](from_scalar_at from) { return to_scalar_at(from); };
@@ -873,29 +1897,38 @@ template <typename from_scalar_at, typename to_scalar_at> struct cast_gt {
 };
 
 template <> struct cast_gt<f32_t, f32_t> {
-    bool operator()(byte_t const*, std::size_t, byte_t*) const { return false; }
+    static bool try_(byte_t const*, std::size_t, byte_t*) noexcept { return false; }
 };
 
 template <> struct cast_gt<f64_t, f64_t> {
-    bool operator()(byte_t const*, std::size_t, byte_t*) const { return false; }
+    static bool try_(byte_t const*, std::size_t, byte_t*) noexcept { return false; }
 };
 
 template <> struct cast_gt<f16_bits_t, f16_bits_t> {
-    bool operator()(byte_t const*, std::size_t, byte_t*) const { return false; }
+    static bool try_(byte_t const*, std::size_t, byte_t*) noexcept { return false; }
+};
+
+template <> struct cast_gt<bf16_bits_t, bf16_bits_t> {
+    static bool try_(byte_t const*, std::size_t, byte_t*) noexcept { return false; }
 };
 
 template <> struct cast_gt<i8_t, i8_t> {
-    bool operator()(byte_t const*, std::size_t, byte_t*) const { return false; }
+    static bool try_(byte_t const*, std::size_t, byte_t*) noexcept { return false; }
+};
+
+template <> struct cast_gt<u8_t, u8_t> {
+    static bool try_(byte_t const*, std::size_t, byte_t*) noexcept { return false; }
 };
 
 template <> struct cast_gt<b1x8_t, b1x8_t> {
-    bool operator()(byte_t const*, std::size_t, byte_t*) const { return false; }
+    static bool try_(byte_t const*, std::size_t, byte_t*) noexcept { return false; }
 };
 
-template <typename from_scalar_at> struct cast_gt<from_scalar_at, b1x8_t> {
-    inline bool operator()(byte_t const* input, std::size_t dim, byte_t* output) const {
+template <typename from_scalar_at> struct cast_to_b1x8_gt {
+    inline static bool try_(byte_t const* input, std::size_t dim, byte_t* output) noexcept {
         from_scalar_at const* typed_input = reinterpret_cast<from_scalar_at const*>(input);
         unsigned char* typed_output = reinterpret_cast<unsigned char*>(output);
+        std::memset(typed_output, 0, dim / CHAR_BIT);
         for (std::size_t i = 0; i != dim; ++i)
             // Converting from scalar types to boolean isn't trivial and depends on the type.
             // The most common case is to consider all positive values as `true` and all others as `false`.
@@ -912,8 +1945,8 @@ template <typename from_scalar_at> struct cast_gt<from_scalar_at, b1x8_t> {
     }
 };
 
-template <typename to_scalar_at> struct cast_gt<b1x8_t, to_scalar_at> {
-    inline bool operator()(byte_t const* input, std::size_t dim, byte_t* output) const {
+template <typename to_scalar_at> struct cast_from_b1x8_gt {
+    static bool try_(byte_t const* input, std::size_t dim, byte_t* output) noexcept {
         unsigned char const* typed_input = reinterpret_cast<unsigned char const*>(input);
         to_scalar_at* typed_output = reinterpret_cast<to_scalar_at*>(output);
         for (std::size_t i = 0; i != dim; ++i)
@@ -924,55 +1957,297 @@ template <typename to_scalar_at> struct cast_gt<b1x8_t, to_scalar_at> {
     }
 };
 
-/**
- *  @brief  Numeric type for uniformly-distributed floating point
- *          values within [-1,1] range, quantized to integers [-100,100].
- */
-class i8_converted_t {
-    std::int8_t int8_{};
-
-  public:
-    constexpr static f32_t divisor_k = 100.f;
-    constexpr static std::int8_t min_k = -100;
-    constexpr static std::int8_t max_k = 100;
-
-    inline i8_converted_t() noexcept : int8_(0) {}
-    inline i8_converted_t(bool v) noexcept : int8_(v ? max_k : 0) {}
-
-    inline i8_converted_t(i8_converted_t&&) = default;
-    inline i8_converted_t& operator=(i8_converted_t&&) = default;
-    inline i8_converted_t(i8_converted_t const&) = default;
-    inline i8_converted_t& operator=(i8_converted_t const&) = default;
-
-    inline operator f16_t() const noexcept { return static_cast<f16_t>(f32_t(int8_) / divisor_k); }
-    inline operator f32_t() const noexcept { return f32_t(int8_) / divisor_k; }
-    inline operator f64_t() const noexcept { return f64_t(int8_) / divisor_k; }
-    inline explicit operator bool() const noexcept { return int8_ > (max_k / 2); }
-    inline explicit operator std::int8_t() const noexcept { return int8_; }
-    inline explicit operator std::int16_t() const noexcept { return int8_; }
-    inline explicit operator std::int32_t() const noexcept { return int8_; }
-    inline explicit operator std::int64_t() const noexcept { return int8_; }
-
-    inline i8_converted_t(f16_t v)
-        : int8_(usearch::clamp<std::int8_t>(static_cast<std::int8_t>(v * divisor_k), min_k, max_k)) {}
-    inline i8_converted_t(f32_t v)
-        : int8_(usearch::clamp<std::int8_t>(static_cast<std::int8_t>(v * divisor_k), min_k, max_k)) {}
-    inline i8_converted_t(f64_t v)
-        : int8_(usearch::clamp<std::int8_t>(static_cast<std::int8_t>(v * divisor_k), min_k, max_k)) {}
+template <typename from_scalar_at> struct cast_to_i8_gt {
+    inline static bool try_(byte_t const* input, std::size_t dim, byte_t* output) noexcept {
+        from_scalar_at const* typed_input = reinterpret_cast<from_scalar_at const*>(input);
+        std::int8_t* typed_output = reinterpret_cast<std::int8_t*>(output);
+        // Unlike other casting mechanisms, switching to small range integers is a two step procedure.
+        // First we want to estimate the magnitude of the vector to scale into [-1.0, 1.0] interval,
+        // instead of clamping. And then we scale the values into the [-127, 127] range.
+        // ! This makes an assumption, that the distance metric is dot-product-like, which may not
+        // ! be true in many cases, so it's recommended to avoid automatic casting from floats to
+        // ! integers.
+        double magnitude = 0.0;
+        for (std::size_t i = 0; i != dim; ++i)
+            magnitude += (double)typed_input[i] * (double)typed_input[i];
+        magnitude = std::sqrt(magnitude);
+        // `!(x > 0)` also catches NaN; cast-to-int of NaN is UB.
+        if (!(magnitude > 0.0)) {
+            std::fill_n(typed_output, dim, std::int8_t{0});
+            return true;
+        }
+        for (std::size_t i = 0; i != dim; ++i)
+            typed_output[i] =
+                static_cast<std::int8_t>(usearch::clamp<double>(typed_input[i] * 127.0 / magnitude, -127.0, 127.0));
+        return true;
+    }
 };
 
-f16_bits_t::f16_bits_t(i8_converted_t v) noexcept : uint16_(f32_to_f16(v)) {}
+template <typename to_scalar_at> struct cast_from_i8_gt {
+    static bool try_(byte_t const* input, std::size_t dim, byte_t* output) noexcept {
+        std::int8_t const* typed_input = reinterpret_cast<std::int8_t const*>(input);
+        to_scalar_at* typed_output = reinterpret_cast<to_scalar_at*>(output);
+        for (std::size_t i = 0; i != dim; ++i)
+            typed_output[i] = static_cast<to_scalar_at>(typed_input[i]) / 127.f;
+        return true;
+    }
+};
 
-template <> struct cast_gt<i8_t, f16_t> : public cast_gt<i8_converted_t, f16_t> {};
-template <> struct cast_gt<i8_t, f32_t> : public cast_gt<i8_converted_t, f32_t> {};
-template <> struct cast_gt<i8_t, f64_t> : public cast_gt<i8_converted_t, f64_t> {};
+template <typename from_scalar_at> struct cast_to_u8_gt {
+    inline static bool try_(byte_t const* input, std::size_t dim, byte_t* output) noexcept {
+        from_scalar_at const* typed_input = reinterpret_cast<from_scalar_at const*>(input);
+        std::uint8_t* typed_output = reinterpret_cast<std::uint8_t*>(output);
+        double magnitude = 0.0;
+        for (std::size_t i = 0; i != dim; ++i)
+            magnitude += (double)typed_input[i] * (double)typed_input[i];
+        magnitude = std::sqrt(magnitude);
+        // `!(x > 0)` also catches NaN; cast-to-int of NaN is UB.
+        if (!(magnitude > 0.0)) {
+            std::fill_n(typed_output, dim, std::uint8_t{0});
+            return true;
+        }
+        for (std::size_t i = 0; i != dim; ++i)
+            typed_output[i] =
+                static_cast<std::uint8_t>(usearch::clamp<double>(typed_input[i] * 255.0 / magnitude, 0.0, 255.0));
+        return true;
+    }
+};
 
-template <> struct cast_gt<f16_t, i8_t> : public cast_gt<f16_t, i8_converted_t> {};
-template <> struct cast_gt<f32_t, i8_t> : public cast_gt<f32_t, i8_converted_t> {};
-template <> struct cast_gt<f64_t, i8_t> : public cast_gt<f64_t, i8_converted_t> {};
+template <typename to_scalar_at> struct cast_from_u8_gt {
+    static bool try_(byte_t const* input, std::size_t dim, byte_t* output) noexcept {
+        std::uint8_t const* typed_input = reinterpret_cast<std::uint8_t const*>(input);
+        to_scalar_at* typed_output = reinterpret_cast<to_scalar_at*>(output);
+        for (std::size_t i = 0; i != dim; ++i)
+            typed_output[i] = static_cast<to_scalar_at>(typed_input[i]) / 255.f;
+        return true;
+    }
+};
+
+template <> struct cast_gt<i8_t, f16_bits_t> : public cast_from_i8_gt<f16_t> {};
+template <> struct cast_gt<i8_t, bf16_bits_t> : public cast_from_i8_gt<bf16_t> {};
+template <> struct cast_gt<i8_t, f32_t> : public cast_from_i8_gt<f32_t> {};
+template <> struct cast_gt<i8_t, f64_t> : public cast_from_i8_gt<f64_t> {};
+
+template <> struct cast_gt<f16_bits_t, i8_t> : public cast_to_i8_gt<f16_t> {};
+template <> struct cast_gt<bf16_bits_t, i8_t> : public cast_to_i8_gt<bf16_t> {};
+template <> struct cast_gt<f32_t, i8_t> : public cast_to_i8_gt<f32_t> {};
+template <> struct cast_gt<f64_t, i8_t> : public cast_to_i8_gt<f64_t> {};
+
+template <> struct cast_gt<b1x8_t, f16_bits_t> : public cast_from_b1x8_gt<f16_t> {};
+template <> struct cast_gt<b1x8_t, bf16_bits_t> : public cast_from_b1x8_gt<bf16_t> {};
+template <> struct cast_gt<b1x8_t, f32_t> : public cast_from_b1x8_gt<f32_t> {};
+template <> struct cast_gt<b1x8_t, f64_t> : public cast_from_b1x8_gt<f64_t> {};
+
+template <> struct cast_gt<f16_bits_t, b1x8_t> : public cast_to_b1x8_gt<f16_t> {};
+template <> struct cast_gt<bf16_bits_t, b1x8_t> : public cast_to_b1x8_gt<bf16_t> {};
+template <> struct cast_gt<f32_t, b1x8_t> : public cast_to_b1x8_gt<f32_t> {};
+template <> struct cast_gt<f64_t, b1x8_t> : public cast_to_b1x8_gt<f64_t> {};
+
+template <> struct cast_gt<b1x8_t, i8_t> : public cast_from_b1x8_gt<i8_t> {};
+template <> struct cast_gt<i8_t, b1x8_t> : public cast_to_b1x8_gt<i8_t> {};
+
+template <typename from_at, typename to_at> struct cast_through_f32_gt {
+    static bool try_(byte_t const* input, std::size_t dim, byte_t* output) noexcept {
+        from_at const* in = reinterpret_cast<from_at const*>(input);
+        to_at* out = reinterpret_cast<to_at*>(output);
+        for (std::size_t i = 0; i != dim; ++i)
+            out[i] = to_at(float(in[i]));
+        return true;
+    }
+};
+
+template <> struct cast_gt<e5m2_bits_t, e5m2_bits_t> {
+    static bool try_(byte_t const*, std::size_t, byte_t*) noexcept { return false; }
+};
+template <> struct cast_gt<e5m2_bits_t, f32_t> : public cast_through_f32_gt<e5m2_t, f32_t> {};
+template <> struct cast_gt<f32_t, e5m2_bits_t> : public cast_through_f32_gt<f32_t, e5m2_t> {};
+template <> struct cast_gt<e5m2_bits_t, f64_t> : public cast_through_f32_gt<e5m2_t, f64_t> {};
+template <> struct cast_gt<f64_t, e5m2_bits_t> : public cast_through_f32_gt<f64_t, e5m2_t> {};
+template <> struct cast_gt<e5m2_bits_t, f16_bits_t> : public cast_through_f32_gt<e5m2_t, f16_t> {};
+template <> struct cast_gt<f16_bits_t, e5m2_bits_t> : public cast_through_f32_gt<f16_t, e5m2_t> {};
+template <> struct cast_gt<e5m2_bits_t, bf16_bits_t> : public cast_through_f32_gt<e5m2_t, bf16_t> {};
+template <> struct cast_gt<bf16_bits_t, e5m2_bits_t> : public cast_through_f32_gt<bf16_t, e5m2_t> {};
+template <> struct cast_gt<e5m2_bits_t, i8_t> : public cast_to_i8_gt<e5m2_t> {};
+template <> struct cast_gt<i8_t, e5m2_bits_t> : public cast_from_i8_gt<e5m2_t> {};
+template <> struct cast_gt<e5m2_bits_t, b1x8_t> : public cast_to_b1x8_gt<e5m2_t> {};
+template <> struct cast_gt<b1x8_t, e5m2_bits_t> : public cast_from_b1x8_gt<e5m2_t> {};
+
+template <> struct cast_gt<e4m3_bits_t, e4m3_bits_t> {
+    static bool try_(byte_t const*, std::size_t, byte_t*) noexcept { return false; }
+};
+template <> struct cast_gt<e4m3_bits_t, f32_t> : public cast_through_f32_gt<e4m3_t, f32_t> {};
+template <> struct cast_gt<f32_t, e4m3_bits_t> : public cast_through_f32_gt<f32_t, e4m3_t> {};
+template <> struct cast_gt<e4m3_bits_t, f64_t> : public cast_through_f32_gt<e4m3_t, f64_t> {};
+template <> struct cast_gt<f64_t, e4m3_bits_t> : public cast_through_f32_gt<f64_t, e4m3_t> {};
+template <> struct cast_gt<e4m3_bits_t, f16_bits_t> : public cast_through_f32_gt<e4m3_t, f16_t> {};
+template <> struct cast_gt<f16_bits_t, e4m3_bits_t> : public cast_through_f32_gt<f16_t, e4m3_t> {};
+template <> struct cast_gt<e4m3_bits_t, bf16_bits_t> : public cast_through_f32_gt<e4m3_t, bf16_t> {};
+template <> struct cast_gt<bf16_bits_t, e4m3_bits_t> : public cast_through_f32_gt<bf16_t, e4m3_t> {};
+template <> struct cast_gt<e4m3_bits_t, i8_t> : public cast_to_i8_gt<e4m3_t> {};
+template <> struct cast_gt<i8_t, e4m3_bits_t> : public cast_from_i8_gt<e4m3_t> {};
+template <> struct cast_gt<e4m3_bits_t, b1x8_t> : public cast_to_b1x8_gt<e4m3_t> {};
+template <> struct cast_gt<b1x8_t, e4m3_bits_t> : public cast_from_b1x8_gt<e4m3_t> {};
+
+template <> struct cast_gt<e2m3_bits_t, e2m3_bits_t> {
+    static bool try_(byte_t const*, std::size_t, byte_t*) noexcept { return false; }
+};
+template <> struct cast_gt<e2m3_bits_t, f32_t> : public cast_through_f32_gt<e2m3_t, f32_t> {};
+template <> struct cast_gt<f32_t, e2m3_bits_t> : public cast_through_f32_gt<f32_t, e2m3_t> {};
+template <> struct cast_gt<e2m3_bits_t, f64_t> : public cast_through_f32_gt<e2m3_t, f64_t> {};
+template <> struct cast_gt<f64_t, e2m3_bits_t> : public cast_through_f32_gt<f64_t, e2m3_t> {};
+template <> struct cast_gt<e2m3_bits_t, f16_bits_t> : public cast_through_f32_gt<e2m3_t, f16_t> {};
+template <> struct cast_gt<f16_bits_t, e2m3_bits_t> : public cast_through_f32_gt<f16_t, e2m3_t> {};
+template <> struct cast_gt<e2m3_bits_t, bf16_bits_t> : public cast_through_f32_gt<e2m3_t, bf16_t> {};
+template <> struct cast_gt<bf16_bits_t, e2m3_bits_t> : public cast_through_f32_gt<bf16_t, e2m3_t> {};
+template <> struct cast_gt<e2m3_bits_t, i8_t> : public cast_to_i8_gt<e2m3_t> {};
+template <> struct cast_gt<i8_t, e2m3_bits_t> : public cast_from_i8_gt<e2m3_t> {};
+template <> struct cast_gt<e2m3_bits_t, b1x8_t> : public cast_to_b1x8_gt<e2m3_t> {};
+template <> struct cast_gt<b1x8_t, e2m3_bits_t> : public cast_from_b1x8_gt<e2m3_t> {};
+
+template <> struct cast_gt<e3m2_bits_t, e3m2_bits_t> {
+    static bool try_(byte_t const*, std::size_t, byte_t*) noexcept { return false; }
+};
+template <> struct cast_gt<e3m2_bits_t, f32_t> : public cast_through_f32_gt<e3m2_t, f32_t> {};
+template <> struct cast_gt<f32_t, e3m2_bits_t> : public cast_through_f32_gt<f32_t, e3m2_t> {};
+template <> struct cast_gt<e3m2_bits_t, f64_t> : public cast_through_f32_gt<e3m2_t, f64_t> {};
+template <> struct cast_gt<f64_t, e3m2_bits_t> : public cast_through_f32_gt<f64_t, e3m2_t> {};
+template <> struct cast_gt<e3m2_bits_t, f16_bits_t> : public cast_through_f32_gt<e3m2_t, f16_t> {};
+template <> struct cast_gt<f16_bits_t, e3m2_bits_t> : public cast_through_f32_gt<f16_t, e3m2_t> {};
+template <> struct cast_gt<e3m2_bits_t, bf16_bits_t> : public cast_through_f32_gt<e3m2_t, bf16_t> {};
+template <> struct cast_gt<bf16_bits_t, e3m2_bits_t> : public cast_through_f32_gt<bf16_t, e3m2_t> {};
+template <> struct cast_gt<e3m2_bits_t, i8_t> : public cast_to_i8_gt<e3m2_t> {};
+template <> struct cast_gt<i8_t, e3m2_bits_t> : public cast_from_i8_gt<e3m2_t> {};
+template <> struct cast_gt<e3m2_bits_t, b1x8_t> : public cast_to_b1x8_gt<e3m2_t> {};
+template <> struct cast_gt<b1x8_t, e3m2_bits_t> : public cast_from_b1x8_gt<e3m2_t> {};
+
+template <> struct cast_gt<u8_t, f16_bits_t> : public cast_from_u8_gt<f16_t> {};
+template <> struct cast_gt<u8_t, bf16_bits_t> : public cast_from_u8_gt<bf16_t> {};
+template <> struct cast_gt<u8_t, f32_t> : public cast_from_u8_gt<f32_t> {};
+template <> struct cast_gt<u8_t, f64_t> : public cast_from_u8_gt<f64_t> {};
+template <> struct cast_gt<f16_bits_t, u8_t> : public cast_to_u8_gt<f16_t> {};
+template <> struct cast_gt<bf16_bits_t, u8_t> : public cast_to_u8_gt<bf16_t> {};
+template <> struct cast_gt<f32_t, u8_t> : public cast_to_u8_gt<f32_t> {};
+template <> struct cast_gt<f64_t, u8_t> : public cast_to_u8_gt<f64_t> {};
+template <> struct cast_gt<b1x8_t, u8_t> : public cast_from_b1x8_gt<u8_t> {};
+template <> struct cast_gt<u8_t, b1x8_t> : public cast_to_b1x8_gt<u8_t> {};
+template <> struct cast_gt<e5m2_bits_t, u8_t> : public cast_to_u8_gt<e5m2_t> {};
+template <> struct cast_gt<u8_t, e5m2_bits_t> : public cast_from_u8_gt<e5m2_t> {};
+template <> struct cast_gt<e4m3_bits_t, u8_t> : public cast_to_u8_gt<e4m3_t> {};
+template <> struct cast_gt<u8_t, e4m3_bits_t> : public cast_from_u8_gt<e4m3_t> {};
+template <> struct cast_gt<e2m3_bits_t, u8_t> : public cast_to_u8_gt<e2m3_t> {};
+template <> struct cast_gt<u8_t, e2m3_bits_t> : public cast_from_u8_gt<e2m3_t> {};
+template <> struct cast_gt<e3m2_bits_t, u8_t> : public cast_to_u8_gt<e3m2_t> {};
+template <> struct cast_gt<u8_t, e3m2_bits_t> : public cast_from_u8_gt<e3m2_t> {};
+template <> struct cast_gt<i8_t, u8_t> : public cast_to_u8_gt<i8_t> {};
+template <> struct cast_gt<u8_t, i8_t> : public cast_from_u8_gt<i8_t> {};
+
+/**
+ *  @brief  Type-punned array casting function.
+ *          Arguments: input buffer, bytes in input buffer, output buffer.
+ *          Returns `true` if the casting was performed successfully, `false` otherwise.
+ */
+using cast_punned_t = bool (*)(byte_t const*, std::size_t, byte_t*);
+
+/**
+ *  @brief  A collection of casting functions for typical vector types.
+ *          Covers to/from conversions for boolean, integer, half-precision,
+ *          single-precision, and double-precision scalars.
+ */
+struct casts_punned_t {
+    struct group_t {
+        cast_punned_t f64{};
+        cast_punned_t f32{};
+        cast_punned_t bf16{};
+        cast_punned_t f16{};
+        cast_punned_t e5m2{};
+        cast_punned_t e4m3{};
+        cast_punned_t e3m2{};
+        cast_punned_t e2m3{};
+        cast_punned_t i8{};
+        cast_punned_t u8{};
+        cast_punned_t b1x8{};
+
+        cast_punned_t operator[](scalar_kind_t scalar_kind) const noexcept {
+            switch (scalar_kind) {
+            case scalar_kind_t::f64_k: return f64;
+            case scalar_kind_t::f32_k: return f32;
+            case scalar_kind_t::bf16_k: return bf16;
+            case scalar_kind_t::f16_k: return f16;
+            case scalar_kind_t::e5m2_k: return e5m2;
+            case scalar_kind_t::e4m3_k: return e4m3;
+            case scalar_kind_t::e3m2_k: return e3m2;
+            case scalar_kind_t::e2m3_k: return e2m3;
+            case scalar_kind_t::i8_k: return i8;
+            case scalar_kind_t::u8_k: return u8;
+            case scalar_kind_t::b1x8_k: return b1x8;
+            default: return nullptr;
+            }
+        }
+
+    } from, to;
+
+    template <typename scalar_at> static casts_punned_t make() noexcept {
+        casts_punned_t result;
+
+        result.from.f64 = &cast_gt<f64_t, scalar_at>::try_;
+        result.from.f32 = &cast_gt<f32_t, scalar_at>::try_;
+        result.from.bf16 = &cast_gt<bf16_t, scalar_at>::try_;
+        result.from.f16 = &cast_gt<f16_t, scalar_at>::try_;
+        result.from.e5m2 = &cast_gt<e5m2_t, scalar_at>::try_;
+        result.from.e4m3 = &cast_gt<e4m3_t, scalar_at>::try_;
+        result.from.e3m2 = &cast_gt<e3m2_t, scalar_at>::try_;
+        result.from.e2m3 = &cast_gt<e2m3_t, scalar_at>::try_;
+        result.from.i8 = &cast_gt<i8_t, scalar_at>::try_;
+        result.from.u8 = &cast_gt<u8_t, scalar_at>::try_;
+        result.from.b1x8 = &cast_gt<b1x8_t, scalar_at>::try_;
+
+        result.to.f64 = &cast_gt<scalar_at, f64_t>::try_;
+        result.to.f32 = &cast_gt<scalar_at, f32_t>::try_;
+        result.to.bf16 = &cast_gt<scalar_at, bf16_t>::try_;
+        result.to.f16 = &cast_gt<scalar_at, f16_t>::try_;
+        result.to.e5m2 = &cast_gt<scalar_at, e5m2_t>::try_;
+        result.to.e4m3 = &cast_gt<scalar_at, e4m3_t>::try_;
+        result.to.e3m2 = &cast_gt<scalar_at, e3m2_t>::try_;
+        result.to.e2m3 = &cast_gt<scalar_at, e2m3_t>::try_;
+        result.to.i8 = &cast_gt<scalar_at, i8_t>::try_;
+        result.to.u8 = &cast_gt<scalar_at, u8_t>::try_;
+        result.to.b1x8 = &cast_gt<scalar_at, b1x8_t>::try_;
+
+        return result;
+    }
+
+    static casts_punned_t make(scalar_kind_t scalar_kind) noexcept {
+        switch (scalar_kind) {
+        case scalar_kind_t::f64_k: return casts_punned_t::make<f64_t>();
+        case scalar_kind_t::f32_k: return casts_punned_t::make<f32_t>();
+        case scalar_kind_t::bf16_k: return casts_punned_t::make<bf16_t>();
+        case scalar_kind_t::f16_k: return casts_punned_t::make<f16_t>();
+        case scalar_kind_t::e5m2_k: return casts_punned_t::make<e5m2_t>();
+        case scalar_kind_t::e4m3_k: return casts_punned_t::make<e4m3_t>();
+        case scalar_kind_t::e3m2_k: return casts_punned_t::make<e3m2_t>();
+        case scalar_kind_t::e2m3_k: return casts_punned_t::make<e2m3_t>();
+        case scalar_kind_t::i8_k: return casts_punned_t::make<i8_t>();
+        case scalar_kind_t::u8_k: return casts_punned_t::make<u8_t>();
+        case scalar_kind_t::b1x8_k: return casts_punned_t::make<b1x8_t>();
+        default: return {};
+        }
+    }
+};
+
+/*  Don't complain if the vectorization of the inner loops fails:
+ *
+ *  > warning: loop not vectorized: the optimizer was unable to perform the requested transformation;
+ *  > the transformation might be disabled or specified as part of an unsupported transformation ordering
+ */
+#if defined(USEARCH_DEFINED_CLANG)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wpass-failed"
+#endif
 
 /**
  *  @brief  Inner (Dot) Product distance.
+ *          Vectors should be normalized to unit length,
+ *          otherwise `::metric_cos_gt` should be used instead.
  */
 template <typename scalar_at = float, typename result_at = scalar_at> struct metric_ip_gt {
     using scalar_t = scalar_at;
@@ -1207,7 +2482,8 @@ template <typename scalar_at = float, typename result_at = float> struct metric_
             b_sq_sum += bi * bi;
         }
         result_t denom = (dim * a_sq_sum - a_sum * a_sum) * (dim * b_sq_sum - b_sum * b_sum);
-        if (denom == 0)
+        // could be negative
+        if (denom <= 0)
             return 0;
         result_t corr = dim * ab_sum - a_sum * b_sum;
         denom = std::sqrt(denom);
@@ -1245,7 +2521,10 @@ template <typename scalar_at = float, typename result_at = float> struct metric_
     }
 };
 
-struct cos_i8_t {
+/**
+ *  @brief  Cosine (Angular) distance for signed 8-bit integers using 16-bit intermediates.
+ */
+struct metric_cos_i8_t {
     using scalar_t = i8_t;
     using result_t = f32_t;
 
@@ -1271,7 +2550,11 @@ struct cos_i8_t {
     }
 };
 
-struct l2sq_i8_t {
+/**
+ *  @brief  Squared Euclidean (L2) distance for signed 8-bit integers using 16-bit intermediates.
+ *          Square root is avoided at the end, as it won't affect the ordering.
+ */
+struct metric_l2sq_i8_t {
     using scalar_t = i8_t;
     using result_t = f32_t;
 
@@ -1286,6 +2569,57 @@ struct l2sq_i8_t {
 #endif
         for (std::size_t i = 0; i != dim; i++)
             ab_deltas_sq += square(std::int16_t(a[i]) - std::int16_t(b[i]));
+        return static_cast<result_t>(ab_deltas_sq);
+    }
+};
+
+/**
+ *  @brief  Cosine (Angular) distance for unsigned 8-bit integers using 32-bit intermediates.
+ */
+struct metric_cos_u8_t {
+    using scalar_t = u8_t;
+    using result_t = f32_t;
+
+    inline result_t operator()(u8_t const* a, u8_t const* b, std::size_t dim) const noexcept {
+        std::int64_t ab{}, a2{}, b2{};
+#if USEARCH_USE_OPENMP
+#pragma omp simd reduction(+ : ab, a2, b2)
+#elif defined(USEARCH_DEFINED_CLANG)
+#pragma clang loop vectorize(enable)
+#elif defined(USEARCH_DEFINED_GCC)
+#pragma GCC ivdep
+#endif
+        for (std::size_t i = 0; i != dim; i++) {
+            std::int32_t ai{a[i]};
+            std::int32_t bi{b[i]};
+            ab += ai * bi;
+            a2 += square(ai);
+            b2 += square(bi);
+        }
+        result_t a2f = std::sqrt(static_cast<result_t>(a2));
+        result_t b2f = std::sqrt(static_cast<result_t>(b2));
+        return (ab != 0) ? (1.f - ab / (a2f * b2f)) : 0;
+    }
+};
+
+/**
+ *  @brief  Squared Euclidean (L2) distance for unsigned 8-bit integers using 32-bit intermediates.
+ */
+struct metric_l2sq_u8_t {
+    using scalar_t = u8_t;
+    using result_t = f32_t;
+
+    inline result_t operator()(u8_t const* a, u8_t const* b, std::size_t dim) const noexcept {
+        std::int32_t ab_deltas_sq{};
+#if USEARCH_USE_OPENMP
+#pragma omp simd reduction(+ : ab_deltas_sq)
+#elif defined(USEARCH_DEFINED_CLANG)
+#pragma clang loop vectorize(enable)
+#elif defined(USEARCH_DEFINED_GCC)
+#pragma GCC ivdep
+#endif
+        for (std::size_t i = 0; i != dim; i++)
+            ab_deltas_sq += square(std::int32_t(a[i]) - std::int32_t(b[i]));
         return static_cast<result_t>(ab_deltas_sq);
     }
 };
@@ -1331,10 +2665,193 @@ enum class metric_punned_signature_t {
     array_array_state_k,
 };
 
+#if USEARCH_USE_NUMKONG
+
+/**
+ *  @brief  Returns the result of `nk_capabilities()`, cached in a function-local static.
+ *          Every call-site that needs the current CPU's capability mask should use this
+ *          instead of caching the value in its own `static` local.
+ */
+inline nk_capability_t nk_cached_capabilities() noexcept {
+    static nk_capability_t caps = [] {
+        nk_capability_t c = nk_capabilities();
+        nk_configure_thread(c);
+        return c;
+    }();
+    return caps;
+}
+
+/**
+ *  @brief  Converts a USearch `scalar_kind_t` to the corresponding NumKong `nk_dtype_t`.
+ *  @return The matching dtype, or `(nk_dtype_t)0` when there is no NumKong equivalent.
+ */
+inline nk_dtype_t scalar_kind_to_nk_dtype(scalar_kind_t sk) noexcept {
+    switch (sk) {
+    case scalar_kind_t::f64_k: return (nk_dtype_t)nk_f64_k;
+    case scalar_kind_t::f32_k: return (nk_dtype_t)nk_f32_k;
+    case scalar_kind_t::bf16_k: return (nk_dtype_t)nk_bf16_k;
+    case scalar_kind_t::f16_k: return (nk_dtype_t)nk_f16_k;
+    case scalar_kind_t::e5m2_k: return (nk_dtype_t)nk_e5m2_k;
+    case scalar_kind_t::e4m3_k: return (nk_dtype_t)nk_e4m3_k;
+    case scalar_kind_t::e3m2_k: return (nk_dtype_t)nk_e3m2_k;
+    case scalar_kind_t::e2m3_k: return (nk_dtype_t)nk_e2m3_k;
+    case scalar_kind_t::i8_k: return (nk_dtype_t)nk_i8_k;
+    case scalar_kind_t::u8_k: return (nk_dtype_t)nk_u8_k;
+    case scalar_kind_t::b1x8_k: return (nk_dtype_t)nk_u1_k;
+    default: return (nk_dtype_t)0;
+    }
+}
+
+/**
+ *  @brief  One entry in the ISA capability-to-name mapping table.
+ */
+struct isa_target_t {
+    nk_capability_t cap;
+    char const* name;
+};
+
+/**
+ *  @brief  Returns the static table mapping each NumKong capability bit to its human-readable name.
+ *          Both `hardware_acceleration_available` and `hardware_acceleration_compiled` use this table
+ *          together with the bitmasks from `nk_capabilities_available()` / `nk_capabilities_compiled()`.
+ */
+inline span_gt<isa_target_t const> isa_targets() noexcept {
+    static isa_target_t const table[] = {
+        {nk_cap_serial_k, "serial"},
+        // x86
+        {nk_cap_haswell_k, "haswell"},
+        {nk_cap_skylake_k, "skylake"},
+        {nk_cap_icelake_k, "icelake"},
+        {nk_cap_genoa_k, "genoa"},
+        {nk_cap_sapphire_k, "sapphire"},
+        {nk_cap_sapphireamx_k, "sapphireamx"},
+        {nk_cap_graniteamx_k, "graniteamx"},
+        {nk_cap_turin_k, "turin"},
+        {nk_cap_sierra_k, "sierra"},
+        {nk_cap_alder_k, "alder"},
+        {nk_cap_diamond_k, "diamond"},
+        // ARM NEON
+        {nk_cap_neon_k, "neon"},
+        {nk_cap_neonhalf_k, "neonhalf"},
+        {nk_cap_neonsdot_k, "neonsdot"},
+        {nk_cap_neonbfdot_k, "neonbfdot"},
+        {nk_cap_neonfhm_k, "neonfhm"},
+        {nk_cap_neonfp8_k, "neonfp8"},
+        // ARM SVE
+        {nk_cap_sve_k, "sve"},
+        {nk_cap_svehalf_k, "svehalf"},
+        {nk_cap_svesdot_k, "svesdot"},
+        {nk_cap_svebfdot_k, "svebfdot"},
+        {nk_cap_sve2_k, "sve2"},
+        {nk_cap_sve2p1_k, "sve2p1"},
+        // ARM SME
+        {nk_cap_sme_k, "sme"},
+        {nk_cap_sme2_k, "sme2"},
+        {nk_cap_sme2p1_k, "sme2p1"},
+        {nk_cap_smef64_k, "smef64"},
+        {nk_cap_smefa64_k, "smefa64"},
+        {nk_cap_smehalf_k, "smehalf"},
+        {nk_cap_smebf16_k, "smebf16"},
+        {nk_cap_smelut2_k, "smelut2"},
+        {nk_cap_smebi32_k, "smebi32"},
+        // RISC-V
+        {nk_cap_rvv_k, "rvv"},
+        {nk_cap_rvvhalf_k, "rvvhalf"},
+        {nk_cap_rvvbf16_k, "rvvbf16"},
+        {nk_cap_rvvbb_k, "rvvbb"},
+        // WebAssembly
+        {nk_cap_v128relaxed_k, "v128relaxed"},
+        // LoongArch
+        {nk_cap_loongsonasx_k, "loongsonasx"},
+        // IBM Power
+        {nk_cap_powervsx_k, "powervsx"},
+    };
+    return {table, sizeof(table) / sizeof(table[0])};
+}
+
+/**
+ *  @brief  Returns the human-readable name for a single capability bit.
+ *  @param  cap  A single `nk_capability_t` bit (not a bitmask of multiple capabilities).
+ *  @return The name string, or "unknown" if the bit is not in the table.
+ */
+inline char const* capability_name(nk_capability_t cap) noexcept {
+    span_gt<isa_target_t const> table = isa_targets();
+    for (std::size_t i = 0; i != table.size(); ++i)
+        if (table[i].cap == cap)
+            return table[i].name;
+    return "unknown";
+}
+
+/**
+ *  @brief  Formats all ISA targets whose bits are set in `caps` into a comma-separated string.
+ *  @param  caps    Capability bitmask to filter against.
+ *  @param  buf     Output buffer.
+ *  @param  buf_len Size of the output buffer in bytes.
+ *  @return The number of characters written (excluding the null terminator).
+ */
+inline std::size_t isa_targets_format(nk_capability_t caps, char* buf, std::size_t buf_len) noexcept {
+    if (!buf_len)
+        return 0;
+    span_gt<isa_target_t const> table = isa_targets();
+    char* p = buf;
+    char* end = buf + buf_len - 1;
+    std::size_t matched = 0;
+    for (std::size_t i = 0; i != table.size(); ++i) {
+        if (!(caps & table[i].cap))
+            continue;
+        std::size_t name_len = std::strlen(table[i].name);
+        std::size_t needed = name_len + (matched ? 2 : 0);
+        if (p + needed > end)
+            break;
+        if (matched++)
+            *p++ = ',', *p++ = ' ';
+        std::memcpy(p, table[i].name, name_len);
+        p += name_len;
+    }
+    *p = '\0';
+    return static_cast<std::size_t>(p - buf);
+}
+
+/**
+ *  @brief  Returns a comma-separated list of ISAs available at runtime (compiled AND supported by CPU).
+ *  @return Pointer to a static null-terminated string. Thread-safe after first call.
+ */
+inline char const* hardware_acceleration_available() noexcept {
+    static char buf[1024];
+    static bool initialized = false;
+    if (!initialized) {
+        nk_cached_capabilities(); // ensures nk_configure_thread is called
+        isa_targets_format(nk_capabilities_available(), buf, sizeof(buf));
+        initialized = true;
+    }
+    return buf;
+}
+
+/**
+ *  @brief  Returns a comma-separated list of ISAs that were compiled into this binary.
+ *  @return Pointer to a static null-terminated string. Thread-safe after first call.
+ */
+inline char const* hardware_acceleration_compiled() noexcept {
+    static char buf[1024];
+    static bool initialized = false;
+    if (!initialized) {
+        isa_targets_format(nk_capabilities_compiled(), buf, sizeof(buf));
+        initialized = true;
+    }
+    return buf;
+}
+
+#else
+
+inline char const* hardware_acceleration_available() noexcept { return "serial"; }
+inline char const* hardware_acceleration_compiled() noexcept { return "serial"; }
+
+#endif
+
 /**
  *  @brief  Type-punned metric class, which unlike STL's `std::function` avoids any memory allocations.
  *          It also provides additional APIs to check, if SIMD hardware-acceleration is available.
- *          Wraps the `simsimd_metric_punned_t` when available. The auto-vectorized backend otherwise.
+ *          Wraps the `nk_metric_dense_punned_t` when available. The auto-vectorized backend otherwise.
  */
 class metric_punned_t {
   public:
@@ -1351,9 +2868,9 @@ class metric_punned_t {
     /// Distance function that takes two arrays and some callback state and returns a scalar.
     using metric_array_array_state_t = result_t (*)(uptr_t, uptr_t, uptr_t);
     /// Distance function callback, like `metric_array_array_size_t`, but depends on member variables.
-    using metric_rounted_t = result_t (metric_punned_t::*)(uptr_t, uptr_t) const;
+    using metric_routed_t = result_t (metric_punned_t::*)(uptr_t, uptr_t) const;
 
-    metric_rounted_t metric_routed_ = nullptr;
+    metric_routed_t metric_routed_ = nullptr;
     uptr_t metric_ptr_ = 0;
     uptr_t metric_third_arg_ = 0;
 
@@ -1361,8 +2878,8 @@ class metric_punned_t {
     metric_kind_t metric_kind_ = metric_kind_t::unknown_k;
     scalar_kind_t scalar_kind_ = scalar_kind_t::unknown_k;
 
-#if USEARCH_USE_SIMSIMD
-    simsimd_capability_t isa_kind_ = simsimd_cap_serial_k;
+#if USEARCH_USE_NUMKONG
+    nk_capability_t isa_kind_ = nk_cap_serial_k;
 #endif
 
   public:
@@ -1389,7 +2906,7 @@ class metric_punned_t {
 
     /**
      *  @brief  Creates a metric of a natively supported kind, choosing the best
-     *          available backend internally or from SimSIMD.
+     *          available backend internally or from NumKong.
      *
      *  @param  dimensions      The number of elements in the input arrays.
      *  @param  metric_kind     The kind of metric to use.
@@ -1407,12 +2924,8 @@ class metric_punned_t {
         metric.metric_kind_ = metric_kind;
         metric.scalar_kind_ = scalar_kind;
 
-#if USEARCH_USE_SIMSIMD
-        if (!metric.configure_with_simsimd())
+        if (!metric.configure_with_numkong())
             metric.configure_with_autovec();
-#else
-        metric.configure_with_autovec();
-#endif
 
         return metric;
     }
@@ -1447,23 +2960,25 @@ class metric_punned_t {
     }
 
     /**
-     *  @brief  Creates a metric using the provided function pointer for a statefull metric.
+     *  @brief  Creates a metric using the provided function pointer for a stateful metric.
      *          The third argument is the state that will be passed to the metric function.
      *
+     *  @param  dimensions      The number of elements in the input arrays.
      *  @param  metric_uintptr  The function pointer to the metric function.
      *  @param  metric_state    The state to pass to the metric function.
      *  @param  metric_kind     The kind of metric to use.
      *  @param  scalar_kind     The kind of scalar to use.
      *  @return                 A metric object that can be used to compute distances between vectors.
      */
-    inline static metric_punned_t statefull(std::uintptr_t metric_uintptr, std::uintptr_t metric_state,
-                                            metric_kind_t metric_kind = metric_kind_t::unknown_k,
-                                            scalar_kind_t scalar_kind = scalar_kind_t::unknown_k) noexcept {
+    inline static metric_punned_t stateful( //
+        std::size_t dimensions, std::uintptr_t metric_uintptr, std::uintptr_t metric_state,
+        metric_kind_t metric_kind = metric_kind_t::unknown_k,
+        scalar_kind_t scalar_kind = scalar_kind_t::unknown_k) noexcept {
         metric_punned_t metric;
         metric.metric_routed_ = &metric_punned_t::invoke_array_array_third;
         metric.metric_ptr_ = metric_uintptr;
         metric.metric_third_arg_ = metric_state;
-        metric.dimensions_ = 0;
+        metric.dimensions_ = dimensions;
         metric.metric_kind_ = metric_kind;
         metric.scalar_kind_ = scalar_kind;
         return metric;
@@ -1475,7 +2990,7 @@ class metric_punned_t {
     inline explicit operator bool() const noexcept { return metric_routed_ && metric_ptr_; }
 
     /**
-     *  @brief  Checks fi we've failed to initialized the metric with provided arguments.
+     *  @brief  Checks if we've failed to initialize the metric with provided arguments.
      *
      *  It's different from `operator bool()` when it comes to explicitly uninitialized metrics.
      *  It's a common case, where a NULL state is created only to be overwritten later, when
@@ -1486,20 +3001,11 @@ class metric_punned_t {
     inline char const* isa_name() const noexcept {
         if (!*this)
             return "uninitialized";
-
-#if USEARCH_USE_SIMSIMD
-        switch (isa_kind_) {
-        case simsimd_cap_serial_k: return "serial";
-        case simsimd_cap_neon_k: return "neon";
-        case simsimd_cap_sve_k: return "sve";
-        case simsimd_cap_haswell_k: return "haswell";
-        case simsimd_cap_skylake_k: return "skylake";
-        case simsimd_cap_ice_k: return "ice";
-        case simsimd_cap_sapphire_k: return "sapphire";
-        default: return "unknown";
-        }
-#endif
+#if USEARCH_USE_NUMKONG
+        return capability_name(isa_kind_);
+#else
         return "serial";
+#endif
     }
 
     inline std::size_t bytes_per_vector() const noexcept {
@@ -1511,56 +3017,83 @@ class metric_punned_t {
     }
 
   private:
-#if USEARCH_USE_SIMSIMD
-    bool configure_with_simsimd(simsimd_capability_t simd_caps) noexcept {
-        simsimd_metric_kind_t kind = simsimd_metric_unknown_k;
-        simsimd_datatype_t datatype = simsimd_datatype_unknown_k;
-        simsimd_capability_t allowed = simsimd_cap_any_k;
+#if USEARCH_USE_NUMKONG
+    /**
+     *  @brief  Typed invoke template for NumKong kernels.
+     *
+     *  The accumulator type and IP-reversal flag are selected once in `configure_with_numkong`
+     *  and baked into the member-function pointer stored in `metric_routed_`.
+     */
+    template <typename accumulator_at, bool reverse_ak>
+#if defined(USEARCH_DEFINED_CLANG) || defined(USEARCH_DEFINED_GCC)
+    __attribute__((no_sanitize("all")))
+#endif
+    result_t invoke_numkong(uptr_t a, uptr_t b) const noexcept {
+        accumulator_at result = 0;
+        auto function_pointer = (nk_metric_dense_punned_t)(metric_ptr_);
+        function_pointer(reinterpret_cast<void const*>(a), reinterpret_cast<void const*>(b), metric_third_arg_,
+                         &result);
+        return reverse_ak ? (result_t)(1 - (result_t)result) : (result_t)result;
+    }
+
+    /// Shorthand: casts an `invoke_numkong` instantiation to the opaque `metric_routed_t` type.
+    template <typename accumulator_at, bool reverse_ak> //
+    static metric_routed_t numkong_routed() noexcept {
+        return reinterpret_cast<metric_routed_t>(&metric_punned_t::invoke_numkong<accumulator_at, reverse_ak>);
+    }
+
+    bool configure_with_numkong(nk_capability_t simd_caps) noexcept {
+        nk_kernel_kind_t kind = (nk_kernel_kind_t)0;
         switch (metric_kind_) {
-        case metric_kind_t::ip_k: kind = simsimd_metric_dot_k; break;
-        case metric_kind_t::cos_k: kind = simsimd_metric_cos_k; break;
-        case metric_kind_t::l2sq_k: kind = simsimd_metric_l2sq_k; break;
-        case metric_kind_t::hamming_k: kind = simsimd_metric_hamming_k; break;
-        case metric_kind_t::tanimoto_k: kind = simsimd_metric_jaccard_k; break;
-        case metric_kind_t::jaccard_k: kind = simsimd_metric_jaccard_k; break;
-        default: break;
+        case metric_kind_t::ip_k: kind = nk_kernel_dot_k; break;
+        case metric_kind_t::cos_k: kind = nk_kernel_angular_k; break;
+        case metric_kind_t::l2sq_k: kind = nk_kernel_sqeuclidean_k; break;
+        case metric_kind_t::hamming_k: kind = nk_kernel_hamming_k; break;
+        case metric_kind_t::tanimoto_k: kind = nk_kernel_jaccard_k; break;
+        case metric_kind_t::jaccard_k: kind = nk_kernel_jaccard_k; break;
+        default: return false;
         }
-        switch (scalar_kind_) {
-        case scalar_kind_t::f32_k: datatype = simsimd_datatype_f32_k; break;
-        case scalar_kind_t::f64_k: datatype = simsimd_datatype_f64_k; break;
-        case scalar_kind_t::f16_k: datatype = simsimd_datatype_f16_k; break;
-        case scalar_kind_t::i8_k: datatype = simsimd_datatype_i8_k; break;
-        case scalar_kind_t::b1x8_k: datatype = simsimd_datatype_b8_k; break;
-        default: break;
-        }
-        simsimd_metric_punned_t simd_metric = NULL;
-        simsimd_capability_t simd_kind = simsimd_cap_any_k;
-        simsimd_find_metric_punned(kind, datatype, simd_caps, allowed, &simd_metric, &simd_kind);
+        nk_dtype_t datatype = scalar_kind_to_nk_dtype(scalar_kind_);
+        nk_metric_dense_punned_t simd_metric = NULL;
+        nk_capability_t simd_kind = nk_cap_any_k;
+        nk_find_kernel_punned(kind, datatype, simd_caps, (nk_kernel_punned_t*)&simd_metric, &simd_kind);
         if (simd_metric == nullptr)
             return false;
 
         std::memcpy(&metric_ptr_, &simd_metric, sizeof(simd_metric));
-        metric_routed_ = metric_kind_ == metric_kind_t::ip_k
-                             ? reinterpret_cast<metric_rounted_t>(&metric_punned_t::invoke_simsimd_reverse)
-                             : reinterpret_cast<metric_rounted_t>(&metric_punned_t::invoke_simsimd);
+
+        // Select the typed invoke variant based on the kernel's output dtype to avoid per-call branching.
+        // The output type depends on both scalar_kind and metric_kind (e.g. i8 dot->i32, i8 l2sq->u32, i8 cos->f32).
+        nk_dtype_t out_dtype = nk_kernel_output_dtype(kind, datatype);
+        bool is_ip = (metric_kind_ == metric_kind_t::ip_k);
+        switch (out_dtype) {
+        case nk_f64_k:
+            metric_routed_ = is_ip ? numkong_routed<nk_f64_t, true>() : numkong_routed<nk_f64_t, false>();
+            break;
+        case nk_f32_k:
+            metric_routed_ = is_ip ? numkong_routed<nk_f32_t, true>() : numkong_routed<nk_f32_t, false>();
+            break;
+        case nk_i32_k:
+            metric_routed_ = is_ip ? numkong_routed<std::int32_t, true>() : numkong_routed<std::int32_t, false>();
+            break;
+        case nk_u32_k:
+            metric_routed_ = is_ip ? numkong_routed<std::uint32_t, true>() : numkong_routed<std::uint32_t, false>();
+            break;
+        default: metric_routed_ = is_ip ? numkong_routed<nk_f64_t, true>() : numkong_routed<nk_f64_t, false>(); break;
+        }
         isa_kind_ = simd_kind;
+
+        // NumKong binary-set kernels (Hamming, Jaccard/Tanimoto) expect the third argument
+        // to be the number of dimensions (bits), not the number of bytes.
+        if (scalar_kind_ == scalar_kind_t::b1x8_k)
+            metric_third_arg_ = dimensions_;
+
         return true;
     }
-    bool configure_with_simsimd() noexcept {
-        static simsimd_capability_t static_capabilities = simsimd_capabilities();
-        return configure_with_simsimd(static_capabilities);
-    }
-    result_t invoke_simsimd(uptr_t a, uptr_t b) const noexcept {
-        simsimd_distance_t result;
-        // Here `reinterpret_cast` raises warning... we know what we are doing!
-        auto function_pointer = (simsimd_metric_punned_t)(metric_ptr_);
-        function_pointer(reinterpret_cast<void const*>(a), reinterpret_cast<void const*>(b), metric_third_arg_,
-                         &result);
-        return (result_t)result;
-    }
-    result_t invoke_simsimd_reverse(uptr_t a, uptr_t b) const noexcept { return 1 - invoke_simsimd(a, b); }
+
+    bool configure_with_numkong() noexcept { return configure_with_numkong(nk_cached_capabilities()); }
 #else
-    bool configure_with_simsimd() noexcept { return false; }
+    bool configure_with_numkong() noexcept { return false; }
 #endif
     result_t invoke_array_array_third(uptr_t a, uptr_t b) const noexcept {
         auto function_pointer = (metric_array_array_size_t)(metric_ptr_);
@@ -1576,60 +3109,108 @@ class metric_punned_t {
         switch (metric_kind_) {
         case metric_kind_t::ip_k: {
             switch (scalar_kind_) {
-            case scalar_kind_t::f32_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_ip_gt<f32_t>>; break;
-            case scalar_kind_t::f16_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_ip_gt<f16_t, f32_t>>; break;
-            case scalar_kind_t::i8_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_ip_gt<i8_t, f32_t>>; break;
             case scalar_kind_t::f64_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_ip_gt<f64_t>>; break;
+            case scalar_kind_t::f32_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_ip_gt<f32_t>>; break;
+            case scalar_kind_t::bf16_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_ip_gt<bf16_t, f32_t>>; break;
+            case scalar_kind_t::f16_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_ip_gt<f16_t, f32_t>>; break;
+            case scalar_kind_t::e5m2_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_ip_gt<e5m2_t, f32_t>>; break;
+            case scalar_kind_t::e4m3_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_ip_gt<e4m3_t, f32_t>>; break;
+            case scalar_kind_t::e3m2_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_ip_gt<e3m2_t, f32_t>>; break;
+            case scalar_kind_t::e2m3_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_ip_gt<e2m3_t, f32_t>>; break;
+            case scalar_kind_t::i8_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_ip_gt<i8_t, f32_t>>; break;
+            case scalar_kind_t::u8_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_ip_gt<u8_t, f32_t>>; break;
             default: metric_ptr_ = 0; break;
             }
             break;
         }
         case metric_kind_t::cos_k: {
             switch (scalar_kind_) {
-            case scalar_kind_t::f32_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_cos_gt<f32_t>>; break;
-            case scalar_kind_t::f16_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_cos_gt<f16_t, f32_t>>; break;
-            case scalar_kind_t::i8_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_cos_gt<i8_t, f32_t>>; break;
             case scalar_kind_t::f64_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_cos_gt<f64_t>>; break;
+            case scalar_kind_t::f32_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_cos_gt<f32_t>>; break;
+            case scalar_kind_t::bf16_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_cos_gt<bf16_t, f32_t>>; break;
+            case scalar_kind_t::f16_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_cos_gt<f16_t, f32_t>>; break;
+            case scalar_kind_t::e5m2_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_cos_gt<e5m2_t, f32_t>>; break;
+            case scalar_kind_t::e4m3_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_cos_gt<e4m3_t, f32_t>>; break;
+            case scalar_kind_t::e3m2_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_cos_gt<e3m2_t, f32_t>>; break;
+            case scalar_kind_t::e2m3_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_cos_gt<e2m3_t, f32_t>>; break;
+            case scalar_kind_t::i8_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_cos_i8_t>; break;
+            case scalar_kind_t::u8_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_cos_u8_t>; break;
             default: metric_ptr_ = 0; break;
             }
             break;
         }
         case metric_kind_t::l2sq_k: {
             switch (scalar_kind_) {
-            case scalar_kind_t::f32_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_l2sq_gt<f32_t>>; break;
-            case scalar_kind_t::f16_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_l2sq_gt<f16_t, f32_t>>; break;
-            case scalar_kind_t::i8_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_l2sq_gt<i8_t, f32_t>>; break;
             case scalar_kind_t::f64_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_l2sq_gt<f64_t>>; break;
+            case scalar_kind_t::f32_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_l2sq_gt<f32_t>>; break;
+            case scalar_kind_t::bf16_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_l2sq_gt<bf16_t, f32_t>>; break;
+            case scalar_kind_t::f16_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_l2sq_gt<f16_t, f32_t>>; break;
+            case scalar_kind_t::e5m2_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_l2sq_gt<e5m2_t, f32_t>>; break;
+            case scalar_kind_t::e4m3_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_l2sq_gt<e4m3_t, f32_t>>; break;
+            case scalar_kind_t::e3m2_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_l2sq_gt<e3m2_t, f32_t>>; break;
+            case scalar_kind_t::e2m3_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_l2sq_gt<e2m3_t, f32_t>>; break;
+            case scalar_kind_t::i8_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_l2sq_i8_t>; break;
+            case scalar_kind_t::u8_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_l2sq_u8_t>; break;
             default: metric_ptr_ = 0; break;
             }
             break;
         }
         case metric_kind_t::pearson_k: {
             switch (scalar_kind_) {
-            case scalar_kind_t::i8_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_pearson_gt<i8_t, f32_t>>; break;
-            case scalar_kind_t::f16_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_pearson_gt<f16_t, f32_t>>; break;
-            case scalar_kind_t::f32_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_pearson_gt<f32_t>>; break;
             case scalar_kind_t::f64_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_pearson_gt<f64_t>>; break;
+            case scalar_kind_t::f32_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_pearson_gt<f32_t>>; break;
+            case scalar_kind_t::bf16_k:
+                metric_ptr_ = (uptr_t)&equidimensional_<metric_pearson_gt<bf16_t, f32_t>>;
+                break;
+            case scalar_kind_t::f16_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_pearson_gt<f16_t, f32_t>>; break;
+            case scalar_kind_t::e5m2_k:
+                metric_ptr_ = (uptr_t)&equidimensional_<metric_pearson_gt<e5m2_t, f32_t>>;
+                break;
+            case scalar_kind_t::e4m3_k:
+                metric_ptr_ = (uptr_t)&equidimensional_<metric_pearson_gt<e4m3_t, f32_t>>;
+                break;
+            case scalar_kind_t::e3m2_k:
+                metric_ptr_ = (uptr_t)&equidimensional_<metric_pearson_gt<e3m2_t, f32_t>>;
+                break;
+            case scalar_kind_t::e2m3_k:
+                metric_ptr_ = (uptr_t)&equidimensional_<metric_pearson_gt<e2m3_t, f32_t>>;
+                break;
+            case scalar_kind_t::i8_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_pearson_gt<i8_t, f32_t>>; break;
+            case scalar_kind_t::u8_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_pearson_gt<u8_t, f32_t>>; break;
             default: metric_ptr_ = 0; break;
             }
             break;
         }
         case metric_kind_t::haversine_k: {
             switch (scalar_kind_) {
-            case scalar_kind_t::f16_k: metric_ptr_ = 0; break; //< Having half-precision 2D coordinates is a bit silly.
-            case scalar_kind_t::f32_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_haversine_gt<f32_t>>; break;
             case scalar_kind_t::f64_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_haversine_gt<f64_t>>; break;
+            case scalar_kind_t::f32_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_haversine_gt<f32_t>>; break;
             default: metric_ptr_ = 0; break;
             }
             break;
         }
         case metric_kind_t::divergence_k: {
             switch (scalar_kind_) {
+            case scalar_kind_t::f64_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_divergence_gt<f64_t>>; break;
+            case scalar_kind_t::f32_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_divergence_gt<f32_t>>; break;
+            case scalar_kind_t::bf16_k:
+                metric_ptr_ = (uptr_t)&equidimensional_<metric_divergence_gt<bf16_t, f32_t>>;
+                break;
             case scalar_kind_t::f16_k:
                 metric_ptr_ = (uptr_t)&equidimensional_<metric_divergence_gt<f16_t, f32_t>>;
                 break;
-            case scalar_kind_t::f32_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_divergence_gt<f32_t>>; break;
-            case scalar_kind_t::f64_k: metric_ptr_ = (uptr_t)&equidimensional_<metric_divergence_gt<f64_t>>; break;
+            case scalar_kind_t::e5m2_k:
+                metric_ptr_ = (uptr_t)&equidimensional_<metric_divergence_gt<e5m2_t, f32_t>>;
+                break;
+            case scalar_kind_t::e4m3_k:
+                metric_ptr_ = (uptr_t)&equidimensional_<metric_divergence_gt<e4m3_t, f32_t>>;
+                break;
+            case scalar_kind_t::e3m2_k:
+                metric_ptr_ = (uptr_t)&equidimensional_<metric_divergence_gt<e3m2_t, f32_t>>;
+                break;
+            case scalar_kind_t::e2m3_k:
+                metric_ptr_ = (uptr_t)&equidimensional_<metric_divergence_gt<e2m3_t, f32_t>>;
+                break;
             default: metric_ptr_ = 0; break;
             }
             break;
@@ -1649,36 +3230,42 @@ class metric_punned_t {
     }
 };
 
+/* Allow complaining about vectorization after this point. */
+#if defined(USEARCH_DEFINED_CLANG)
+#pragma clang diagnostic pop
+#endif
+
 /**
  *  @brief  View over a potentially-strided memory buffer, containing a row-major matrix.
  */
 template <typename scalar_at> //
-class vectors_view_gt {
+class matrix_slice_gt {
     using scalar_t = scalar_at;
+    using byte_addressable_t = typename std::conditional<std::is_const<scalar_t>::value, byte_t const, byte_t>::type;
 
-    scalar_t const* begin_{};
+    scalar_t* begin_{};
     std::size_t dimensions_{};
     std::size_t count_{};
     std::size_t stride_bytes_{};
 
   public:
-    vectors_view_gt() noexcept = default;
-    vectors_view_gt(vectors_view_gt const&) noexcept = default;
-    vectors_view_gt& operator=(vectors_view_gt const&) noexcept = default;
+    matrix_slice_gt() noexcept = default;
+    matrix_slice_gt(matrix_slice_gt const&) noexcept = default;
+    matrix_slice_gt& operator=(matrix_slice_gt const&) noexcept = default;
 
-    vectors_view_gt(scalar_t const* begin, std::size_t dimensions, std::size_t count = 1) noexcept
-        : vectors_view_gt(begin, dimensions, count, dimensions * sizeof(scalar_at)) {}
+    matrix_slice_gt(scalar_t* begin, std::size_t dimensions, std::size_t count = 1) noexcept
+        : matrix_slice_gt(begin, dimensions, count, dimensions * sizeof(scalar_at)) {}
 
-    vectors_view_gt(scalar_t const* begin, std::size_t dimensions, std::size_t count, std::size_t stride_bytes) noexcept
+    matrix_slice_gt(scalar_t* begin, std::size_t dimensions, std::size_t count, std::size_t stride_bytes) noexcept
         : begin_(begin), dimensions_(dimensions), count_(count), stride_bytes_(stride_bytes) {}
 
     explicit operator bool() const noexcept { return begin_; }
     std::size_t size() const noexcept { return count_; }
     std::size_t dimensions() const noexcept { return dimensions_; }
-    std::size_t stride() const noexcept { return stride_bytes_; }
-    scalar_t const* data() const noexcept { return begin_; }
-    scalar_t const* at(std::size_t i) const noexcept {
-        return reinterpret_cast<scalar_t const*>(reinterpret_cast<byte_t const*>(begin_) + i * stride_bytes_);
+    std::size_t stride_bytes() const noexcept { return stride_bytes_; }
+    scalar_t* data() const noexcept { return begin_; }
+    scalar_t* at(std::size_t i) const noexcept {
+        return reinterpret_cast<scalar_t*>(reinterpret_cast<byte_addressable_t*>(begin_) + i * stride_bytes_);
     }
 };
 
@@ -1687,7 +3274,7 @@ struct exact_offset_and_distance_t {
     f32_t distance;
 };
 
-using exact_search_results_t = vectors_view_gt<exact_offset_and_distance_t>;
+using exact_search_results_t = matrix_slice_gt<exact_offset_and_distance_t const>;
 
 /**
  *  @brief  Helper-structure for exact search operations.
@@ -1708,15 +3295,14 @@ class exact_search_t {
 
   public:
     template <typename scalar_at, typename executor_at = dummy_executor_t, typename progress_at = dummy_progress_t>
-    exact_search_results_t operator()(                                          //
-        vectors_view_gt<scalar_at> dataset, vectors_view_gt<scalar_at> queries, //
-        std::size_t wanted, metric_punned_t const& metric,                      //
+    exact_search_results_t operator()(                                                      //
+        matrix_slice_gt<scalar_at const> dataset, matrix_slice_gt<scalar_at const> queries, //
+        std::size_t wanted, metric_punned_t const& metric,                                  //
         executor_at&& executor = executor_at{}, progress_at&& progress = progress_at{}) {
-        return operator()(                                                                     //
-            metric,                                                                            //
-            reinterpret_cast<byte_t const*>(dataset.data()), dataset.size(), dataset.stride(), //
-            reinterpret_cast<byte_t const*>(queries.data()), queries.size(), queries.stride(), //
-            wanted, executor, progress);
+        return operator()(                                                                           //
+            reinterpret_cast<byte_t const*>(dataset.data()), dataset.size(), dataset.stride_bytes(), //
+            reinterpret_cast<byte_t const*>(queries.data()), queries.size(), queries.stride_bytes(), //
+            wanted, metric, executor, progress);
     }
 
     template <typename executor_at = dummy_executor_t, typename progress_at = dummy_progress_t>
@@ -1726,9 +3312,8 @@ class exact_search_t {
         std::size_t wanted, metric_punned_t const& metric, executor_at&& executor = executor_at{},
         progress_at&& progress = progress_at{}) {
 
-        // Allocate temporary memory to store the distance matrix
-        // Previous version didn't need temporary memory, but the performance was much lower.
-        // In the new design we keep two buffers - original and transposed, as in-place transpositions
+        // Allocate temporary memory to store the distance matrix.
+        // We keep two buffers - original and transposed, as in-place transpositions
         // of non-rectangular matrixes is expensive.
         std::size_t tasks_count = dataset_count * queries_count;
         if (keys_and_distances.size() < tasks_count * 2)
@@ -1774,9 +3359,6 @@ class exact_search_t {
         executor.fixed(queries_count, [&](std::size_t, std::size_t query_idx) {
             auto start = keys_and_distances_per_query + dataset_count * query_idx;
             if (wanted > 1) {
-                // TODO: Consider alternative sorting approaches
-                // radix_sort(start, start + dataset_count, wanted);
-                // std::sort(start, start + dataset_count, &smaller_distance);
                 std::partial_sort(start, start + wanted, start + dataset_count, &smaller_distance);
             } else {
                 auto min_it = std::min_element(start, start + dataset_count, &smaller_distance);
@@ -1791,6 +3373,344 @@ class exact_search_t {
                 dataset_count * sizeof(exact_offset_and_distance_t)};
     }
 };
+
+struct kmeans_clustering_result_t {
+    error_t error{};
+    std::size_t computed_distances{};
+    /// @brief The number of iterations the algorithm took to converge.
+    std::size_t iterations{};
+    /// @brief The number of points that changed clusters in the last iteration.
+    std::size_t last_iteration_points_shifted{};
+    /// @brief The inertia of the last iteration (sum of squared distances to centroids).
+    f64_t last_iteration_inertia{};
+    /// @brief The total elapsed runtime of the algorithm in seconds.
+    f64_t runtime_seconds{};
+    /// @brief The total distance between the points and their assigned centroids.
+    f64_t aggregate_distance{};
+
+    explicit operator bool() const noexcept { return !error; }
+    kmeans_clustering_result_t failed(error_t message) noexcept {
+        error = std::move(message);
+        return std::move(*this);
+    }
+};
+
+/**
+ *  @brief  Helper-class for K-Means clustering of dense vectors.
+ *          Doesn't require constructing the index, but benefits from mixed-precision logic.
+ *          ! Doesn't guarantee that the clusters are balanced in size.
+ *
+ *  The algorithm is as follows:
+ *  - Initialization: Select K initial centroids (randomly or with a heuristic).
+ *  - Assignment: Assign each data point to the nearest centroid based on the Euclidean distance.
+ *  - Update: Recalculate the centroids as the mean of all points assigned to each centroid.
+ *  - Repeat: Repeat the assignment and update steps until the centroids no longer change significantly
+ *            or an early-exit condition is met.
+ */
+template <typename allocator_at = std::allocator<char>> class kmeans_clustering_gt {
+  public:
+    using distance_t = distance_punned_t;
+
+    metric_kind_t metric_kind{metric_kind_t::l2sq_k};
+    scalar_kind_t quantization_kind{scalar_kind_t::bf16_k};
+
+    static constexpr std::size_t max_iterations_default_k = 300;
+    static constexpr f64_t inertia_threshold_default_k = 1e-4;
+    static constexpr f64_t max_seconds_default_k = 60.0;
+    static constexpr f64_t min_shifts_default_k = 0.01;
+
+    /// @brief Early-exit parameter - the maximum number of iterations to perform.
+    std::size_t max_iterations{max_iterations_default_k};
+    /// @brief Early-exit parameter - the threshold for the final inertia to terminate early.
+    f64_t inertia_threshold{inertia_threshold_default_k};
+    /// @brief Early-exit parameter - the maximum runtime allowed in seconds.
+    f64_t max_seconds{max_seconds_default_k};
+    /// @brief Early-exit parameter - the minimum share of points that must change clusters per iteration.
+    f64_t min_shifts{min_shifts_default_k};
+    /// @brief The random seed to use for centroid initialization.
+    std::uint64_t seed{0};
+
+    kmeans_clustering_gt(std::uint64_t seed) noexcept : seed(seed) {}
+    kmeans_clustering_gt() noexcept(false) {
+        std::random_device random_device;
+        seed = random_device();
+    }
+
+    kmeans_clustering_gt(kmeans_clustering_gt const&) = default;
+    kmeans_clustering_gt& operator=(kmeans_clustering_gt const&) = default;
+
+    template <typename scalar_at, typename executor_at = dummy_executor_t, typename progress_at = dummy_progress_t>
+    kmeans_clustering_result_t operator()( //
+        matrix_slice_gt<scalar_at const> points, matrix_slice_gt<scalar_at> centroids,
+        span_gt<std::size_t> point_to_centroid_index, span_gt<distance_t> point_to_centroid_distance, //
+        executor_at&& executor = executor_at{}, progress_at&& progress = progress_at{}) {
+        return operator()(                                                                        //
+            reinterpret_cast<byte_t const*>(points.data()), points.size(), points.stride_bytes(), //
+            reinterpret_cast<byte_t*>(centroids.data()), centroids.size(), centroids.stride_bytes(),
+            point_to_centroid_index.data(), point_to_centroid_distance.data(), //
+            scalar_kind<scalar_at>(), points.dimensions(), executor, progress);
+    }
+
+    template <typename executor_at = dummy_executor_t, typename progress_at = dummy_progress_t>
+    kmeans_clustering_result_t operator()(                                                       //
+        byte_t const* points_data, std::size_t points_count, std::size_t points_stride_bytes,    //
+        byte_t* centroids_data, std::size_t wanted_clusters, std::size_t centroids_stride_bytes, //
+        std::size_t* point_to_centroid_index, distance_t* point_to_centroid_distance,            //
+        scalar_kind_t original_scalar_kind, std::size_t dimensions, executor_at&& executor = executor_at{},
+        progress_at&& progress = progress_at{}) {
+
+        (void)progress; // TODO
+
+        // Perform sanity checks for algorithm settings.
+        kmeans_clustering_result_t result;
+        if (max_iterations < 1)
+            return result.failed("The number of iterations must be at least 1");
+
+        // Perform sanity checks for input arguments.
+        if (wanted_clusters < 2)
+            return result.failed("The number of clusters must be at least 2");
+        if (wanted_clusters >= points_count)
+            return result.failed("The number of clusters must be less than the number of vectors");
+
+        metric_punned_t metric = metric_punned_t::builtin(dimensions, metric_kind, quantization_kind);
+        if (!metric)
+            return result.failed("Unsupported metric or scalar kind");
+
+        // Let's allocate memory for the centroids coordinates and make sure it's
+        // rows are aligned to cache lines to avoid false sharing.
+        buffer_gt<distance_t, aligned_allocator_gt<distance_t, 64>> point_to_centroid_distance_buffer(points_count);
+        buffer_gt<std::size_t, aligned_allocator_gt<std::size_t, 64>> point_to_centroid_index_buffer(points_count);
+        buffer_gt<std::atomic<std::size_t>, aligned_allocator_gt<std::atomic<std::size_t>, 64>> cluster_sizes_buffer(
+            wanted_clusters);
+
+        // For a mixed precision computation, we keep the centroids represented in two forms -
+        // double precision and quantized the same way as in the index, to avoid paying conversion penalties.
+        // Double precision is needed to avoid accumulating errors when aggregating too many entries.
+        std::size_t const bytes_per_vector_original =
+            divide_round_up<CHAR_BIT>(dimensions * bits_per_scalar(original_scalar_kind));
+        std::size_t const bytes_per_vector_quantized = metric.bytes_per_vector();
+        std::size_t const stride_per_vector_quantized = divide_round_up<64>(bytes_per_vector_quantized) * 64;
+        buffer_gt<byte_t, aligned_allocator_gt<byte_t, 64>> points_quantized_buffer( //
+            points_count * stride_per_vector_quantized);
+        buffer_gt<byte_t, aligned_allocator_gt<byte_t, 64>> centroids_quantized_buffer( //
+            wanted_clusters * stride_per_vector_quantized);
+
+        // When aggregating centroids, we want to parallelize the operation and need more memory.
+        // For every thread we keep two double-precision vectors. One is the up-casting output buffer for quantized
+        // coordinates, and the other is the temporary buffer for the partial sums of the double-precision coordinates.
+        // The ordering:
+        //
+        //      - thread 0: [centroid 0, centroid 1, centroid 2, centroid 3, ...]
+        //      - thread 1: [centroid 0, centroid 1, centroid 2, centroid 3, ...]
+        //      - thread 2: [centroid 0, centroid 1, centroid 2, centroid 3, ...]
+        //
+        std::size_t const thread_count = executor.size();
+        buffer_gt<f64_t, aligned_allocator_gt<f64_t, 64>> centroids_precise_buffer( //
+            wanted_clusters * dimensions * thread_count);
+        buffer_gt<f64_t, aligned_allocator_gt<f64_t, 64>> points_precise_buffer( //
+            wanted_clusters * dimensions * thread_count);
+
+        // Check if all memory allocations were successful.
+        if (!centroids_precise_buffer || !points_precise_buffer || !centroids_quantized_buffer ||
+            !point_to_centroid_index_buffer || !cluster_sizes_buffer || !point_to_centroid_distance_buffer ||
+            !points_quantized_buffer)
+            return result.failed("No memory for result outputs!");
+
+        std::fill_n(point_to_centroid_index_buffer.data(), points_count, wanted_clusters);
+        std::fill_n(point_to_centroid_distance_buffer.data(), points_count, (std::numeric_limits<distance_t>::max)());
+
+        // Initialize the casting kernel for quantization and export.
+        casts_punned_t casts = casts_punned_t::make(quantization_kind);
+        cast_punned_t const& compress_points = casts.from[original_scalar_kind];
+        cast_punned_t const& decompress_points = casts.to[original_scalar_kind];
+        cast_punned_t const& compress_precise = casts.from.f64;
+        cast_punned_t const& decompress_precise = casts.to.f64;
+        for (std::size_t i = 0; i < points_count; i++) {
+            byte_t const* vector = points_data + i * points_stride_bytes;
+            byte_t* quantized = points_quantized_buffer.data() + i * stride_per_vector_quantized;
+            if (!compress_points(vector, dimensions, quantized))
+                std::memcpy(quantized, vector, bytes_per_vector_original);
+        }
+
+        // Initialize centroids with random points vectors.
+        std::mt19937_64 random_engine;
+        random_engine.seed(seed);
+        for (std::size_t i = 0; i < wanted_clusters; i++) {
+            // Generate the random index of the points vector,
+            // that is unique and not already used as a centroid.
+            std::size_t random_index;
+            do {
+                random_index = random_engine() % points_count;
+                bool is_unique = true;
+                for (std::size_t j = 0; j < i; j++) {
+                    if (point_to_centroid_index_buffer[j] == random_index) {
+                        is_unique = false;
+                        break;
+                    }
+                }
+                if (is_unique)
+                    break;
+            } while (true);
+
+            // Copy the vector to the centroid and quantize it.
+            byte_t const* quantized_point = points_quantized_buffer.data() + random_index * stride_per_vector_quantized;
+            byte_t* quantized_centroid = centroids_quantized_buffer.data() + i * stride_per_vector_quantized;
+            std::memcpy(quantized_centroid, quantized_point, bytes_per_vector_quantized);
+            point_to_centroid_index_buffer[random_index] = i;
+            point_to_centroid_distance_buffer[random_index] = 0;
+        }
+
+        auto start_time = std::chrono::high_resolution_clock::now();
+        std::size_t iterations = 0;
+        std::size_t const min_points_shifted_per_iteration = static_cast<std::size_t>(min_shifts * points_count);
+        f64_t last_aggregate_distance = (std::numeric_limits<f64_t>::max)();
+
+        while (iterations < max_iterations) {
+            iterations++;
+
+            // For every point, find the closest centroid.
+            std::atomic<std::size_t> points_shifted{0};
+            executor.dynamic(points_count, [&](std::size_t, std::size_t points_idx) {
+                byte_t const* quantized_point =
+                    points_quantized_buffer.data() + points_idx * stride_per_vector_quantized;
+                byte_t const* quantized_centroids = centroids_quantized_buffer.data();
+                distance_t closest_distance_local = (std::numeric_limits<distance_t>::max)();
+                std::size_t closest_idx_local = 0;
+                for (std::size_t centroid_idx = 0; centroid_idx < wanted_clusters; centroid_idx++) {
+                    byte_t const* quantized_centroid = quantized_centroids + centroid_idx * stride_per_vector_quantized;
+                    distance_t distance = metric(quantized_point, quantized_centroid);
+                    if (distance < closest_distance_local) {
+                        closest_distance_local = distance;
+                        closest_idx_local = centroid_idx;
+                    }
+                }
+
+                distance_t& closest_distance_ref = point_to_centroid_distance_buffer[points_idx];
+                std::size_t& closest_idx_ref = point_to_centroid_index_buffer[points_idx];
+                if (closest_idx_local != closest_idx_ref) {
+                    closest_idx_ref = closest_idx_local;
+                    points_shifted.fetch_add(1, std::memory_order_relaxed);
+                }
+
+                closest_distance_ref = closest_distance_local;
+                return true;
+            });
+
+            f64_t aggregate_distance = 0.0;
+            for (std::size_t i = 0; i < points_count; i++)
+                aggregate_distance += point_to_centroid_distance_buffer[i];
+            f64_t aggregate_distance_change =
+                std::abs(aggregate_distance - last_aggregate_distance) / last_aggregate_distance;
+
+            auto current_time = std::chrono::high_resolution_clock::now();
+            std::chrono::duration<f64_t> elapsed_time = current_time - start_time;
+            result.runtime_seconds = elapsed_time.count();
+            result.last_iteration_inertia = aggregate_distance_change;
+            result.last_iteration_points_shifted = points_shifted.load(std::memory_order_relaxed);
+
+            // Check for early-exit conditions
+            if (last_aggregate_distance != 0.0 && inertia_threshold != 0.0)
+                if (aggregate_distance_change <= inertia_threshold)
+                    break;
+            if (min_points_shifted_per_iteration != 0 || result.last_iteration_points_shifted == 0)
+                if (result.last_iteration_points_shifted <= min_points_shifted_per_iteration)
+                    break;
+            if (max_seconds != 0)
+                if (result.runtime_seconds >= max_seconds)
+                    break;
+
+            // For every centroid, recalculate the mean of all points assigned to it.
+            // That part is problematic to parallelize on many-core-systems, because of the contention.
+            // Alternatively, a tree-like approach can be used, where every core accumulates it's own partial sums.
+            // And those are later aggregated by a single thread.
+            std::memset(centroids_precise_buffer.data(), 0,
+                        wanted_clusters * dimensions * thread_count * sizeof(f64_t));
+            std::memset(reinterpret_cast<byte_t*>(cluster_sizes_buffer.data()), 0,
+                        wanted_clusters * sizeof(std::atomic<std::size_t>));
+            executor.dynamic(points_count, [&](std::size_t thread_idx, std::size_t points_idx) {
+                std::size_t centroid_idx = point_to_centroid_index_buffer[points_idx];
+                byte_t const* quantized_point =
+                    points_quantized_buffer.data() + points_idx * stride_per_vector_quantized;
+                f64_t* centroid_precise = centroids_precise_buffer.data() + wanted_clusters * dimensions * thread_idx +
+                                          centroid_idx * dimensions;
+
+                // Upcast the points point into a buffer of double-precision floats.
+                f64_t* point_precise = points_precise_buffer.data() + wanted_clusters * dimensions * thread_idx +
+                                       centroid_idx * dimensions;
+                if (!decompress_precise(quantized_point, dimensions, reinterpret_cast<byte_t*>(point_precise)))
+                    std::memcpy(reinterpret_cast<byte_t*>(point_precise), quantized_point, bytes_per_vector_quantized);
+
+                // Now add the vector from the points into the centroid partial sum.
+                for (std::size_t i = 0; i < dimensions; i++)
+                    centroid_precise[i] += point_precise[i];
+
+                cluster_sizes_buffer[centroid_idx].fetch_add(1, std::memory_order_relaxed);
+                return true;
+            });
+
+            // Aggregate the partial sums into the final centroids - storing them in the high-precision
+            // buffer of the first thread. Normalization procedure is different for different metrics.
+            for (std::size_t centroid_idx = 0; centroid_idx < wanted_clusters; centroid_idx++) {
+                f64_t* centroid_precise_aggregated = centroids_precise_buffer.data() + centroid_idx * dimensions;
+                for (std::size_t thread_idx = 1; thread_idx < thread_count; thread_idx++) {
+                    f64_t* centroid_precise = centroids_precise_buffer.data() +
+                                              wanted_clusters * dimensions * thread_idx + centroid_idx * dimensions;
+                    for (std::size_t i = 0; i < dimensions; i++)
+                        centroid_precise_aggregated[i] += centroid_precise[i];
+                }
+
+                // Normalize based on the metric kind
+                if (metric_kind == metric_kind_t::l2sq_k) {
+                    // Normalize for Euclidean distance (L2)
+                    std::size_t cluster_size = cluster_sizes_buffer[centroid_idx].load(std::memory_order_relaxed);
+                    if (cluster_size > 0)
+                        for (std::size_t i = 0; i < dimensions; i++)
+                            centroid_precise_aggregated[i] /= static_cast<f64_t>(cluster_size);
+
+                } else if (metric_kind == metric_kind_t::cos_k) {
+                    // Normalize for Cosine distance
+                    f64_t norm = 0.0;
+                    for (std::size_t i = 0; i < dimensions; i++)
+                        norm += centroid_precise_aggregated[i] * centroid_precise_aggregated[i];
+                    norm = std::sqrt(norm);
+                    if (norm > 0.0)
+                        for (std::size_t i = 0; i < dimensions; i++)
+                            centroid_precise_aggregated[i] /= norm;
+                }
+
+                // Quantize the centroid after normalization for further iterations
+                byte_t* centroid_quantized =
+                    centroids_quantized_buffer.data() + centroid_idx * stride_per_vector_quantized;
+                if (!compress_precise(reinterpret_cast<byte_t*>(centroid_precise_aggregated), dimensions,
+                                      centroid_quantized))
+                    std::memcpy(centroid_quantized, reinterpret_cast<byte_t*>(centroid_precise_aggregated),
+                                bytes_per_vector_quantized);
+            }
+        }
+
+        // Export stats.
+        result.iterations = iterations;
+        result.computed_distances = points_count * wanted_clusters * iterations;
+        result.aggregate_distance = 0;
+        for (distance_t distance : point_to_centroid_distance_buffer)
+            result.aggregate_distance += distance;
+
+        // We've finished all the iterations, now we can export the centroids back to the original precision.
+        std::memcpy(point_to_centroid_index, point_to_centroid_index_buffer.data(), points_count * sizeof(std::size_t));
+        std::memcpy(point_to_centroid_distance, point_to_centroid_distance_buffer.data(),
+                    points_count * sizeof(distance_t));
+        for (std::size_t i = 0; i < wanted_clusters; i++) {
+            byte_t const* quantized_centroid = centroids_quantized_buffer.data() + i * stride_per_vector_quantized;
+            byte_t* centroid = centroids_data + i * centroids_stride_bytes;
+            if (!decompress_points(quantized_centroid, dimensions, centroid))
+                std::memcpy(centroid, quantized_centroid, bytes_per_vector_quantized);
+        }
+
+        return result;
+    }
+};
+
+using kmeans_clustering_t = kmeans_clustering_gt<>;
 
 /**
  *  @brief  C++11 Multi-Hash-Set with Linear Probing.
@@ -1826,6 +3746,8 @@ class flat_hash_multi_set_gt {
     char* data_ = nullptr;
     std::size_t buckets_ = 0;
     std::size_t populated_slots_ = 0;
+    /// @brief  Number of tombstones (slots marked deleted but not yet reclaimed)
+    std::size_t deleted_slots_ = 0;
     /// @brief  Number of slots
     std::size_t capacity_slots_ = 0;
 
@@ -1861,9 +3783,38 @@ class flat_hash_multi_set_gt {
         }
     }
 
+    /**
+     *  @brief  Copies every live entry of @p source into the freshly zeroed @p target.
+     *
+     *  Tombstones are never carried over, so probe chains must be rebuilt from the hash
+     *  rather than reproduced slot-for-slot: a live entry displaced past a tombstone by
+     *  linear probing would otherwise become unreachable once that tombstone reads empty.
+     *  The target holds no tombstones, so an unpopulated slot is always a free slot.
+     */
+    void rehash_into(char* source, std::size_t source_slots, char* target, std::size_t target_slots) const noexcept {
+        hash_t hasher;
+        for (std::size_t i = 0; i != source_slots; ++i) {
+            slot_ref_t source_slot = slot_ref(source, i);
+            if (!(source_slot.header.populated & source_slot.mask) || (source_slot.header.deleted & source_slot.mask))
+                continue;
+
+            std::size_t target_index = hasher(source_slot.element) & (target_slots - 1);
+            while (true) {
+                slot_ref_t target_slot = slot_ref(target, target_index);
+                if (!(target_slot.header.populated & target_slot.mask)) {
+                    new (&target_slot.element) element_t(source_slot.element);
+                    target_slot.header.populated |= target_slot.mask;
+                    break;
+                }
+                target_index = (target_index + 1) & (target_slots - 1);
+            }
+        }
+    }
+
   public:
     std::size_t size() const noexcept { return populated_slots_; }
-    std::size_t capacity() const noexcept { return capacity_slots_; }
+    std::size_t capacity() const noexcept { return capacity_slots_ * 2u / 3u; }
+    std::size_t capacity_slots() const noexcept { return capacity_slots_; }
 
     flat_hash_multi_set_gt() noexcept {}
     ~flat_hash_multi_set_gt() noexcept { reset(); }
@@ -1877,26 +3828,22 @@ class flat_hash_multi_set_gt {
         }
 
         // Allocate new memory
-        data_ = (char*)allocator_t{}.allocate(other.buckets_ * bytes_per_bucket());
+        checked_size_result_t bytes = checked_mul(other.buckets_, bytes_per_bucket());
+        if (!bytes)
+            usearch_raise_runtime_error("failed memory allocation");
+        data_ = (char*)allocator_t{}.allocate(bytes.value);
         if (!data_)
-            throw std::bad_alloc();
+            usearch_raise_runtime_error("failed memory allocation");
 
-        // Copy metadata
+        // Copy metadata. Only live entries are rehashed below, so the copy has no tombstones.
         buckets_ = other.buckets_;
         populated_slots_ = other.populated_slots_;
+        deleted_slots_ = 0;
         capacity_slots_ = other.capacity_slots_;
 
         // Initialize new buckets to empty
         std::memset(data_, 0, buckets_ * bytes_per_bucket());
-
-        // Copy elements and bucket headers
-        for (std::size_t i = 0; i < capacity_slots_; ++i) {
-            slot_ref_t old_slot = other.slot_ref(i);
-            if ((old_slot.header.populated & old_slot.mask) && !(old_slot.header.deleted & old_slot.mask)) {
-                slot_ref_t new_slot = slot_ref(i);
-                populate_slot(new_slot, old_slot.element);
-            }
-        }
+        rehash_into(other.data_, other.capacity_slots_, data_, capacity_slots_);
     }
 
     flat_hash_multi_set_gt& operator=(flat_hash_multi_set_gt const& other) {
@@ -1917,26 +3864,22 @@ class flat_hash_multi_set_gt {
             allocator_t{}.deallocate(data_, buckets_ * bytes_per_bucket());
 
         // Allocate new memory
-        data_ = (char*)allocator_t{}.allocate(other.buckets_ * bytes_per_bucket());
+        checked_size_result_t bytes = checked_mul(other.buckets_, bytes_per_bucket());
+        if (!bytes)
+            usearch_raise_runtime_error("failed memory allocation");
+        data_ = (char*)allocator_t{}.allocate(bytes.value);
         if (!data_)
-            throw std::bad_alloc();
+            usearch_raise_runtime_error("failed memory allocation");
 
-        // Copy metadata
+        // Copy metadata. Only live entries are rehashed below, so the copy has no tombstones.
         buckets_ = other.buckets_;
         populated_slots_ = other.populated_slots_;
+        deleted_slots_ = 0;
         capacity_slots_ = other.capacity_slots_;
 
         // Initialize new buckets to empty
         std::memset(data_, 0, buckets_ * bytes_per_bucket());
-
-        // Copy elements and bucket headers
-        for (std::size_t i = 0; i < capacity_slots_; ++i) {
-            slot_ref_t old_slot = other.slot_ref(i);
-            if ((old_slot.header.populated & old_slot.mask) && !(old_slot.header.deleted & old_slot.mask)) {
-                slot_ref_t new_slot = slot_ref(i);
-                populate_slot(new_slot, old_slot.element);
-            }
-        }
+        rehash_into(other.data_, other.capacity_slots_, data_, capacity_slots_);
 
         return *this;
     }
@@ -1953,64 +3896,76 @@ class flat_hash_multi_set_gt {
         if (data_)
             std::memset(data_, 0, buckets_ * bytes_per_bucket());
         populated_slots_ = 0;
+        deleted_slots_ = 0;
     }
 
     void reset() noexcept {
         clear(); // Clear all elements
         if (data_)
             allocator_t{}.deallocate(data_, buckets_ * bytes_per_bucket());
+        data_ = nullptr;
         buckets_ = 0;
         populated_slots_ = 0;
+        deleted_slots_ = 0;
         capacity_slots_ = 0;
     }
 
+    /**
+     *  @brief  Grows the table to fit @p capacity live entries, reclaiming tombstones.
+     *
+     *  Tombstones are reclaimed even when no growth is requested. They only ever stop
+     *  being created once reclaimed, and a table with no empty slot left cannot
+     *  terminate a probe, silently stranding live entries.
+     */
     bool try_reserve(std::size_t capacity) noexcept {
-        if (capacity * 3u <= capacity_slots_ * 2u)
+        if (capacity <= this->capacity() && deleted_slots_ == 0)
             return true;
 
         // Calculate new sizes
-        std::size_t new_slots = ceil2((capacity * 3ul) / 2ul);
-        std::size_t new_buckets = divide_round_up<slots_per_bucket()>(new_slots);
-        new_slots = new_buckets * slots_per_bucket(); // This must be a power of two!
-        std::size_t new_bytes = new_buckets * bytes_per_bucket();
+        checked_size_result_t scaled_capacity = checked_mul(capacity, std::size_t{3});
+        if (!scaled_capacity)
+            return false;
+        checked_size_result_t slots_needed = checked_divide_round_up(scaled_capacity.value, std::size_t{2});
+        if (!slots_needed)
+            return false;
+        checked_size_result_t new_slots_checked = checked_ceil2(slots_needed.value);
+        if (!new_slots_checked)
+            return false;
+        checked_size_result_t new_buckets_checked =
+            checked_divide_round_up(new_slots_checked.value, slots_per_bucket());
+        if (!new_buckets_checked)
+            return false;
+        checked_size_result_t new_slots = checked_mul(new_buckets_checked.value, slots_per_bucket());
+        if (!new_slots)
+            return false;
+
+        // Never shrink: reclaiming tombstones alone needs no more than the current capacity
+        std::size_t target_buckets = new_buckets_checked.value;
+        std::size_t target_slots = new_slots.value;
+        if (target_slots < capacity_slots_) {
+            target_buckets = buckets_;
+            target_slots = capacity_slots_;
+        }
+        checked_size_result_t new_bytes = checked_mul(target_buckets, bytes_per_bucket());
+        if (!new_bytes)
+            return false;
 
         // Allocate new memory
-        char* new_data = (char*)allocator_t{}.allocate(new_bytes);
+        char* new_data = (char*)allocator_t{}.allocate(new_bytes.value);
         if (!new_data)
             return false;
 
         // Initialize new buckets to empty
-        std::memset(new_data, 0, new_bytes);
-
-        // Rehash and copy existing elements to new_data
-        hash_t hasher;
-        for (std::size_t i = 0; i < capacity_slots_; ++i) {
-            slot_ref_t old_slot = slot_ref(i);
-            if ((~old_slot.header.populated & old_slot.mask) | (old_slot.header.deleted & old_slot.mask))
-                continue;
-
-            // Rehash
-            std::size_t hash_value = hasher(old_slot.element);
-            std::size_t new_slot_index = hash_value & (new_slots - 1);
-
-            // Linear probing to find an empty slot in new_data
-            while (true) {
-                slot_ref_t new_slot = slot_ref(new_data, new_slot_index);
-                if (!(new_slot.header.populated & new_slot.mask) || (new_slot.header.deleted & new_slot.mask)) {
-                    populate_slot(new_slot, std::move(old_slot.element));
-                    new_slot.header.populated |= new_slot.mask;
-                    break;
-                }
-                new_slot_index = (new_slot_index + 1) & (new_slots - 1);
-            }
-        }
+        std::memset(new_data, 0, new_bytes.value);
+        rehash_into(data_, capacity_slots_, new_data, target_slots);
 
         // Deallocate old data and update pointers and sizes
         if (data_)
             allocator_t{}.deallocate(data_, buckets_ * bytes_per_bucket());
         data_ = new_data;
-        buckets_ = new_buckets;
-        capacity_slots_ = new_slots;
+        buckets_ = target_buckets;
+        capacity_slots_ = target_slots;
+        deleted_slots_ = 0;
 
         return true;
     }
@@ -2027,12 +3982,21 @@ class flat_hash_multi_set_gt {
                           equals_t const& equals)
             : index_(index), parent_(parent), query_(query), equals_(equals) {}
 
-        // Pre-increment
+        // Pre-increment: advance past tombstones and non-matching entries,
+        // stopping at the next matching live entry or an empty slot. When every
+        // slot is either live or tombstoned (no empty slot exists), the probe
+        // saturates after `capacity_slots_` steps and the iterator becomes
+        // `end()` - otherwise the loop would spin forever.
         equal_iterator_gt& operator++() {
-            do {
+            for (std::size_t remaining = parent_->capacity_slots_; remaining; --remaining) {
                 index_ = (index_ + 1) & (parent_->capacity_slots_ - 1);
-            } while (!equals_(parent_->slot_ref(index_).element, query_) &&
-                     (parent_->slot_ref(index_).header.populated & parent_->slot_ref(index_).mask));
+                auto slot = parent_->slot_ref(index_);
+                bool is_empty = ~slot.header.populated & slot.mask;
+                bool is_match = !(slot.header.deleted & slot.mask) && equals_(slot.element, query_);
+                if (is_empty || is_match)
+                    return *this;
+            }
+            index_ = parent_->capacity_slots_; // saturated probe -> end()
             return *this;
         }
 
@@ -2130,6 +4094,7 @@ class flat_hash_multi_set_gt {
                     // Found a match, mark as deleted
                     slot.header.deleted |= slot.mask;
                     --populated_slots_;
+                    ++deleted_slots_;
                     popped_value = slot.element;
                     return true; // Successfully removed
                 }
@@ -2165,6 +4130,7 @@ class flat_hash_multi_set_gt {
                     // Found a match, mark as deleted
                     slot.header.deleted |= slot.mask;
                     --populated_slots_;
+                    ++deleted_slots_;
                     ++count; // Increment count of elements removed
                 }
             } else {
@@ -2291,12 +4257,14 @@ class flat_hash_multi_set_gt {
 
     void reserve(std::size_t capacity) {
         if (!try_reserve(capacity))
-            throw std::bad_alloc();
+            usearch_raise_runtime_error("failed to reserve memory");
     }
 
     bool try_emplace(element_t const& element) noexcept {
-        // Check if we need to resize
-        if (populated_slots_ * 3u >= capacity_slots_ * 2u)
+        // Both live entries and tombstones consume slots a probe must walk past, so the
+        // load factor counts them together. Under churn the live count alone stays flat
+        // and would never trigger the rehash that reclaims the tombstones.
+        if ((populated_slots_ + deleted_slots_) * 3u >= capacity_slots_ * 2u)
             if (!try_reserve(populated_slots_ + 1))
                 return false;
 
@@ -2308,7 +4276,9 @@ class flat_hash_multi_set_gt {
         while (true) {
             slot_ref_t slot = slot_ref(slot_index);
             if ((~slot.header.populated & slot.mask) | (slot.header.deleted & slot.mask)) {
-                // Found an empty or deleted slot
+                // Found an empty or deleted slot; reusing a tombstone reclaims it.
+                // Read the tombstone bit before `populate_slot` clears it.
+                deleted_slots_ -= (slot.header.deleted & slot.mask) != 0;
                 populate_slot(slot, element);
                 ++populated_slots_;
                 return true;

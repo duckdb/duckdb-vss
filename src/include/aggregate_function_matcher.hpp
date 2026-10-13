@@ -24,10 +24,10 @@ inline bool AggregateFunctionExpressionMatcher::Match(Expression &expr_p, vector
 		return false;
 	}
 	auto &expr = expr_p.Cast<BoundAggregateExpression>();
-	if (!FunctionMatcher::Match(function, expr.function.name)) {
+	if (!FunctionMatcher::Match(function, expr.Function().name)) {
 		return false;
 	}
-	if (!SetMatcher::Match(matchers, expr.children, bindings, policy)) {
+	if (!SetMatcher::Match(matchers, expr.GetChildrenMutable(), bindings, policy)) {
 		return false;
 	}
 	return true;

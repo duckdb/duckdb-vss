@@ -52,4 +52,14 @@ Binder Error: HNSW index 'M0' must be at least 2
 statement ok
 CREATE INDEX idx ON embeddings USING HNSW (vec) WITH (ef_construction = 100, ef_search = 100, M = 3, M0 = 3);
 
+statement ok
+INSERT INTO embeddings VALUES (1, [1, 2, 3]), (2, [4, 5, 6]);
+
+statement ok
+SET hnsw_ef_search = 1;
+
+query I
+SELECT id FROM embeddings ORDER BY array_distance(vec, [1, 2, 3]::FLOAT[3]) LIMIT 1;
+----
+1
 

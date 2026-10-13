@@ -5,12 +5,8 @@
  *  @date       July 26, 2023
  */
 #pragma once
+#include "index.hpp"
 #include <stdlib.h> // `aligned_alloc`
-
-#include <functional> // `std::function`
-#include <numeric>    // `std::iota`
-#include <thread>     // `std::thread`
-#include <vector>     // `std::vector`
 
 #include <usearch/index.hpp>
 #include <usearch/index_plugins.hpp>
@@ -95,10 +91,32 @@ struct index_dense_head_result_t {
     }
 };
 
+/**
+ *  @brief  Configuration settings for the construction of dense
+ *          equidimensional vector indexes.
+ *
+ *  Unlike the underlying `index_gt` class, incorporates the
+ *  `::expansion_add` and `::expansion_search` parameters passed
+ *  separately for the lower-level engine.
+ */
 struct index_dense_config_t : public index_config_t {
     std::size_t expansion_add = default_expansion_add();
     std::size_t expansion_search = default_expansion_search();
+
+    /**
+     *  @brief  Excludes vectors from the serialized file.
+     *          This is handy when you want to store the vectors in a separate file.
+     *
+     *  ! For advanced users only.
+     */
     bool exclude_vectors = false;
+
+    /**
+     *  @brief  Allows you to store multiple vectors per key.
+     *          This is handy when a large document is chunked into many parts.
+     *
+     *  ! May degrade the performance of iterators.
+     */
     bool multi = false;
 
     /**
@@ -107,17 +125,37 @@ struct index_dense_config_t : public index_config_t {
      *          the vectors-to-keys mappings.
      *
      *  ! This configuration parameter doesn't affect the serialized file,
-     *  ! and is not preserved between runs. Makes sense for small vector
-     *  ! representations that fit ina  single cache line.
+     *  ! and is not preserved between runs. Makes sense for smaller vectors
+     *  ! that fit in a couple of cache lines.
+     *
+     *  The trade-off is that some methods won't be available, like `get`, `rename`,
+     *  and `remove`. The basic functionality, like `add` and `search` will work as
+     *  expected even with `enable_key_lookups = false`.
+     *
+     *  If both `!multi && !enable_key_lookups`, the "duplicate entry" checks won't
+     *  be performed and no errors will be raised.
      */
     bool enable_key_lookups = true;
 
-    index_dense_config_t(index_config_t base) noexcept : index_config_t(base) {}
+    inline index_dense_config_t(index_config_t base) noexcept : index_config_t(base) {}
 
-    index_dense_config_t(std::size_t c = default_connectivity(), std::size_t ea = default_expansion_add(),
-                         std::size_t es = default_expansion_search()) noexcept
-        : index_config_t(c), expansion_add(ea ? ea : default_expansion_add()),
-          expansion_search(es ? es : default_expansion_search()) {}
+    inline index_dense_config_t(std::size_t c = 0, std::size_t ea = 0, std::size_t es = 0) noexcept
+        : index_config_t(c), expansion_add(ea), expansion_search(es) {}
+
+    /**
+     *  @brief  Validates the configuration settings, updating them in-place.
+     *  @return Error message, if any.
+     */
+    inline error_t validate() noexcept {
+        error_t error = index_config_t::validate();
+        if (error)
+            return error;
+        if (expansion_add == 0)
+            expansion_add = default_expansion_add();
+        if (expansion_search == 0)
+            expansion_search = default_expansion_search();
+        return {};
+    }
 };
 
 struct index_dense_clustering_config_t {
@@ -170,6 +208,45 @@ struct index_dense_metadata_result_t {
 };
 
 /**
+ *  @brief  Fixes serialized scalar-kind codes for pre-v2.10 versions, until we can upgrade to v3.
+ *          The old enum `scalar_kind_t` is defined without explicit constants from 0.
+ */
+inline scalar_kind_t convert_pre_2_10_scalar_kind(scalar_kind_t scalar_kind) noexcept {
+    switch (static_cast<std::underlying_type<scalar_kind_t>::type>(scalar_kind)) {
+    case 0: return scalar_kind_t::unknown_k;
+    case 1: return scalar_kind_t::b1x8_k;
+    case 2: return scalar_kind_t::u40_k;
+    case 3: return scalar_kind_t::uuid_k;
+    case 4: return scalar_kind_t::f64_k;
+    case 5: return scalar_kind_t::f32_k;
+    case 6: return scalar_kind_t::f16_k;
+    case 7: return scalar_kind_t::e5m2_k;
+    case 8: return scalar_kind_t::u64_k;
+    case 9: return scalar_kind_t::u32_k;
+    case 10: return scalar_kind_t::u8_k;
+    case 11: return scalar_kind_t::i64_k;
+    case 12: return scalar_kind_t::i32_k;
+    case 13: return scalar_kind_t::i16_k;
+    case 14: return scalar_kind_t::i8_k;
+    default: return scalar_kind;
+    }
+}
+
+/**
+ *  @brief  Fixes the metadata for pre-v2.10 versions, until we can upgrade to v3.
+ *          Originates from: https://github.com/unum-cloud/USearch/issues/423
+ */
+inline void fix_pre_2_10_metadata(index_dense_head_t& head) {
+    if (head.version_major == 2 && head.version_minor < 10) {
+        head.kind_scalar = convert_pre_2_10_scalar_kind(head.kind_scalar);
+        head.kind_key = convert_pre_2_10_scalar_kind(head.kind_key);
+        head.kind_compressed_slot = convert_pre_2_10_scalar_kind(head.kind_compressed_slot);
+        head.version_minor = 10;
+        head.version_patch = 0;
+    }
+}
+
+/**
  *  @brief  Extracts metadata from a pre-constructed index on disk,
  *          without loading it or mapping the whole binary file.
  */
@@ -186,8 +263,10 @@ inline index_dense_metadata_result_t index_dense_metadata_from_path(char const* 
 
     // Check if the file immediately starts with the index, instead of vectors
     result.config.exclude_vectors = true;
-    if (std::memcmp(result.head_buffer, default_magic(), std::strlen(default_magic())) == 0)
+    if (std::memcmp(result.head_buffer, default_magic(), std::strlen(default_magic())) == 0) {
+        fix_pre_2_10_metadata(result.head);
         return result;
+    }
 
     if (std::fseek(file.get(), 0L, SEEK_END) != 0)
         return result.failed("Can't infer file size");
@@ -197,15 +276,22 @@ inline index_dense_metadata_result_t index_dense_metadata_from_path(char const* 
 
     std::uint32_t dimensions_u32[2]{0};
     std::memcpy(dimensions_u32, result.head_buffer, sizeof(dimensions_u32));
-    std::size_t offset_if_u32 = std::size_t(dimensions_u32[0]) * dimensions_u32[1] + sizeof(dimensions_u32);
+    checked_size_result_t offset_if_u32 =
+        checked_mul_add(std::size_t(dimensions_u32[0]), std::size_t(dimensions_u32[1]), sizeof(dimensions_u32));
 
     std::uint64_t dimensions_u64[2]{0};
     std::memcpy(dimensions_u64, result.head_buffer, sizeof(dimensions_u64));
-    std::size_t offset_if_u64 = std::size_t(dimensions_u64[0]) * dimensions_u64[1] + sizeof(dimensions_u64);
+    checked_size_result_t rows_if_u64 = checked_size_from_u64(dimensions_u64[0]);
+    checked_size_result_t columns_if_u64 = checked_size_from_u64(dimensions_u64[1]);
+    checked_size_result_t offset_if_u64 =
+        rows_if_u64 && columns_if_u64 ? checked_mul_add(rows_if_u64.value, columns_if_u64.value, sizeof(dimensions_u64))
+                                      : checked_size_overflow();
 
     // Check if it starts with 32-bit
-    if (offset_if_u32 + sizeof(index_dense_head_buffer_t) < file_size) {
-        if (std::fseek(file.get(), static_cast<long>(offset_if_u32), SEEK_SET) != 0)
+    checked_size_result_t head_offset_if_u32 =
+        offset_if_u32 ? checked_add(offset_if_u32.value, sizeof(index_dense_head_buffer_t)) : offset_if_u32;
+    if (head_offset_if_u32 && head_offset_if_u32.value < file_size) {
+        if (std::fseek(file.get(), static_cast<long>(offset_if_u32.value), SEEK_SET) != 0)
             return result.failed(std::strerror(errno));
         read = std::fread(result.head_buffer, sizeof(index_dense_head_buffer_t), 1, file.get());
         if (!read)
@@ -213,13 +299,17 @@ inline index_dense_metadata_result_t index_dense_metadata_from_path(char const* 
 
         result.config.exclude_vectors = false;
         result.config.use_64_bit_dimensions = false;
-        if (std::memcmp(result.head_buffer, default_magic(), std::strlen(default_magic())) == 0)
+        if (std::memcmp(result.head_buffer, default_magic(), std::strlen(default_magic())) == 0) {
+            fix_pre_2_10_metadata(result.head);
             return result;
+        }
     }
 
     // Check if it starts with 64-bit
-    if (offset_if_u64 + sizeof(index_dense_head_buffer_t) < file_size) {
-        if (std::fseek(file.get(), static_cast<long>(offset_if_u64), SEEK_SET) != 0)
+    checked_size_result_t head_offset_if_u64 =
+        offset_if_u64 ? checked_add(offset_if_u64.value, sizeof(index_dense_head_buffer_t)) : offset_if_u64;
+    if (head_offset_if_u64 && head_offset_if_u64.value < file_size) {
+        if (std::fseek(file.get(), static_cast<long>(offset_if_u64.value), SEEK_SET) != 0)
             return result.failed(std::strerror(errno));
         read = std::fread(result.head_buffer, sizeof(index_dense_head_buffer_t), 1, file.get());
         if (!read)
@@ -228,8 +318,10 @@ inline index_dense_metadata_result_t index_dense_metadata_from_path(char const* 
         // Check if it starts with 64-bit
         result.config.exclude_vectors = false;
         result.config.use_64_bit_dimensions = true;
-        if (std::memcmp(result.head_buffer, default_magic(), std::strlen(default_magic())) == 0)
+        if (std::memcmp(result.head_buffer, default_magic(), std::strlen(default_magic())) == 0) {
+            fix_pre_2_10_metadata(result.head);
             return result;
+        }
     }
 
     return result.failed("Not a dense USearch index!");
@@ -238,7 +330,7 @@ inline index_dense_metadata_result_t index_dense_metadata_from_path(char const* 
 /**
  *  @brief  Extracts metadata from a pre-constructed index serialized into an in-memory buffer.
  */
-inline index_dense_metadata_result_t index_dense_metadata_from_buffer(memory_mapped_file_t file,
+inline index_dense_metadata_result_t index_dense_metadata_from_buffer(memory_mapped_file_t const& file,
                                                                       std::size_t offset = 0) noexcept {
     index_dense_metadata_result_t result;
 
@@ -246,7 +338,7 @@ inline index_dense_metadata_result_t index_dense_metadata_from_buffer(memory_map
     if (offset + sizeof(index_dense_head_buffer_t) >= file.size())
         return result.failed("End of file reached!");
 
-    byte_t* const file_data = file.data() + offset;
+    byte_t const* file_data = file.data() + offset;
     std::size_t const file_size = file.size() - offset;
     std::memcpy(&result.head_buffer, file_data, sizeof(index_dense_head_buffer_t));
 
@@ -258,15 +350,22 @@ inline index_dense_metadata_result_t index_dense_metadata_from_buffer(memory_map
     // Check if it starts with 32-bit
     std::uint32_t dimensions_u32[2]{0};
     std::memcpy(dimensions_u32, result.head_buffer, sizeof(dimensions_u32));
-    std::size_t offset_if_u32 = std::size_t(dimensions_u32[0]) * dimensions_u32[1] + sizeof(dimensions_u32);
+    checked_size_result_t offset_if_u32 =
+        checked_mul_add(std::size_t(dimensions_u32[0]), std::size_t(dimensions_u32[1]), sizeof(dimensions_u32));
 
     std::uint64_t dimensions_u64[2]{0};
     std::memcpy(dimensions_u64, result.head_buffer, sizeof(dimensions_u64));
-    std::size_t offset_if_u64 = std::size_t(dimensions_u64[0]) * dimensions_u64[1] + sizeof(dimensions_u64);
+    checked_size_result_t rows_if_u64 = checked_size_from_u64(dimensions_u64[0]);
+    checked_size_result_t columns_if_u64 = checked_size_from_u64(dimensions_u64[1]);
+    checked_size_result_t offset_if_u64 =
+        rows_if_u64 && columns_if_u64 ? checked_mul_add(rows_if_u64.value, columns_if_u64.value, sizeof(dimensions_u64))
+                                      : checked_size_overflow();
 
     // Check if it starts with 32-bit
-    if (offset_if_u32 + sizeof(index_dense_head_buffer_t) < file_size) {
-        std::memcpy(&result.head_buffer, file_data + offset_if_u32, sizeof(index_dense_head_buffer_t));
+    checked_size_result_t head_offset_if_u32 =
+        offset_if_u32 ? checked_add(offset_if_u32.value, sizeof(index_dense_head_buffer_t)) : offset_if_u32;
+    if (head_offset_if_u32 && head_offset_if_u32.value < file_size) {
+        std::memcpy(&result.head_buffer, file_data + offset_if_u32.value, sizeof(index_dense_head_buffer_t));
         result.config.exclude_vectors = false;
         result.config.use_64_bit_dimensions = false;
         if (std::memcmp(result.head_buffer, default_magic(), std::strlen(default_magic())) == 0)
@@ -274,8 +373,10 @@ inline index_dense_metadata_result_t index_dense_metadata_from_buffer(memory_map
     }
 
     // Check if it starts with 64-bit
-    if (offset_if_u64 + sizeof(index_dense_head_buffer_t) < file_size) {
-        std::memcpy(&result.head_buffer, file_data + offset_if_u64, sizeof(index_dense_head_buffer_t));
+    checked_size_result_t head_offset_if_u64 =
+        offset_if_u64 ? checked_add(offset_if_u64.value, sizeof(index_dense_head_buffer_t)) : offset_if_u64;
+    if (head_offset_if_u64 && head_offset_if_u64.value < file_size) {
+        std::memcpy(&result.head_buffer, file_data + offset_if_u64.value, sizeof(index_dense_head_buffer_t));
         result.config.exclude_vectors = false;
         result.config.use_64_bit_dimensions = true;
         if (std::memcmp(result.head_buffer, default_magic(), std::strlen(default_magic())) == 0)
@@ -323,8 +424,6 @@ class index_dense_gt {
     using tape_allocator_t = memory_mapping_allocator_gt<64>;
 
   private:
-    /// @brief Schema: input buffer, bytes in input buffer, output buffer.
-    using cast_t = std::function<bool(byte_t const*, std::size_t, byte_t*)>;
     /// @brief Punned index.
     using index_t = index_gt<                        //
         distance_t, vector_key_t, compressed_slot_t, //
@@ -359,20 +458,11 @@ class index_dense_gt {
     index_dense_config_t config_;
     index_t* typed_ = nullptr;
 
-    mutable std::vector<byte_t> cast_buffer_;
-    struct casts_t {
-        cast_t from_b1x8;
-        cast_t from_i8;
-        cast_t from_f16;
-        cast_t from_f32;
-        cast_t from_f64;
+    using cast_buffer_t = buffer_gt<byte_t, dynamic_allocator_t>;
 
-        cast_t to_b1x8;
-        cast_t to_i8;
-        cast_t to_f16;
-        cast_t to_f32;
-        cast_t to_f64;
-    } casts_;
+    /// @brief  Temporary memory for every thread to store a casted vector.
+    mutable cast_buffer_t cast_buffer_;
+    casts_punned_t casts_;
 
     /// @brief An instance of a potentially stateful `metric_t` used to initialize copies and forks.
     metric_t metric_;
@@ -381,11 +471,17 @@ class index_dense_gt {
     /// @brief Allocator for the copied vectors, aligned to widest double-precision scalars.
     vectors_tape_allocator_t vectors_tape_allocator_;
 
-    /// @brief For every managed `compressed_slot_t` stores a pointer to the allocated vector copy.
-    mutable std::vector<byte_t*> vectors_lookup_;
+    using vectors_lookup_allocator_t = aligned_allocator_gt<byte_t*, 64>;
+    using vectors_lookup_t = buffer_gt<byte_t*, vectors_lookup_allocator_t>;
 
-    /// @brief Originally forms and array of integers [0, threads], marking all
-    mutable std::vector<std::size_t> available_threads_;
+    /// @brief For every managed `compressed_slot_t` stores a pointer to the allocated vector copy.
+    mutable vectors_lookup_t vectors_lookup_;
+
+    using available_threads_allocator_t = aligned_allocator_gt<std::size_t, 64>;
+    using available_threads_t = ring_gt<std::size_t, available_threads_allocator_t>;
+
+    /// @brief Originally forms and array of integers [0, threads], marking all as available.
+    mutable available_threads_t available_threads_;
 
     /// @brief Mutex, controlling concurrent access to `available_threads_`.
     mutable std::mutex available_threads_mutex_;
@@ -408,8 +504,8 @@ class index_dense_gt {
 
     struct lookup_key_hash_t {
         using is_transparent = void;
-        std::size_t operator()(key_and_slot_t const& k) const noexcept { return std::hash<vector_key_t>{}(k.key); }
-        std::size_t operator()(vector_key_t const& k) const noexcept { return std::hash<vector_key_t>{}(k); }
+        std::size_t operator()(key_and_slot_t const& k) const noexcept { return hash_gt<vector_key_t>{}(k.key); }
+        std::size_t operator()(vector_key_t const& k) const noexcept { return hash_gt<vector_key_t>{}(k); }
     };
 
     struct lookup_key_same_t {
@@ -434,12 +530,59 @@ class index_dense_gt {
     /// @brief A constant for the reserved key value, used to mark deleted entries.
     vector_key_t free_key_ = default_free_value<vector_key_t>();
 
+    /// @brief Locks the thread for the duration of the operation.
+    struct thread_lock_t {
+        index_dense_gt const& parent;
+        std::size_t thread_id = 0;
+        bool engaged = false;
+
+        ~thread_lock_t() usearch_noexcept_m {
+            if (engaged)
+                parent.thread_unlock_(thread_id);
+        }
+
+        thread_lock_t(thread_lock_t const&) = delete;
+        thread_lock_t& operator=(thread_lock_t const&) = delete;
+
+        thread_lock_t(index_dense_gt const& parent, std::size_t thread_id, bool engaged = true) noexcept
+            : parent(parent), thread_id(thread_id), engaged(engaged) {}
+        thread_lock_t(thread_lock_t&& other) noexcept
+            : parent(other.parent), thread_id(other.thread_id), engaged(other.engaged) {
+            other.engaged = false;
+        }
+        explicit operator bool() const noexcept {
+            return parent.typed_ && thread_id != any_thread() && thread_id < parent.typed_->limits().threads();
+        }
+    };
+
   public:
-    using search_result_t = typename index_t::search_result_t;
     using cluster_result_t = typename index_t::cluster_result_t;
     using add_result_t = typename index_t::add_result_t;
     using stats_t = typename index_t::stats_t;
     using match_t = typename index_t::match_t;
+
+    /**
+     *  @brief  A search result, containing the found keys and distances.
+     *
+     *  As the `index_dense_gt` manages the thread-pool on its own, the search result
+     *  preserves the thread-lock to avoid undefined behaviors, when other threads
+     *  start overwriting the results.
+     */
+    struct search_result_t : public index_t::search_result_t {
+        inline search_result_t(index_dense_gt const& parent) noexcept
+            : index_t::search_result_t(), lock_(parent, 0, false) {}
+        search_result_t failed(error_t message) noexcept {
+            this->error = std::move(message);
+            return std::move(*this);
+        }
+
+      private:
+        friend class index_dense_gt;
+        thread_lock_t lock_;
+
+        inline search_result_t(typename index_t::search_result_t result, thread_lock_t lock) noexcept
+            : index_t::search_result_t(std::move(result)), lock_(std::move(lock)) {}
+    };
 
     index_dense_gt() = default;
     index_dense_gt(index_dense_gt&& other)
@@ -491,51 +634,73 @@ class index_dense_gt {
         typed_ = nullptr;
     }
 
+    struct state_result_t {
+        index_dense_gt index;
+        error_t error;
+
+        explicit operator bool() const noexcept { return !error; }
+        state_result_t failed(error_t message) noexcept {
+            error = std::move(message);
+            return std::move(*this);
+        }
+        operator index_dense_gt&&() && {
+            if (error)
+                usearch_raise_runtime_error(error.what());
+            return std::move(index);
+        }
+    };
+    using copy_result_t = state_result_t;
+
     /**
      *  @brief Constructs an instance of ::index_dense_gt.
      *  @param[in] metric One of the provided or an @b ad-hoc metric, type-punned.
      *  @param[in] config The index configuration (optional).
      *  @param[in] free_key The key used for freed vectors (optional).
-     *  @return An instance of ::index_dense_gt.
+     *  @param[in] limits Initial reservation. Default sizes the thread pool to
+     *                    @c hardware_concurrency(); pass @c {unreserved} to skip.
+     *  @return An instance of ::index_dense_gt or error, wrapped in a `state_result_t`.
      */
-    static index_dense_gt make(           //
-        metric_t metric,                  //
+    static state_result_t make(           //
+        metric_t metric = {},             //
         index_dense_config_t config = {}, //
-        vector_key_t free_key = default_free_value<vector_key_t>()) {
+        vector_key_t free_key = default_free_value<vector_key_t>(), index_limits_t limits = {}) {
 
-        scalar_kind_t scalar_kind = metric.scalar_kind();
-        std::size_t hardware_threads = std::thread::hardware_concurrency();
-
-        index_dense_gt result;
-        result.config_ = config;
-        result.cast_buffer_.resize(hardware_threads * metric.bytes_per_vector());
-        result.casts_ = make_casts_(scalar_kind);
-        result.metric_ = metric;
-        result.free_key_ = free_key;
-
-        // Fill the thread IDs.
-        result.available_threads_.resize(hardware_threads);
-        std::iota(result.available_threads_.begin(), result.available_threads_.end(), 0ul);
-
-        // Available since C11, but only C++17, so we use the C version.
+        if (metric.missing())
+            return state_result_t{}.failed("Metric won't be initialized!");
+        error_t error = config.validate();
+        if (error)
+            return state_result_t{}.failed(std::move(error));
         index_t* raw = index_allocator_t{}.allocate(1);
+        if (!raw)
+            return state_result_t{}.failed("Failed to allocate memory for the index!");
+
+        state_result_t result;
+        index_dense_gt& index = result.index;
+        index.config_ = config;
+        index.free_key_ = free_key;
+        index.casts_ = casts_punned_t::make(metric.scalar_kind());
+        index.metric_ = metric;
+
         new (raw) index_t(config);
-        result.typed_ = raw;
+        index.typed_ = raw;
+
+        if (!index.try_reserve(limits))
+            return state_result_t{}.failed("Failed to reserve memory for the index!");
+
         return result;
     }
 
-    static index_dense_gt make(char const* path, bool view = false) {
-        index_dense_metadata_result_t meta = index_dense_metadata_from_path(path);
-        if (!meta)
-            return {};
-        metric_punned_t metric(meta.head.dimensions, meta.head.kind_metric, meta.head.kind_scalar);
-        index_dense_gt result = make(metric);
-        if (!result)
-            return result;
-        if (view)
-            result.view(path);
-        else
-            result.load(path);
+    /**
+     *  @brief Constructs an instance of ::index_dense_gt from a serialized binary file.
+     *  @param[in] path The path to the binary file.
+     *  @param[in] view Whether to map the file into memory or load it.
+     *  @return An instance of ::index_dense_gt or error, wrapped in a `state_result_t`.
+     */
+    static state_result_t make(char const* path, bool view = false) {
+        state_result_t result;
+        serialization_result_t serialization_result = view ? result.index.view(path) : result.index.load(path);
+        if (!serialization_result)
+            return result.failed(std::move(serialization_result.error));
         return result;
     }
 
@@ -543,19 +708,54 @@ class index_dense_gt {
     std::size_t connectivity() const { return typed_->connectivity(); }
     std::size_t size() const { return typed_->size() - free_keys_.size(); }
     std::size_t capacity() const { return typed_->capacity(); }
-    std::size_t max_level() const noexcept { return typed_->max_level(); }
+    std::size_t max_level() const { return typed_->max_level(); }
     index_dense_config_t const& config() const { return config_; }
     index_limits_t const& limits() const { return typed_->limits(); }
+    double inverse_log_connectivity() const { return typed_->inverse_log_connectivity(); }
+    std::size_t neighbors_base_bytes() const { return typed_->neighbors_base_bytes(); }
+    std::size_t neighbors_bytes() const { return typed_->neighbors_bytes(); }
     bool multi() const { return config_.multi; }
+    std::size_t currently_available_threads() const {
+        std::unique_lock<std::mutex> available_threads_lock(available_threads_mutex_);
+        return available_threads_.size();
+    }
 
     // The metric and its properties
     metric_t const& metric() const { return metric_; }
-    void change_metric(metric_t metric) { metric_ = std::move(metric); }
 
-    scalar_kind_t scalar_kind() const noexcept { return metric_.scalar_kind(); }
-    std::size_t bytes_per_vector() const noexcept { return metric_.bytes_per_vector(); }
-    std::size_t scalar_words() const noexcept { return metric_.scalar_words(); }
-    std::size_t dimensions() const noexcept { return metric_.dimensions(); }
+    /**
+     *  @brief Replaces the active distance metric, resizing the per-thread cast
+     *         buffer and rebuilding the cast dispatch table if the new metric
+     *         changes @c bytes_per_vector() or @c scalar_kind().
+     *  @return @c false if the cast buffer can't be re-allocated; the metric is
+     *          left untouched in that case so the index stays consistent.
+     */
+    bool try_change_metric(metric_t metric) noexcept {
+        checked_size_result_t needed_bytes = checked_mul(limits().threads(), metric.bytes_per_vector());
+        if (!needed_bytes)
+            return false;
+        if (needed_bytes.value > cast_buffer_.size()) {
+            cast_buffer_t new_buffer(needed_bytes.value);
+            if (!new_buffer)
+                return false;
+            cast_buffer_ = std::move(new_buffer);
+        }
+        casts_ = casts_punned_t::make(metric.scalar_kind());
+        metric_ = std::move(metric);
+        return true;
+    }
+
+    /// @brief Throwing counterpart of @ref try_change_metric.
+    void change_metric(metric_t metric) {
+        if (!try_change_metric(std::move(metric)))
+            usearch_raise_runtime_error("failed to grow cast buffer for the new metric");
+    }
+
+    scalar_kind_t scalar_kind() const { return metric_.scalar_kind(); }
+    metric_kind_t metric_kind() const { return metric_.metric_kind(); }
+    std::size_t bytes_per_vector() const { return metric_.bytes_per_vector(); }
+    std::size_t scalar_words() const { return metric_.scalar_words(); }
+    std::size_t dimensions() const { return metric_.dimensions(); }
 
     // Fetching and changing search criteria
     std::size_t expansion_add() const { return config_.expansion_add; }
@@ -565,8 +765,6 @@ class index_dense_gt {
 
     member_citerator_t cbegin() const { return typed_->cbegin(); }
     member_citerator_t cend() const { return typed_->cend(); }
-    member_citerator_t begin() const { return typed_->begin(); }
-    member_citerator_t end() const { return typed_->end(); }
     member_iterator_t begin() { return typed_->begin(); }
     member_iterator_t end() { return typed_->end(); }
 
@@ -574,6 +772,45 @@ class index_dense_gt {
     stats_t stats(std::size_t level) const { return typed_->stats(level); }
     stats_t stats(stats_t* stats_per_level, std::size_t max_level) const {
         return typed_->stats(stats_per_level, max_level);
+    }
+
+    using neighbors_view_t = typename index_t::neighbors_view_t;
+
+    /**
+     *  @brief  Returns a read-only range over the neighbors of @p key at the given
+     *          graph @p level.
+     *
+     *          For multi-key indexes, returns the neighbors of the first matching
+     *          slot; iterate through `cbegin()`/`cend()` and call the underlying
+     *          `index_gt::neighbors(member_citerator_t, std::size_t)` overload to
+     *          inspect every copy of a duplicated key.
+     *
+     *  @return An empty view if the key is not present, or if @p level exceeds
+     *          the node's level.
+     *  @warning The view aliases the node's adjacency tape. Hold no concurrent
+     *           `add`/`update`/`remove` for the lifetime of the view.
+     */
+    neighbors_view_t neighbors(vector_key_t key, std::size_t level) const {
+        usearch_assert_m(config().enable_key_lookups, "Key lookups are disabled");
+        shared_lock_t lookup_lock(slot_lookup_mutex_);
+        auto matching_slots = slot_lookup_.equal_range(key_and_slot_t::any_slot(key));
+        if (matching_slots.first == matching_slots.second)
+            return {};
+        compressed_slot_t slot = (*matching_slots.first).slot;
+        return typed_->neighbors(slot, level);
+    }
+
+    /**
+     *  @brief  Returns the top graph level at which @p key is present, or zero
+     *          if the key is not in the index.
+     */
+    std::size_t level_of(vector_key_t key) const {
+        usearch_assert_m(config().enable_key_lookups, "Key lookups are disabled");
+        shared_lock_t lookup_lock(slot_lookup_mutex_);
+        auto matching_slots = slot_lookup_.equal_range(key_and_slot_t::any_slot(key));
+        if (matching_slots.first == matching_slots.second)
+            return 0;
+        return typed_->level_of((*matching_slots.first).slot);
     }
 
     dynamic_allocator_t const& allocator() const { return typed_->dynamic_allocator(); }
@@ -593,8 +830,36 @@ class index_dense_gt {
             vectors_tape_allocator_.total_allocated();
     }
 
-    static constexpr std::size_t any_thread() { return std::numeric_limits<std::size_t>::max(); }
-    static constexpr distance_t infinite_distance() { return std::numeric_limits<distance_t>::max(); }
+    /**
+     *  @brief  Aggregated memory statistics for the allocator tapes used by the dense index.
+     */
+    struct memory_stats_t {
+        /// Memory stats for the graph structure allocator.
+        std::size_t graph_allocated;
+        std::size_t graph_wasted;
+        std::size_t graph_reserved;
+        /// Memory stats for the vectors data allocator.
+        std::size_t vectors_allocated;
+        std::size_t vectors_wasted;
+        std::size_t vectors_reserved;
+    };
+
+    /**
+     *  @brief  Returns detailed memory statistics with separate breakdowns for the graph
+     *          and vectors allocator tapes.
+     *  @return A `memory_stats_t` struct with per-tape allocated, wasted, and reserved bytes.
+     */
+    memory_stats_t memory_stats() const {
+        auto const& graph_alloc = typed_->tape_allocator();
+        return {
+            graph_alloc.total_allocated(),          graph_alloc.total_wasted(),
+            graph_alloc.total_reserved(),           vectors_tape_allocator_.total_allocated(),
+            vectors_tape_allocator_.total_wasted(), vectors_tape_allocator_.total_reserved(),
+        };
+    }
+
+    static constexpr std::size_t any_thread() { return (std::numeric_limits<std::size_t>::max)(); }
+    static constexpr distance_t infinite_distance() { return (std::numeric_limits<distance_t>::max)(); }
 
     struct aggregated_distances_t {
         std::size_t count = 0;
@@ -604,47 +869,93 @@ class index_dense_gt {
     };
 
     // clang-format off
-    add_result_t add(vector_key_t key, b1x8_t const* vector, std::size_t thread = any_thread(), bool force_vector_copy = true) { return add_(key, vector, thread, force_vector_copy, casts_.from_b1x8); }
-    add_result_t add(vector_key_t key, i8_t const* vector, std::size_t thread = any_thread(), bool force_vector_copy = true) { return add_(key, vector, thread, force_vector_copy, casts_.from_i8); }
-    add_result_t add(vector_key_t key, f16_t const* vector, std::size_t thread = any_thread(), bool force_vector_copy = true) { return add_(key, vector, thread, force_vector_copy, casts_.from_f16); }
-    add_result_t add(vector_key_t key, f32_t const* vector, std::size_t thread = any_thread(), bool force_vector_copy = true) { return add_(key, vector, thread, force_vector_copy, casts_.from_f32); }
-    add_result_t add(vector_key_t key, f64_t const* vector, std::size_t thread = any_thread(), bool force_vector_copy = true) { return add_(key, vector, thread, force_vector_copy, casts_.from_f64); }
+    add_result_t add(vector_key_t key, f64_t const* vector, std::size_t thread = any_thread(), bool copy_vector = true) { return add_(key, vector, thread, copy_vector, casts_.from.f64); }
+    add_result_t add(vector_key_t key, f32_t const* vector, std::size_t thread = any_thread(), bool copy_vector = true) { return add_(key, vector, thread, copy_vector, casts_.from.f32); }
+    add_result_t add(vector_key_t key, bf16_t const* vector, std::size_t thread = any_thread(), bool copy_vector = true) { return add_(key, vector, thread, copy_vector, casts_.from.bf16); }
+    add_result_t add(vector_key_t key, f16_t const* vector, std::size_t thread = any_thread(), bool copy_vector = true) { return add_(key, vector, thread, copy_vector, casts_.from.f16); }
+    add_result_t add(vector_key_t key, e5m2_t const* vector, std::size_t thread = any_thread(), bool copy_vector = true) { return add_(key, vector, thread, copy_vector, casts_.from.e5m2); }
+    add_result_t add(vector_key_t key, e4m3_t const* vector, std::size_t thread = any_thread(), bool copy_vector = true) { return add_(key, vector, thread, copy_vector, casts_.from.e4m3); }
+    add_result_t add(vector_key_t key, e3m2_t const* vector, std::size_t thread = any_thread(), bool copy_vector = true) { return add_(key, vector, thread, copy_vector, casts_.from.e3m2); }
+    add_result_t add(vector_key_t key, e2m3_t const* vector, std::size_t thread = any_thread(), bool copy_vector = true) { return add_(key, vector, thread, copy_vector, casts_.from.e2m3); }
+    add_result_t add(vector_key_t key, i8_t const* vector, std::size_t thread = any_thread(), bool copy_vector = true) { return add_(key, vector, thread, copy_vector, casts_.from.i8); }
+    add_result_t add(vector_key_t key, u8_t const* vector, std::size_t thread = any_thread(), bool copy_vector = true) { return add_(key, vector, thread, copy_vector, casts_.from.u8); }
+    add_result_t add(vector_key_t key, b1x8_t const* vector, std::size_t thread = any_thread(), bool copy_vector = true) { return add_(key, vector, thread, copy_vector, casts_.from.b1x8); }
 
-    search_result_t search(b1x8_t const* vector, std::size_t wanted, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, dummy_predicate_t {}, thread, exact, casts_.from_b1x8, config_.expansion_search); }
-    search_result_t search(i8_t const* vector, std::size_t wanted, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, dummy_predicate_t {}, thread, exact, casts_.from_i8, config_.expansion_search); }
-    search_result_t search(f16_t const* vector, std::size_t wanted, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, dummy_predicate_t {}, thread, exact, casts_.from_f16, config_.expansion_search); }
-    search_result_t search(f32_t const* vector, std::size_t wanted, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, dummy_predicate_t {}, thread, exact, casts_.from_f32, config_.expansion_search); }
-    search_result_t search(f64_t const* vector, std::size_t wanted, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, dummy_predicate_t {}, thread, exact, casts_.from_f64, config_.expansion_search); }
+    search_result_t search(f64_t const* vector, std::size_t wanted, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, dummy_predicate_t {}, thread, exact, casts_.from.f64); }
+    search_result_t search(f32_t const* vector, std::size_t wanted, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, dummy_predicate_t {}, thread, exact, casts_.from.f32); }
+    search_result_t search(bf16_t const* vector, std::size_t wanted, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, dummy_predicate_t {}, thread, exact, casts_.from.bf16); }
+    search_result_t search(f16_t const* vector, std::size_t wanted, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, dummy_predicate_t {}, thread, exact, casts_.from.f16); }
+    search_result_t search(e5m2_t const* vector, std::size_t wanted, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, dummy_predicate_t {}, thread, exact, casts_.from.e5m2); }
+    search_result_t search(e4m3_t const* vector, std::size_t wanted, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, dummy_predicate_t {}, thread, exact, casts_.from.e4m3); }
+    search_result_t search(e3m2_t const* vector, std::size_t wanted, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, dummy_predicate_t {}, thread, exact, casts_.from.e3m2); }
+    search_result_t search(e2m3_t const* vector, std::size_t wanted, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, dummy_predicate_t {}, thread, exact, casts_.from.e2m3); }
+    search_result_t search(i8_t const* vector, std::size_t wanted, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, dummy_predicate_t {}, thread, exact, casts_.from.i8); }
+    search_result_t search(u8_t const* vector, std::size_t wanted, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, dummy_predicate_t {}, thread, exact, casts_.from.u8); }
+    search_result_t search(b1x8_t const* vector, std::size_t wanted, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, dummy_predicate_t {}, thread, exact, casts_.from.b1x8); }
 
-    search_result_t ef_search(b1x8_t const* vector, std::size_t wanted, std::size_t ef_search, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, dummy_predicate_t {}, thread, exact, casts_.from_b1x8, ef_search); }
-    search_result_t ef_search(i8_t const* vector, std::size_t wanted, std::size_t ef_search, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, dummy_predicate_t {}, thread, exact, casts_.from_i8, ef_search); }
-    search_result_t ef_search(f16_t const* vector, std::size_t wanted, std::size_t ef_search, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, dummy_predicate_t {}, thread, exact, casts_.from_f16, ef_search); }
-    search_result_t ef_search(f32_t const* vector, std::size_t wanted, std::size_t ef_search, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, dummy_predicate_t {}, thread, exact, casts_.from_f32, ef_search); }
-    search_result_t ef_search(f64_t const* vector, std::size_t wanted, std::size_t ef_search, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, dummy_predicate_t {}, thread, exact, casts_.from_f64, ef_search); }
+    search_result_t ef_search(f32_t const* vector, std::size_t wanted, std::size_t ef_search, std::size_t thread = any_thread(), bool exact = false) const {
+        index_search_config_t search_config;
+        search_config.thread = thread;
+        search_config.expansion = ef_search;
+        search_config.exact = exact;
+        return search_(vector, wanted, dummy_predicate_t {}, search_config, casts_.from.f32);
+    }
 
-    template <typename predicate_at> search_result_t filtered_search(b1x8_t const* vector, std::size_t wanted, predicate_at&& predicate, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, std::forward<predicate_at>(predicate), thread, exact, casts_.from_b1x8, config_.expansion_search); }
-    template <typename predicate_at> search_result_t filtered_search(i8_t const* vector, std::size_t wanted, predicate_at&& predicate, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, std::forward<predicate_at>(predicate), thread, exact, casts_.from_i8, config_.expansion_search); }
-    template <typename predicate_at> search_result_t filtered_search(f16_t const* vector, std::size_t wanted, predicate_at&& predicate, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, std::forward<predicate_at>(predicate), thread, exact, casts_.from_f16, config_.expansion_search); }
-    template <typename predicate_at> search_result_t filtered_search(f32_t const* vector, std::size_t wanted, predicate_at&& predicate, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, std::forward<predicate_at>(predicate), thread, exact, casts_.from_f32, config_.expansion_search); }
-    template <typename predicate_at> search_result_t filtered_search(f64_t const* vector, std::size_t wanted, predicate_at&& predicate, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, std::forward<predicate_at>(predicate), thread, exact, casts_.from_f64, config_.expansion_search); }
+    template <typename predicate_at> search_result_t filtered_ef_search(f32_t const* vector, std::size_t wanted, std::size_t ef_search, predicate_at&& predicate, std::size_t thread = any_thread(), bool exact = false) const {
+        index_search_config_t search_config;
+        search_config.thread = thread;
+        search_config.expansion = ef_search;
+        search_config.exact = exact;
+        return search_(vector, wanted, std::forward<predicate_at>(predicate), search_config, casts_.from.f32);
+    }
 
-    std::size_t get(vector_key_t key, b1x8_t* vector, std::size_t vectors_count = 1) const { return get_(key, vector, vectors_count, casts_.to_b1x8); }
-    std::size_t get(vector_key_t key, i8_t* vector, std::size_t vectors_count = 1) const { return get_(key, vector, vectors_count, casts_.to_i8); }
-    std::size_t get(vector_key_t key, f16_t* vector, std::size_t vectors_count = 1) const { return get_(key, vector, vectors_count, casts_.to_f16); }
-    std::size_t get(vector_key_t key, f32_t* vector, std::size_t vectors_count = 1) const { return get_(key, vector, vectors_count, casts_.to_f32); }
-    std::size_t get(vector_key_t key, f64_t* vector, std::size_t vectors_count = 1) const { return get_(key, vector, vectors_count, casts_.to_f64); }
+    template <typename predicate_at> search_result_t filtered_search(f64_t const* vector, std::size_t wanted, predicate_at&& predicate, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, std::forward<predicate_at>(predicate), thread, exact, casts_.from.f64); }
+    template <typename predicate_at> search_result_t filtered_search(f32_t const* vector, std::size_t wanted, predicate_at&& predicate, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, std::forward<predicate_at>(predicate), thread, exact, casts_.from.f32); }
+    template <typename predicate_at> search_result_t filtered_search(bf16_t const* vector, std::size_t wanted, predicate_at&& predicate, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, std::forward<predicate_at>(predicate), thread, exact, casts_.from.bf16); }
+    template <typename predicate_at> search_result_t filtered_search(f16_t const* vector, std::size_t wanted, predicate_at&& predicate, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, std::forward<predicate_at>(predicate), thread, exact, casts_.from.f16); }
+    template <typename predicate_at> search_result_t filtered_search(e5m2_t const* vector, std::size_t wanted, predicate_at&& predicate, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, std::forward<predicate_at>(predicate), thread, exact, casts_.from.e5m2); }
+    template <typename predicate_at> search_result_t filtered_search(e4m3_t const* vector, std::size_t wanted, predicate_at&& predicate, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, std::forward<predicate_at>(predicate), thread, exact, casts_.from.e4m3); }
+    template <typename predicate_at> search_result_t filtered_search(e3m2_t const* vector, std::size_t wanted, predicate_at&& predicate, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, std::forward<predicate_at>(predicate), thread, exact, casts_.from.e3m2); }
+    template <typename predicate_at> search_result_t filtered_search(e2m3_t const* vector, std::size_t wanted, predicate_at&& predicate, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, std::forward<predicate_at>(predicate), thread, exact, casts_.from.e2m3); }
+    template <typename predicate_at> search_result_t filtered_search(i8_t const* vector, std::size_t wanted, predicate_at&& predicate, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, std::forward<predicate_at>(predicate), thread, exact, casts_.from.i8); }
+    template <typename predicate_at> search_result_t filtered_search(u8_t const* vector, std::size_t wanted, predicate_at&& predicate, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, std::forward<predicate_at>(predicate), thread, exact, casts_.from.u8); }
+    template <typename predicate_at> search_result_t filtered_search(b1x8_t const* vector, std::size_t wanted, predicate_at&& predicate, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, std::forward<predicate_at>(predicate), thread, exact, casts_.from.b1x8); }
 
-    cluster_result_t cluster(b1x8_t const* vector, std::size_t level, std::size_t thread = any_thread()) const { return cluster_(vector, level, thread, casts_.from_b1x8); }
-    cluster_result_t cluster(i8_t const* vector, std::size_t level, std::size_t thread = any_thread()) const { return cluster_(vector, level, thread, casts_.from_i8); }
-    cluster_result_t cluster(f16_t const* vector, std::size_t level, std::size_t thread = any_thread()) const { return cluster_(vector, level, thread, casts_.from_f16); }
-    cluster_result_t cluster(f32_t const* vector, std::size_t level, std::size_t thread = any_thread()) const { return cluster_(vector, level, thread, casts_.from_f32); }
-    cluster_result_t cluster(f64_t const* vector, std::size_t level, std::size_t thread = any_thread()) const { return cluster_(vector, level, thread, casts_.from_f64); }
+    std::size_t get(vector_key_t key, f64_t* vector, std::size_t vectors_count = 1) const { return get_(key, vector, vectors_count, casts_.to.f64); }
+    std::size_t get(vector_key_t key, f32_t* vector, std::size_t vectors_count = 1) const { return get_(key, vector, vectors_count, casts_.to.f32); }
+    std::size_t get(vector_key_t key, bf16_t* vector, std::size_t vectors_count = 1) const { return get_(key, vector, vectors_count, casts_.to.bf16); }
+    std::size_t get(vector_key_t key, f16_t* vector, std::size_t vectors_count = 1) const { return get_(key, vector, vectors_count, casts_.to.f16); }
+    std::size_t get(vector_key_t key, e5m2_t* vector, std::size_t vectors_count = 1) const { return get_(key, vector, vectors_count, casts_.to.e5m2); }
+    std::size_t get(vector_key_t key, e4m3_t* vector, std::size_t vectors_count = 1) const { return get_(key, vector, vectors_count, casts_.to.e4m3); }
+    std::size_t get(vector_key_t key, e3m2_t* vector, std::size_t vectors_count = 1) const { return get_(key, vector, vectors_count, casts_.to.e3m2); }
+    std::size_t get(vector_key_t key, e2m3_t* vector, std::size_t vectors_count = 1) const { return get_(key, vector, vectors_count, casts_.to.e2m3); }
+    std::size_t get(vector_key_t key, i8_t* vector, std::size_t vectors_count = 1) const { return get_(key, vector, vectors_count, casts_.to.i8); }
+    std::size_t get(vector_key_t key, u8_t* vector, std::size_t vectors_count = 1) const { return get_(key, vector, vectors_count, casts_.to.u8); }
+    std::size_t get(vector_key_t key, b1x8_t* vector, std::size_t vectors_count = 1) const { return get_(key, vector, vectors_count, casts_.to.b1x8); }
 
-    aggregated_distances_t distance_between(vector_key_t key, b1x8_t const* vector, std::size_t thread = any_thread()) const { return distance_between_(key, vector, thread, casts_.to_b1x8); }
-    aggregated_distances_t distance_between(vector_key_t key, i8_t const* vector, std::size_t thread = any_thread()) const { return distance_between_(key, vector, thread, casts_.to_i8); }
-    aggregated_distances_t distance_between(vector_key_t key, f16_t const* vector, std::size_t thread = any_thread()) const { return distance_between_(key, vector, thread, casts_.to_f16); }
-    aggregated_distances_t distance_between(vector_key_t key, f32_t const* vector, std::size_t thread = any_thread()) const { return distance_between_(key, vector, thread, casts_.to_f32); }
-    aggregated_distances_t distance_between(vector_key_t key, f64_t const* vector, std::size_t thread = any_thread()) const { return distance_between_(key, vector, thread, casts_.to_f64); }
+    cluster_result_t cluster(f64_t const* vector, std::size_t level, std::size_t thread = any_thread()) const { return cluster_(vector, level, thread, casts_.from.f64); }
+    cluster_result_t cluster(f32_t const* vector, std::size_t level, std::size_t thread = any_thread()) const { return cluster_(vector, level, thread, casts_.from.f32); }
+    cluster_result_t cluster(bf16_t const* vector, std::size_t level, std::size_t thread = any_thread()) const { return cluster_(vector, level, thread, casts_.from.bf16); }
+    cluster_result_t cluster(f16_t const* vector, std::size_t level, std::size_t thread = any_thread()) const { return cluster_(vector, level, thread, casts_.from.f16); }
+    cluster_result_t cluster(e5m2_t const* vector, std::size_t level, std::size_t thread = any_thread()) const { return cluster_(vector, level, thread, casts_.from.e5m2); }
+    cluster_result_t cluster(e4m3_t const* vector, std::size_t level, std::size_t thread = any_thread()) const { return cluster_(vector, level, thread, casts_.from.e4m3); }
+    cluster_result_t cluster(e3m2_t const* vector, std::size_t level, std::size_t thread = any_thread()) const { return cluster_(vector, level, thread, casts_.from.e3m2); }
+    cluster_result_t cluster(e2m3_t const* vector, std::size_t level, std::size_t thread = any_thread()) const { return cluster_(vector, level, thread, casts_.from.e2m3); }
+    cluster_result_t cluster(i8_t const* vector, std::size_t level, std::size_t thread = any_thread()) const { return cluster_(vector, level, thread, casts_.from.i8); }
+    cluster_result_t cluster(u8_t const* vector, std::size_t level, std::size_t thread = any_thread()) const { return cluster_(vector, level, thread, casts_.from.u8); }
+    cluster_result_t cluster(b1x8_t const* vector, std::size_t level, std::size_t thread = any_thread()) const { return cluster_(vector, level, thread, casts_.from.b1x8); }
+
+    aggregated_distances_t distance_between(vector_key_t key, f64_t const* vector, std::size_t thread = any_thread()) const { return distance_between_(key, vector, thread, casts_.to.f64); }
+    aggregated_distances_t distance_between(vector_key_t key, f32_t const* vector, std::size_t thread = any_thread()) const { return distance_between_(key, vector, thread, casts_.to.f32); }
+    aggregated_distances_t distance_between(vector_key_t key, bf16_t const* vector, std::size_t thread = any_thread()) const { return distance_between_(key, vector, thread, casts_.to.bf16); }
+    aggregated_distances_t distance_between(vector_key_t key, f16_t const* vector, std::size_t thread = any_thread()) const { return distance_between_(key, vector, thread, casts_.to.f16); }
+    aggregated_distances_t distance_between(vector_key_t key, e5m2_t const* vector, std::size_t thread = any_thread()) const { return distance_between_(key, vector, thread, casts_.to.e5m2); }
+    aggregated_distances_t distance_between(vector_key_t key, e4m3_t const* vector, std::size_t thread = any_thread()) const { return distance_between_(key, vector, thread, casts_.to.e4m3); }
+    aggregated_distances_t distance_between(vector_key_t key, e3m2_t const* vector, std::size_t thread = any_thread()) const { return distance_between_(key, vector, thread, casts_.to.e3m2); }
+    aggregated_distances_t distance_between(vector_key_t key, e2m3_t const* vector, std::size_t thread = any_thread()) const { return distance_between_(key, vector, thread, casts_.to.e2m3); }
+    aggregated_distances_t distance_between(vector_key_t key, i8_t const* vector, std::size_t thread = any_thread()) const { return distance_between_(key, vector, thread, casts_.to.i8); }
+    aggregated_distances_t distance_between(vector_key_t key, u8_t const* vector, std::size_t thread = any_thread()) const { return distance_between_(key, vector, thread, casts_.to.u8); }
+    aggregated_distances_t distance_between(vector_key_t key, b1x8_t const* vector, std::size_t thread = any_thread()) const { return distance_between_(key, vector, thread, casts_.to.b1x8); }
     // clang-format on
 
     /**
@@ -653,6 +964,7 @@ class index_dense_gt {
      *          exporting the mean, maximum, and minimum values.
      */
     aggregated_distances_t distance_between(vector_key_t a, vector_key_t b, std::size_t = any_thread()) const {
+        usearch_assert_m(config().enable_key_lookups, "Key lookups are disabled!");
         shared_lock_t lock(slot_lookup_mutex_);
         aggregated_distances_t result;
         if (!multi()) {
@@ -681,8 +993,8 @@ class index_dense_gt {
         if (a_missing || b_missing)
             return result;
 
-        result.min = std::numeric_limits<distance_t>::max();
-        result.max = std::numeric_limits<distance_t>::min();
+        result.min = (std::numeric_limits<distance_t>::max)();
+        result.max = (std::numeric_limits<distance_t>::min)();
         result.mean = 0;
         result.count = 0;
 
@@ -723,13 +1035,13 @@ class index_dense_gt {
 
         index_cluster_config_t cluster_config;
         thread_lock_t lock = thread_lock_(thread);
+        if (!lock)
+            return cluster_result_t{}.failed("Reserve capacity ahead of searches!");
         cluster_config.thread = lock.thread_id;
         cluster_config.expansion = config_.expansion_search;
         metric_proxy_t metric{*this};
-        auto &free_key_ = this->free_key_;
-        auto allow = [&free_key_](member_cref_t const& member) noexcept {
-            return member.key != free_key_;
-        };
+        vector_key_t free_key_copy = free_key_;
+        auto allow = [free_key_copy](member_cref_t const& member) noexcept { return member.key != free_key_copy; };
 
         // Find the closest cluster for any vector under that key.
         while (key_range.first != key_range.second) {
@@ -749,19 +1061,56 @@ class index_dense_gt {
     /**
      *  @brief Reserves memory for the index and the keyed lookup.
      *  @return `true` if the memory reservation was successful, `false` otherwise.
+     *
+     *  ! No update or search operations should be running during this operation.
      */
-    bool reserve(index_limits_t limits) {
-        {
-            unique_lock_t lock(slot_lookup_mutex_);
-            slot_lookup_.reserve(limits.members);
-            vectors_lookup_.resize(limits.members);
+    bool try_reserve(index_limits_t limits) {
 
-            // During reserve, no insertions may be happening, so we can safely overwrite the whole collection.
-            std::unique_lock<std::mutex> available_threads_lock(available_threads_mutex_);
-            available_threads_.resize(limits.threads());
-            std::iota(available_threads_.begin(), available_threads_.end(), 0ul);
+        // Reserving is monotonic: reducing thread limits must not shrink member-addressed storage.
+        limits.members = (std::max)(limits.members, typed_->capacity());
+        limits.members = (std::max)(limits.members, vectors_lookup_.size());
+
+        // The slot lookup system will generally prefer power-of-two sizes.
+        if (config_.enable_key_lookups) {
+            unique_lock_t lock(slot_lookup_mutex_);
+            if (!slot_lookup_.try_reserve(limits.members))
+                return false;
         }
+
+        // Hash-table load-factor slack does not need corresponding vector or graph slots.
+        if (limits.members != vectors_lookup_.size()) {
+            vectors_lookup_t new_vectors_lookup(limits.members);
+            if (!new_vectors_lookup)
+                return false;
+            if (vectors_lookup_.size() > 0)
+                std::memcpy(new_vectors_lookup.data(), vectors_lookup_.data(),
+                            vectors_lookup_.size() * sizeof(byte_t*));
+            vectors_lookup_ = std::move(new_vectors_lookup);
+        }
+
+        // During reserve, no insertions may be happening, so we can safely overwrite the whole collection.
+        std::unique_lock<std::mutex> available_threads_lock(available_threads_mutex_);
+        available_threads_.clear();
+        if (!available_threads_.reserve(limits.threads()))
+            return false;
+        for (std::size_t i = 0; i < limits.threads(); i++)
+            available_threads_.push(i);
+
+        // Allocate a buffer for the casted vectors.
+        checked_size_result_t cast_buffer_bytes = checked_mul(limits.threads(), metric_.bytes_per_vector());
+        if (!cast_buffer_bytes)
+            return false;
+        cast_buffer_t cast_buffer(cast_buffer_bytes.value);
+        if (!cast_buffer)
+            return false;
+        cast_buffer_ = std::move(cast_buffer);
+
         return typed_->reserve(limits);
+    }
+
+    void reserve(index_limits_t limits) {
+        if (!try_reserve(limits))
+            usearch_raise_runtime_error("failed to reserve memory");
     }
 
     /**
@@ -776,7 +1125,8 @@ class index_dense_gt {
         std::unique_lock<std::mutex> free_lock(free_keys_mutex_);
         typed_->clear();
         slot_lookup_.clear();
-        vectors_lookup_.clear();
+        // Tape pointers are about to be invalidated by the reset below.
+        std::fill(vectors_lookup_.begin(), vectors_lookup_.end(), nullptr);
         free_keys_.clear();
         vectors_tape_allocator_.reset();
     }
@@ -789,19 +1139,18 @@ class index_dense_gt {
      *  If the index is memory-mapped - releases the mapping and the descriptor.
      */
     void reset() {
-        unique_lock_t lookup_lock(slot_lookup_mutex_);
 
+        unique_lock_t lookup_lock(slot_lookup_mutex_);
         std::unique_lock<std::mutex> free_lock(free_keys_mutex_);
         std::unique_lock<std::mutex> available_threads_lock(available_threads_mutex_);
-        typed_->reset();
+
+        if (typed_)
+            typed_->reset();
         slot_lookup_.clear();
-        vectors_lookup_.clear();
+        vectors_lookup_.reset();
         free_keys_.clear();
         vectors_tape_allocator_.reset();
-
-        // Reset the thread IDs.
-        available_threads_.resize(std::thread::hardware_concurrency());
-        std::iota(available_threads_.begin(), available_threads_.end(), 0ul);
+        available_threads_.reset();
     }
 
     /**
@@ -880,7 +1229,7 @@ class index_dense_gt {
     /**
      *  @brief  Estimate the binary length (in bytes) of the serialized index.
      */
-    std::size_t serialized_length(serialization_config_t config = {}) const noexcept {
+    std::size_t serialized_length(serialization_config_t config = {}) const {
         std::size_t dimensions_length = 0;
         std::size_t matrix_length = 0;
         if (!config.exclude_vectors) {
@@ -892,8 +1241,9 @@ class index_dense_gt {
 
     /**
      *  @brief Parses the index from file to RAM.
-     *  @param[in] path The path to the file.
+     *  @param[in] input The input stream to read from.
      *  @param[in] config Configuration parameters for imports.
+     *  @param[in] progress Callback to report the execution progress.
      *  @return Outcome descriptor explicitly convertible to boolean.
      */
     template <typename input_callback_at, typename progress_at = dummy_progress_t>
@@ -901,7 +1251,9 @@ class index_dense_gt {
                                             serialization_config_t config = {}, //
                                             progress_at&& progress = {}) {
 
-        // Discard all previous memory allocations of `vectors_tape_allocator_`
+        // Preserve any explicit thread counts from the prior index state; fall
+        // back to library defaults when they were never set (e.g. `unreserved`).
+        index_limits_t new_limits = typed_ ? typed_->limits().with_thread_defaults() : index_limits_t{};
         reset();
 
         // Infer the new index size
@@ -926,7 +1278,9 @@ class index_dense_gt {
                 matrix_cols = dimensions[1];
             }
             // Load the vectors one after another
-            vectors_lookup_.resize(matrix_rows);
+            vectors_lookup_ = vectors_lookup_t(matrix_rows);
+            if (!vectors_lookup_)
+                return result.failed("Failed to allocate memory to address vectors");
             for (std::uint64_t slot = 0; slot != matrix_rows; ++slot) {
                 byte_t* vector = vectors_tape_allocator_.allocate(matrix_cols);
                 if (!input(vector, matrix_cols))
@@ -945,6 +1299,9 @@ class index_dense_gt {
             if (std::memcmp(buffer, default_magic(), std::strlen(default_magic())) != 0)
                 return result.failed("Magic header mismatch - the file isn't an index");
 
+            // fix pre-2.10 headers
+            fix_pre_2_10_metadata(head);
+
             // Validate the software version
             if (head.version_major != USEARCH_VERSION_MAJOR)
                 return result.failed("File format may be different, please rebuild");
@@ -957,16 +1314,40 @@ class index_dense_gt {
 
             config_.multi = head.multi;
             metric_ = metric_t::builtin(head.dimensions, head.kind_metric, head.kind_scalar);
-            cast_buffer_.resize(available_threads_.size() * metric_.bytes_per_vector());
-            casts_ = make_casts_(head.kind_scalar);
+            checked_size_result_t cast_buffer_bytes = checked_mul(new_limits.threads(), metric_.bytes_per_vector());
+            if (!cast_buffer_bytes)
+                return result.failed("Failed to allocate memory for the casts");
+            cast_buffer_ = cast_buffer_t(cast_buffer_bytes.value);
+            if (!cast_buffer_)
+                return result.failed("Failed to allocate memory for the casts");
+            casts_ = casts_punned_t::make(head.kind_scalar);
         }
 
         // Pull the actual proximity graph
+        if (!typed_) {
+            index_t* raw = index_allocator_t{}.allocate(1);
+            if (!raw)
+                return result.failed("Failed to allocate memory for the index");
+            new (raw) index_t(config_);
+            typed_ = raw;
+        }
         result = typed_->load_from_stream(std::forward<input_callback_at>(input), std::forward<progress_at>(progress));
         if (!result)
             return result;
         if (typed_->size() != static_cast<std::size_t>(matrix_rows))
             return result.failed("Index size and the number of vectors doesn't match");
+        new_limits.members = static_cast<std::size_t>(matrix_rows);
+        if (!typed_->try_reserve(new_limits))
+            return result.failed("Failed to reserve memory for the index");
+
+        // After the index is loaded, resize `available_threads_` to match the new limits.
+        available_threads_t available_threads;
+        std::size_t max_threads = new_limits.threads();
+        if (!available_threads.reserve(max_threads))
+            return result.failed("Failed to allocate memory for the available threads!");
+        for (std::size_t i = 0; i < max_threads; i++)
+            available_threads.push(i);
+        available_threads_ = std::move(available_threads);
 
         reindex_keys_();
         return result;
@@ -974,8 +1355,10 @@ class index_dense_gt {
 
     /**
      *  @brief Parses the index from file, without loading it into RAM.
-     *  @param[in] path The path to the file.
+     *  @param[in] file The input file to read from.
+     *  @param[in] offset The offset in the file to start reading from.
      *  @param[in] config Configuration parameters for imports.
+     *  @param[in] progress Callback to report the execution progress.
      *  @return Outcome descriptor explicitly convertible to boolean.
      */
     template <typename progress_at = dummy_progress_t>
@@ -983,12 +1366,19 @@ class index_dense_gt {
                                 std::size_t offset = 0, serialization_config_t config = {}, //
                                 progress_at&& progress = {}) {
 
-        // Discard all previous memory allocations of `vectors_tape_allocator_`
+        // Preserve any explicit thread counts from the prior index state; fall
+        // back to library defaults when they were never set (e.g. `unreserved`).
+        index_limits_t new_limits = typed_ ? typed_->limits().with_thread_defaults() : index_limits_t{};
         reset();
 
         serialization_result_t result = file.open_if_not();
         if (!result)
             return result;
+
+        // `offset` is caller-supplied, so every `file.size() - offset` below would
+        // otherwise underflow into a huge span instead of failing.
+        if (offset > file.size())
+            return result.failed("File is corrupted and lacks matrix dimensions");
 
         // Infer the new index size
         std::uint64_t matrix_rows = 0;
@@ -1015,7 +1405,12 @@ class index_dense_gt {
                 matrix_cols = dimensions[1];
                 offset += sizeof(dimensions);
             }
-            vectors_buffer = {file.data() + offset, static_cast<std::size_t>(matrix_rows * matrix_cols)};
+            // bound the vectors matrix span against the file (overflow-safe; offset <= file.size() holds here)
+            checked_size_result_t vectors_bytes =
+                checked_mul(static_cast<std::size_t>(matrix_rows), static_cast<std::size_t>(matrix_cols));
+            if (!vectors_bytes || file.size() - offset < vectors_bytes.value)
+                return result.failed("File is corrupted: vectors matrix exceeds file size");
+            vectors_buffer = {file.data() + offset, vectors_bytes.value};
             offset += vectors_buffer.size();
         }
 
@@ -1031,6 +1426,9 @@ class index_dense_gt {
             if (std::memcmp(buffer, default_magic(), std::strlen(default_magic())) != 0)
                 return result.failed("Magic header mismatch - the file isn't an index");
 
+            // fix pre-2.10 headers
+            fix_pre_2_10_metadata(head);
+
             // Validate the software version
             if (head.version_major != USEARCH_VERSION_MAJOR)
                 return result.failed("File format may be different, please rebuild");
@@ -1043,23 +1441,50 @@ class index_dense_gt {
 
             config_.multi = head.multi;
             metric_ = metric_t::builtin(head.dimensions, head.kind_metric, head.kind_scalar);
-            cast_buffer_.resize(available_threads_.size() * metric_.bytes_per_vector());
-            casts_ = make_casts_(head.kind_scalar);
+            // available_threads_.size() will be updated to old_limits.threads() later in this
+            checked_size_result_t cast_buffer_bytes = checked_mul(new_limits.threads(), metric_.bytes_per_vector());
+            if (!cast_buffer_bytes)
+                return result.failed("Failed to allocate memory for the casts");
+            cast_buffer_ = cast_buffer_t(cast_buffer_bytes.value);
+            if (!cast_buffer_)
+                return result.failed("Failed to allocate memory for the casts");
+            casts_ = casts_punned_t::make(head.kind_scalar);
             offset += sizeof(buffer);
         }
 
         // Pull the actual proximity graph
+        if (!typed_) {
+            index_t* raw = index_allocator_t{}.allocate(1);
+            if (!raw)
+                return result.failed("Failed to allocate memory for the index");
+            new (raw) index_t(config_);
+            typed_ = raw;
+        }
         result = typed_->view(std::move(file), offset, std::forward<progress_at>(progress));
         if (!result)
             return result;
         if (typed_->size() != static_cast<std::size_t>(matrix_rows))
             return result.failed("Index size and the number of vectors doesn't match");
+        new_limits.members = static_cast<std::size_t>(matrix_rows);
+        if (!typed_->try_reserve(new_limits))
+            return result.failed("Failed to reserve memory for the index");
 
         // Address the vectors
-        vectors_lookup_.resize(matrix_rows);
+        vectors_lookup_ = vectors_lookup_t(matrix_rows);
+        if (!vectors_lookup_)
+            return result.failed("Failed to allocate memory to address vectors");
         if (!config.exclude_vectors)
             for (std::uint64_t slot = 0; slot != matrix_rows; ++slot)
                 vectors_lookup_[slot] = (byte_t*)vectors_buffer.data() + matrix_cols * slot;
+
+        // After the index is viewed, resize `available_threads_` to match the new limits.
+        available_threads_t available_threads;
+        std::size_t max_threads = new_limits.threads();
+        if (!available_threads.reserve(max_threads))
+            return result.failed("Failed to allocate memory for the available threads!");
+        for (std::size_t i = 0; i < max_threads; i++)
+            available_threads.push(i);
+        available_threads_ = std::move(available_threads);
 
         reindex_keys_();
         return result;
@@ -1067,8 +1492,9 @@ class index_dense_gt {
 
     /**
      *  @brief Saves the index to a file.
-     *  @param[in] path The path to the file.
+     *  @param[in] file The output file to write to.
      *  @param[in] config Configuration parameters for exports.
+     *  @param[in] progress Callback to report the execution progress.
      *  @return Outcome descriptor explicitly convertible to boolean.
      */
     template <typename progress_at = dummy_progress_t>
@@ -1122,8 +1548,9 @@ class index_dense_gt {
 
     /**
      *  @brief Parses the index from file to RAM.
-     *  @param[in] path The path to the file.
+     *  @param[in] file The input file to read from.
      *  @param[in] config Configuration parameters for imports.
+     *  @param[in] progress Progress callback.
      *  @return Outcome descriptor explicitly convertible to boolean.
      */
     template <typename progress_at = dummy_progress_t>
@@ -1193,6 +1620,7 @@ class index_dense_gt {
      *  @return `true` if the key is present in the index, `false` otherwise.
      */
     bool contains(vector_key_t key) const {
+        usearch_assert_m(config().enable_key_lookups, "Key lookups are disabled");
         shared_lock_t lock(slot_lookup_mutex_);
         return slot_lookup_.contains(key_and_slot_t::any_slot(key));
     }
@@ -1202,6 +1630,7 @@ class index_dense_gt {
      *  @return Zero if nothing is found, a positive integer otherwise.
      */
     std::size_t count(vector_key_t key) const {
+        usearch_assert_m(config().enable_key_lookups, "Key lookups are disabled");
         shared_lock_t lock(slot_lookup_mutex_);
         return slot_lookup_.count(key_and_slot_t::any_slot(key));
     }
@@ -1226,7 +1655,10 @@ class index_dense_gt {
      *          If an error occurred during the removal operation, `result.error` will contain an error message.
      */
     labeling_result_t remove(vector_key_t key) {
+        usearch_assert_m(config().enable_key_lookups, "Key lookups are disabled");
         labeling_result_t result;
+        if (typed_->is_immutable())
+            return result.failed("Can't remove from an immutable index");
 
         unique_lock_t lookup_lock(slot_lookup_mutex_);
         auto matching_slots = slot_lookup_.equal_range(key_and_slot_t::any_slot(key));
@@ -1236,7 +1668,8 @@ class index_dense_gt {
         // Grow the removed entries ring, if needed
         std::size_t matching_count = std::distance(matching_slots.first, matching_slots.second);
         std::unique_lock<std::mutex> free_lock(free_keys_mutex_);
-        if (!free_keys_.reserve(free_keys_.size() + matching_count))
+        std::size_t free_count_old = free_keys_.size();
+        if (!free_keys_.reserve(free_count_old + matching_count))
             return result.failed("Can't allocate memory for a free-list");
 
         // A removed entry would be:
@@ -1250,6 +1683,7 @@ class index_dense_gt {
         }
         slot_lookup_.erase(key);
         result.completed = matching_count;
+        usearch_assert_m(free_keys_.size() == free_count_old + matching_count, "Free keys count mismatch");
 
         return result;
     }
@@ -1264,6 +1698,7 @@ class index_dense_gt {
      */
     template <typename keys_iterator_at>
     labeling_result_t remove(keys_iterator_at keys_begin, keys_iterator_at keys_end) {
+        usearch_assert_m(config().enable_key_lookups, "Key lookups are disabled");
 
         labeling_result_t result;
         unique_lock_t lookup_lock(slot_lookup_mutex_);
@@ -1309,6 +1744,11 @@ class index_dense_gt {
      */
     labeling_result_t rename(vector_key_t from, vector_key_t to) {
         labeling_result_t result;
+        if (from == to) {
+            result.completed = count(from);
+            return result;
+        }
+
         unique_lock_t lookup_lock(slot_lookup_mutex_);
 
         if (!multi() && slot_lookup_.contains(key_and_slot_t::any_slot(to)))
@@ -1350,17 +1790,6 @@ class index_dense_gt {
         });
     }
 
-    struct copy_result_t {
-        index_dense_gt index;
-        error_t error;
-
-        explicit operator bool() const noexcept { return !error; }
-        copy_result_t failed(error_t message) noexcept {
-            error = std::move(message);
-            return std::move(*this);
-        }
-    };
-
     /**
      *  @brief Copies the ::index_dense_gt @b with all the data in it.
      *  @param config The copy configuration (optional).
@@ -1383,19 +1812,22 @@ class index_dense_gt {
             copy.free_keys_.push(free_keys_[i]);
 
         // Allocate buffers and move the vectors themselves
-        if (!config.force_vector_copy && copy.config_.exclude_vectors)
-            copy.vectors_lookup_ = vectors_lookup_;
-        else {
-            copy.vectors_lookup_.resize(vectors_lookup_.size());
-            for (std::size_t slot = 0; slot != vectors_lookup_.size(); ++slot)
+        copy.vectors_lookup_ = vectors_lookup_t(vectors_lookup_.size());
+        if (!copy.vectors_lookup_)
+            return result.failed("Out of memory!");
+        if (!config.force_vector_copy && copy.config_.exclude_vectors) {
+            std::memcpy(copy.vectors_lookup_.data(), vectors_lookup_.data(), vectors_lookup_.size() * sizeof(byte_t*));
+        } else {
+            std::size_t slots_count = typed_result.index.size();
+            for (std::size_t slot = 0; slot != slots_count; ++slot)
                 copy.vectors_lookup_[slot] = copy.vectors_tape_allocator_.allocate(copy.metric_.bytes_per_vector());
-            if (std::count(copy.vectors_lookup_.begin(), copy.vectors_lookup_.end(), nullptr))
+            if (std::count(copy.vectors_lookup_.begin(), copy.vectors_lookup_.begin() + slots_count, nullptr))
                 return result.failed("Out of memory!");
-            for (std::size_t slot = 0; slot != vectors_lookup_.size(); ++slot)
+            for (std::size_t slot = 0; slot != slots_count; ++slot)
                 std::memcpy(copy.vectors_lookup_[slot], vectors_lookup_[slot], metric_.bytes_per_vector());
         }
 
-        copy.slot_lookup_ = slot_lookup_;
+        copy.slot_lookup_ = slot_lookup_; // TODO: Handle out of memory
         *copy.typed_ = std::move(typed_result.index);
         return result;
     }
@@ -1405,22 +1837,34 @@ class index_dense_gt {
      *  @return A similarly configured ::index_dense_gt instance.
      */
     copy_result_t fork() const {
+
+        cast_buffer_t cast_buffer(cast_buffer_.size());
+        if (!cast_buffer)
+            return state_result_t{}.failed("Failed to allocate memory for the casts!");
+        available_threads_t available_threads;
+        std::size_t max_threads = limits().threads();
+        if (!available_threads.reserve(max_threads))
+            return state_result_t{}.failed("Failed to allocate memory for the available threads!");
+        for (std::size_t i = 0; i < max_threads; i++)
+            available_threads.push(i);
+        index_t* raw = index_allocator_t{}.allocate(1);
+        if (!raw)
+            return state_result_t{}.failed("Failed to allocate memory for the index!");
+
         copy_result_t result;
         index_dense_gt& other = result.index;
-
+        index_limits_t other_limits = limits();
+        other_limits.members = 0;
         other.config_ = config_;
-        other.cast_buffer_ = cast_buffer_;
+        other.cast_buffer_ = std::move(cast_buffer);
         other.casts_ = casts_;
 
         other.metric_ = metric_;
-        other.available_threads_ = available_threads_;
+        other.available_threads_ = std::move(available_threads);
         other.free_key_ = free_key_;
 
-        index_t* raw = index_allocator_t{}.allocate(1);
-        if (!raw)
-            return result.failed("Can't allocate the index");
-
         new (raw) index_t(config());
+        raw->try_reserve(other_limits);
         other.typed_ = raw;
         return result;
     }
@@ -1448,12 +1892,12 @@ class index_dense_gt {
     compaction_result_t isolate(executor_at&& executor = executor_at{}, progress_at&& progress = progress_at{}) {
         compaction_result_t result;
         std::atomic<std::size_t> pruned_edges;
-        auto disallow = [&](member_cref_t const& member) noexcept {
+        auto allow = [&](member_cref_t const& member) noexcept {
             bool freed = member.key == free_key_;
             pruned_edges += freed;
-            return freed;
+            return !freed;
         };
-        typed_->isolate(disallow, std::forward<executor_at>(executor), std::forward<progress_at>(progress));
+        typed_->isolate(allow, std::forward<executor_at>(executor), std::forward<progress_at>(progress));
         result.pruned_edges = pruned_edges;
         return result;
     }
@@ -1479,7 +1923,10 @@ class index_dense_gt {
     compaction_result_t compact(executor_at&& executor = executor_at{}, progress_at&& progress = progress_at{}) {
         compaction_result_t result;
 
-        std::vector<byte_t*> new_vectors_lookup(vectors_lookup_.size());
+        vectors_lookup_t new_vectors_lookup(vectors_lookup_.size());
+        if (!new_vectors_lookup)
+            return result.failed("Out of memory!");
+
         vectors_tape_allocator_t new_vectors_allocator;
 
         auto track_slot_change = [&](vector_key_t, compressed_slot_t old_slot, compressed_slot_t new_slot) {
@@ -1492,6 +1939,10 @@ class index_dense_gt {
                         std::forward<executor_at>(executor), std::forward<progress_at>(progress));
         vectors_lookup_ = std::move(new_vectors_lookup);
         vectors_tape_allocator_ = std::move(new_vectors_allocator);
+
+        // Compaction permutes graph slots, invalidating both the key-to-slot lookup
+        // and the free-slot list. Rebuild them from the compacted graph.
+        reindex_keys_();
         return result;
     }
 
@@ -1659,7 +2110,7 @@ class index_dense_gt {
 
             cluster_t& merge_source = clusters[unique_clusters - 1];
             std::size_t merge_target_idx = 0;
-            distance_t merge_distance = std::numeric_limits<distance_t>::max();
+            distance_t merge_distance = (std::numeric_limits<distance_t>::max)();
 
             for (std::size_t candidate_idx = 0; candidate_idx + 1 < unique_clusters; ++candidate_idx) {
                 distance_t distance = metric_(merge_source.vector, clusters[candidate_idx].vector);
@@ -1710,51 +2161,42 @@ class index_dense_gt {
 
         result.computed_distances = computed_distances;
         result.visited_members = visited_members;
+        result.clusters = unique_clusters;
 
         (void)progress;
         return result;
     }
 
   private:
-    struct thread_lock_t {
-        index_dense_gt const& parent;
-        std::size_t thread_id;
-        bool engaged;
-
-        ~thread_lock_t() {
-            if (engaged)
-                parent.thread_unlock_(thread_id);
-        }
-    };
-
-    thread_lock_t thread_lock_(std::size_t thread_id) const {
+    thread_lock_t thread_lock_(std::size_t thread_id) const usearch_noexcept_m {
         if (thread_id != any_thread())
             return {*this, thread_id, false};
 
-        available_threads_mutex_.lock();
-        thread_id = available_threads_.back();
-        available_threads_.pop_back();
-        available_threads_mutex_.unlock();
+        std::unique_lock<std::mutex> lock(available_threads_mutex_);
+        if (!available_threads_.try_pop(thread_id))
+            return {*this, any_thread(), false};
         return {*this, thread_id, true};
     }
 
-    void thread_unlock_(std::size_t thread_id) const {
+    void thread_unlock_(std::size_t thread_id) const usearch_noexcept_m {
         available_threads_mutex_.lock();
-        available_threads_.push_back(thread_id);
+        usearch_assert_m(available_threads_.size() < available_threads_.capacity(), "Too many threads unlocked");
+        available_threads_.push(thread_id);
         available_threads_mutex_.unlock();
     }
 
     template <typename scalar_at>
     add_result_t add_(                             //
         vector_key_t key, scalar_at const* vector, //
-        std::size_t thread, bool force_vector_copy, cast_t const& cast) {
+        std::size_t thread, bool copy_vector, cast_punned_t const& cast) {
 
-        if (!multi() && contains(key))
+        if (!multi() && config().enable_key_lookups && contains(key))
             return add_result_t{}.failed("Duplicate keys not allowed in high-level wrappers");
 
         // Cast the vector, if needed for compatibility with `metric_`
         thread_lock_t lock = thread_lock_(thread);
-        bool copy_vector = !config_.exclude_vectors || force_vector_copy;
+        if (!lock)
+            return add_result_t{}.failed("Reserve capacity ahead of insertions!");
         byte_t const* vector_data = reinterpret_cast<byte_t const*>(vector);
         {
             byte_t* casted_data = cast_buffer_.data() + metric_.bytes_per_vector() * lock.thread_id;
@@ -1772,12 +2214,21 @@ class index_dense_gt {
 
         // Perform the insertion or the update
         bool reuse_node = free_slot != default_free_value<compressed_slot_t>();
+
+        byte_t* allocated_vector = nullptr;
+        if (copy_vector && !reuse_node) {
+            allocated_vector = vectors_tape_allocator_.allocate(metric_.bytes_per_vector());
+            if (!allocated_vector)
+                return add_result_t{}.failed("Out of memory!");
+        }
         auto on_success = [&](member_ref_t member) {
-            unique_lock_t slot_lock(slot_lookup_mutex_);
-            slot_lookup_.try_emplace(key_and_slot_t{key, static_cast<compressed_slot_t>(member.slot)});
+            if (config_.enable_key_lookups) {
+                unique_lock_t slot_lock(slot_lookup_mutex_);
+                slot_lookup_.try_emplace(key_and_slot_t{key, static_cast<compressed_slot_t>(member.slot)});
+            }
             if (copy_vector) {
                 if (!reuse_node)
-                    vectors_lookup_[member.slot] = vectors_tape_allocator_.allocate(metric_.bytes_per_vector());
+                    vectors_lookup_[member.slot] = allocated_vector;
                 std::memcpy(vectors_lookup_[member.slot], vector_data, metric_.bytes_per_vector());
             } else
                 vectors_lookup_[member.slot] = (byte_t*)vector_data;
@@ -1795,10 +2246,23 @@ class index_dense_gt {
 
     template <typename scalar_at, typename predicate_at>
     search_result_t search_(scalar_at const* vector, std::size_t wanted, predicate_at&& predicate, std::size_t thread,
-                            bool exact, cast_t const& cast, std::size_t expansion_search) const {
+                            bool exact, cast_punned_t const& cast) const {
+
+        index_search_config_t search_config;
+        search_config.thread = thread;
+        search_config.expansion = config_.expansion_search;
+        search_config.exact = exact;
+        return search_(vector, wanted, std::forward<predicate_at>(predicate), search_config, cast);
+    }
+
+    template <typename scalar_at, typename predicate_at>
+    search_result_t search_(scalar_at const* vector, std::size_t wanted, predicate_at&& predicate,
+                            index_search_config_t search_config, cast_punned_t const& cast) const {
 
         // Cast the vector, if needed for compatibility with `metric_`
-        thread_lock_t lock = thread_lock_(thread);
+        thread_lock_t lock = thread_lock_(search_config.thread);
+        if (!lock)
+            return search_result_t{*this}.failed("Reserve capacity ahead of searches!");
         byte_t const* vector_data = reinterpret_cast<byte_t const*>(vector);
         {
             byte_t* casted_data = cast_buffer_.data() + metric_.bytes_per_vector() * lock.thread_id;
@@ -1807,32 +2271,33 @@ class index_dense_gt {
                 vector_data = casted_data;
         }
 
-        index_search_config_t search_config;
         search_config.thread = lock.thread_id;
-        search_config.expansion = expansion_search;
-        search_config.exact = exact;
 
-        auto &free_key_ = this->free_key_;
+        vector_key_t free_key_copy = free_key_;
         if (std::is_same<typename std::decay<predicate_at>::type, dummy_predicate_t>::value) {
-            auto allow = [&free_key_](member_cref_t const& member) noexcept {
-                return member.key != free_key_;
+            auto allow = [free_key_copy](member_cref_t const& member) noexcept {
+                return (vector_key_t)member.key != free_key_copy;
             };
-            return typed_->search(vector_data, wanted, metric_proxy_t{*this}, search_config, allow);
+            auto typed_result = typed_->search(vector_data, wanted, metric_proxy_t{*this}, search_config, allow);
+            return search_result_t{std::move(typed_result), std::move(lock)};
         } else {
-            auto allow = [&free_key_, &predicate](member_cref_t const& member) noexcept {
-                return member.key != free_key_ && predicate(member.key);
+            auto allow = [free_key_copy, &predicate](member_cref_t const& member) noexcept {
+                return (vector_key_t)member.key != free_key_copy && predicate(member.key);
             };
-            return typed_->search(vector_data, wanted, metric_proxy_t{*this}, search_config, allow);
+            auto typed_result = typed_->search(vector_data, wanted, metric_proxy_t{*this}, search_config, allow);
+            return search_result_t{std::move(typed_result), std::move(lock)};
         }
     }
 
     template <typename scalar_at>
     cluster_result_t cluster_(                      //
         scalar_at const* vector, std::size_t level, //
-        std::size_t thread, cast_t const& cast) const {
+        std::size_t thread, cast_punned_t const& cast) const {
 
         // Cast the vector, if needed for compatibility with `metric_`
         thread_lock_t lock = thread_lock_(thread);
+        if (!lock)
+            return cluster_result_t{}.failed("Reserve capacity ahead of searches!");
         byte_t const* vector_data = reinterpret_cast<byte_t const*>(vector);
         {
             byte_t* casted_data = cast_buffer_.data() + metric_.bytes_per_vector() * lock.thread_id;
@@ -1845,20 +2310,20 @@ class index_dense_gt {
         cluster_config.thread = lock.thread_id;
         cluster_config.expansion = config_.expansion_search;
 
-        auto &free_key_ = this->free_key_;
-        auto allow = [&free_key_](member_cref_t const& member) noexcept {
-            return member.key != free_key_;
-        };
+        vector_key_t free_key_copy = free_key_;
+        auto allow = [free_key_copy](member_cref_t const& member) noexcept { return member.key != free_key_copy; };
         return typed_->cluster(vector_data, level, metric_proxy_t{*this}, cluster_config, allow);
     }
 
     template <typename scalar_at>
     aggregated_distances_t distance_between_(      //
         vector_key_t key, scalar_at const* vector, //
-        std::size_t thread, cast_t const& cast) const {
+        std::size_t thread, cast_punned_t const& cast) const {
 
         // Cast the vector, if needed for compatibility with `metric_`
         thread_lock_t lock = thread_lock_(thread);
+        if (!lock)
+            return {};
         byte_t const* vector_data = reinterpret_cast<byte_t const*>(vector);
         {
             byte_t* casted_data = cast_buffer_.data() + metric_.bytes_per_vector() * lock.thread_id;
@@ -1868,14 +2333,15 @@ class index_dense_gt {
         }
 
         // Check if such `key` is even present.
+        usearch_assert_m(config().enable_key_lookups, "Key lookups are disabled!");
         shared_lock_t slots_lock(slot_lookup_mutex_);
         auto key_range = slot_lookup_.equal_range(key_and_slot_t::any_slot(key));
         aggregated_distances_t result;
         if (key_range.first == key_range.second)
             return result;
 
-        result.min = std::numeric_limits<distance_t>::max();
-        result.max = std::numeric_limits<distance_t>::min();
+        result.min = (std::numeric_limits<distance_t>::max)();
+        result.max = (std::numeric_limits<distance_t>::min)();
         result.mean = 0;
         result.count = 0;
 
@@ -1904,7 +2370,8 @@ class index_dense_gt {
         std::size_t count_total = typed_->size();
         std::size_t count_removed = 0;
         for (std::size_t i = 0; i != count_total; ++i) {
-            member_cref_t member = typed_->at(i);
+            auto member_slot = static_cast<compressed_slot_t>(i);
+            member_cref_t member = typed_->at(member_slot);
             count_removed += member.key == free_key_;
         }
 
@@ -1920,16 +2387,18 @@ class index_dense_gt {
         free_keys_.clear();
         free_keys_.reserve(count_removed);
         for (std::size_t i = 0; i != typed_->size(); ++i) {
-            member_cref_t member = typed_->at(i);
+            auto member_slot = static_cast<compressed_slot_t>(i);
+            member_cref_t member = typed_->at(member_slot);
             if (member.key == free_key_)
-                free_keys_.push(static_cast<compressed_slot_t>(i));
+                free_keys_.push(member_slot);
             else if (config_.enable_key_lookups)
-                slot_lookup_.try_emplace(key_and_slot_t{vector_key_t(member.key), static_cast<compressed_slot_t>(i)});
+                slot_lookup_.try_emplace(key_and_slot_t{vector_key_t(member.key), member_slot});
         }
     }
 
     template <typename scalar_at>
-    std::size_t get_(vector_key_t key, scalar_at* reconstructed, std::size_t vectors_limit, cast_t const& cast) const {
+    std::size_t get_(vector_key_t key, scalar_at* reconstructed, std::size_t vectors_limit,
+                     cast_punned_t const& cast) const {
 
         if (!multi()) {
             compressed_slot_t slot;
@@ -1962,35 +2431,6 @@ class index_dense_gt {
                     std::memcpy(reconstructed_vector, punned_vector, metric_.bytes_per_vector());
             }
             return count_exported;
-        }
-    }
-
-    template <typename to_scalar_at> static casts_t make_casts_() {
-        casts_t result;
-
-        result.from_b1x8 = cast_gt<b1x8_t, to_scalar_at>{};
-        result.from_i8 = cast_gt<i8_t, to_scalar_at>{};
-        result.from_f16 = cast_gt<f16_t, to_scalar_at>{};
-        result.from_f32 = cast_gt<f32_t, to_scalar_at>{};
-        result.from_f64 = cast_gt<f64_t, to_scalar_at>{};
-
-        result.to_b1x8 = cast_gt<to_scalar_at, b1x8_t>{};
-        result.to_i8 = cast_gt<to_scalar_at, i8_t>{};
-        result.to_f16 = cast_gt<to_scalar_at, f16_t>{};
-        result.to_f32 = cast_gt<to_scalar_at, f32_t>{};
-        result.to_f64 = cast_gt<to_scalar_at, f64_t>{};
-
-        return result;
-    }
-
-    static casts_t make_casts_(scalar_kind_t scalar_kind) {
-        switch (scalar_kind) {
-        case scalar_kind_t::f64_k: return make_casts_<f64_t>();
-        case scalar_kind_t::f32_k: return make_casts_<f32_t>();
-        case scalar_kind_t::f16_k: return make_casts_<f16_t>();
-        case scalar_kind_t::i8_k: return make_casts_<i8_t>();
-        case scalar_kind_t::b1x8_k: return make_casts_<b1x8_t>();
-        default: return {};
         }
     }
 };
@@ -2028,7 +2468,7 @@ static join_result_t join(                                    //
     man_to_woman_at&& man_to_woman = man_to_woman_at{}, //
     woman_to_man_at&& woman_to_man = woman_to_man_at{}, //
     executor_at&& executor = executor_at{},             //
-    progress_at&& progress = progress_at{}) noexcept {
+    progress_at&& progress = progress_at{}) {
 
     return men.join(                                 //
         women, config,                               //

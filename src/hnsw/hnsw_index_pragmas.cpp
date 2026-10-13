@@ -39,7 +39,7 @@ namespace duckdb {
 
 // BIND
 static unique_ptr<FunctionData> HNSWindexInfoBind(ClientContext &context, TableFunctionBindInput &input,
-                                                  vector<LogicalType> &return_types, vector<string> &names) {
+                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names.emplace_back("catalog_name");
 	return_types.emplace_back(LogicalType::VARCHAR);
 
@@ -112,40 +112,41 @@ static void HNSWIndexInfoExecute(ClientContext &context, TableFunctionInput &dat
 	idx_t row = 0;
 	while (data.offset < data.entries.size() && row < STANDARD_VECTOR_SIZE) {
 		auto &index_entry = data.entries[data.offset++].get();
-		auto &table_entry = index_entry.schema.catalog.GetEntry<TableCatalogEntry>(context, index_entry.GetSchemaName(),
-		                                                                           index_entry.GetTableName());
+		auto &table_entry = index_entry.schema.catalog.GetEntry<TableCatalogEntry>(
+		    context, QualifiedName(index_entry.schema.catalog.GetName(), index_entry.GetSchemaName(),
+		                           index_entry.GetTableName()));
 		auto &storage = table_entry.GetStorage();
-		HNSWIndex *hnsw_index = nullptr;
+		shared_ptr<IndexEntry> found_entry;
 
 		auto &table_info = *storage.GetDataTableInfo();
 
 		table_info.BindIndexes(context, HNSWIndex::TYPE_NAME);
-		for(auto &index : table_info.GetIndexes().Indexes()) {
-			if (!index.IsBound() || HNSWIndex::TYPE_NAME != index.GetIndexType()) {
+		for (auto entry : table_info.GetIndexes().IndexEntries()) {
+			if (entry->GetBindState() != IndexBindState::BOUND || HNSWIndex::TYPE_NAME != entry->GetIndexType()) {
 				continue;
 			}
-			auto &cast_index = index.Cast<HNSWIndex>();
-			if (cast_index.name == index_entry.name) {
-				hnsw_index = &cast_index;
+			if (entry->GetName() == index_entry.name) {
+				found_entry = entry;
 				break;
 			}
 		}
 
-		if (!hnsw_index) {
+		if (!found_entry) {
 			throw BinderException("Index %s not found", index_entry.name);
 		}
+		auto guard = found_entry->GetReadHandle<HNSWIndex>();
 
 		idx_t col = 0;
 
 		output.data[col++].SetValue(row, Value(index_entry.catalog.GetName()));
-		output.data[col++].SetValue(row, Value(index_entry.schema.name));
-		output.data[col++].SetValue(row, Value(index_entry.name));
-		output.data[col++].SetValue(row, Value(table_entry.name));
+		output.data[col++].SetValue(row, Value(index_entry.schema.name.GetIdentifierName()));
+		output.data[col++].SetValue(row, Value(index_entry.name.GetIdentifierName()));
+		output.data[col++].SetValue(row, Value(table_entry.name.GetIdentifierName()));
 
-		auto stats = hnsw_index->GetStats();
+		auto stats = guard->GetStats();
 
-		output.data[col++].SetValue(row, Value(hnsw_index->GetMetric()));
-		output.data[col++].SetValue(row, Value::BIGINT(hnsw_index->GetVectorSize()));
+		output.data[col++].SetValue(row, Value(guard->GetMetric()));
+		output.data[col++].SetValue(row, Value::BIGINT(guard->GetVectorSize()));
 		output.data[col++].SetValue(row, Value::BIGINT(stats->count));
 		output.data[col++].SetValue(row, Value::BIGINT(stats->capacity));
 		output.data[col++].SetValue(row, Value::BIGINT(stats->approx_size));
@@ -168,7 +169,7 @@ static void HNSWIndexInfoExecute(ClientContext &context, TableFunctionInput &dat
 
 		row++;
 	}
-	output.SetCardinality(row);
+	output.SetChildCardinality(row);
 }
 
 //-------------------------------------------------------------------------
@@ -188,25 +189,24 @@ static void CompactIndexPragma(ClientContext &context, const FunctionParameters 
 	auto qname = QualifiedName::Parse(index_name);
 
 	// look up the index name in the catalog
-	Binder::BindSchemaOrCatalog(context, qname.catalog, qname.schema);
-	auto &index_entry = Catalog::GetEntry(context, CatalogType::INDEX_ENTRY, qname.catalog, qname.schema, qname.name)
-	                        .Cast<IndexCatalogEntry>();
-	auto &table_entry = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, qname.catalog, index_entry.GetSchemaName(),
-	                                      index_entry.GetTableName())
-	                        .Cast<TableCatalogEntry>();
+	Binder::BindSchemaOrCatalog(context, qname);
+	auto &index_entry = Catalog::GetEntry(context, CatalogType::INDEX_ENTRY, qname).Cast<IndexCatalogEntry>();
+	auto table_name =
+	    QualifiedName(index_entry.catalog.GetName(), index_entry.GetSchemaName(), index_entry.GetTableName());
+	auto &table_entry = Catalog::GetEntry<TableCatalogEntry>(context, table_name);
 
 	auto &storage = table_entry.GetStorage();
 	bool found_index = false;
 
 	auto &table_info = *storage.GetDataTableInfo();
 	table_info.BindIndexes(context, HNSWIndex::TYPE_NAME);
-	for(auto &index : table_info.GetIndexes().Indexes()) {
-		if (!index.IsBound() || HNSWIndex::TYPE_NAME != index.GetIndexType()) {
+	for (auto entry : table_info.GetIndexes().IndexEntries()) {
+		if (entry->GetBindState() != IndexBindState::BOUND || HNSWIndex::TYPE_NAME != entry->GetIndexType()) {
 			continue;
 		}
-		auto &cast_index = index.Cast<HNSWIndex>();
-		if (cast_index.name == index_entry.name) {
-			cast_index.Compact();
+		if (entry->GetName() == index_entry.name) {
+			auto guard = entry->GetWriteHandle<HNSWIndex>();
+			guard->Compact();
 			found_index = true;
 			break;
 		}
@@ -222,7 +222,8 @@ static void CompactIndexPragma(ClientContext &context, const FunctionParameters 
 //-------------------------------------------------------------------------
 void HNSWModule::RegisterIndexPragmas(ExtensionLoader &loader) {
 	loader.RegisterFunction(
-	    PragmaFunction::PragmaCall("hnsw_compact_index", CompactIndexPragma, {LogicalType::VARCHAR}));
+	    PragmaFunction::PragmaCall("hnsw_compact_index", CompactIndexPragma,
+	                               FunctionSignature().AddPositionalOnly("index_name", LogicalType::VARCHAR)));
 
 	// TODO: This is kind of ugly and maybe should just take a parameter instead...
 	TableFunction info_function("pragma_hnsw_index_info", {}, HNSWIndexInfoExecute, HNSWindexInfoBind,

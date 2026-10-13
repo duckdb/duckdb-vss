@@ -1,0 +1,109 @@
+# name: test/sql/hnsw/hnsw_lateral_join_plan.test
+# description: Regression test for issue #80's lateral HNSW index join planning.
+# group: [hnsw]
+
+# A batch (LATERAL) similarity search of the form `ORDER BY array_distance(...) LIMIT k`
+# must be planned as HNSW_INDEX_JOIN. DuckDB 1.5 rewrites this pattern into an
+# arg_min_nulls_last top-k aggregate (TopNWindowElimination), so the HNSW optimizer must
+# recognise that plan shape, not just the older window/row_number shape. DuckDB's later
+# `delim_join_as_cte` switch materialises the dependent join as a CTE, moving the arg_min
+# subtree under an INNER comparison-join fed by a CTE_SCAN; the optimizer must match that
+# shape too. Both settings are asserted below.
+
+require vss
+
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+statement ok
+CREATE TABLE a (a_vec FLOAT[3], a_id INT);
+
+statement ok
+CREATE TABLE b (b_vec FLOAT[3], b_str VARCHAR);
+
+statement ok
+INSERT INTO a VALUES (ARRAY[1.0, 2.0, 3.0], 1), (ARRAY[4.0, 5.0, 6.0], 2);
+
+statement ok
+INSERT INTO b VALUES (ARRAY[4.0, 5.0, 6.0], 'b'), (ARRAY[1.0, 2.0, 3.0], 'a');
+
+statement ok
+CREATE INDEX my_idx ON b USING HNSW (b_vec);
+
+# --- delim_join_as_cte = false: the dependent join stays a DELIM_JOIN. ---
+statement ok
+SET delim_join_as_cte = false;
+
+# LIMIT 1: rewritten to a single-value arg_min_nulls_last aggregate.
+query II
+EXPLAIN SELECT * FROM a, LATERAL (SELECT * FROM b ORDER BY array_distance(a.a_vec, b.b_vec) LIMIT 1);
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_JOIN.*
+
+# LIMIT k > 1: rewritten to a top-k arg_min_nulls_last aggregate over a struct.
+query II
+EXPLAIN SELECT * FROM a, LATERAL (SELECT * FROM b ORDER BY array_distance(a.a_vec, b.b_vec) LIMIT 2);
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_JOIN.*
+
+# --- delim_join_as_cte = true: the dependent join is materialised as a CTE. ---
+statement ok
+SET delim_join_as_cte = true;
+
+query II
+EXPLAIN SELECT * FROM a, LATERAL (SELECT * FROM b ORDER BY array_distance(a.a_vec, b.b_vec) LIMIT 1);
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_JOIN.*
+
+query II
+EXPLAIN SELECT * FROM a, LATERAL (SELECT * FROM b ORDER BY array_distance(a.a_vec, b.b_vec) LIMIT 2);
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_JOIN.*
+
+# Exercise the CTE rewrite's projection as well as its plan shape. In particular,
+# LIMIT 2 must preserve the exact payload expressions produced by arg_min.
+query IT
+SELECT a_id, b_str
+FROM a, LATERAL (SELECT * FROM b ORDER BY array_distance(a.a_vec, b.b_vec) LIMIT 1)
+ORDER BY a_id, b_str;
+----
+1	a
+2	b
+
+query IT
+SELECT a_id, b_str
+FROM a, LATERAL (SELECT * FROM b ORDER BY array_distance(a.a_vec, b.b_vec) LIMIT 2)
+ORDER BY a_id, b_str;
+----
+1	a
+1	b
+2	a
+2	b
+
+# User-written payload expressions must also be copied exactly through the
+# arg_min/UNNEST rewrite, rather than being mistaken for the distance expression.
+query II
+EXPLAIN SELECT a_id, nearest.*
+FROM a, LATERAL (
+    SELECT b_str, CAST(b_vec[1] AS INTEGER) AS first_component, upper(b_str) AS upper_str
+    FROM b
+    ORDER BY array_distance(a.a_vec, b.b_vec)
+    LIMIT 2
+) nearest;
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_JOIN.*
+
+query ITIT
+SELECT a_id, nearest.*
+FROM a, LATERAL (
+    SELECT b_str, CAST(b_vec[1] AS INTEGER) AS first_component, upper(b_str) AS upper_str
+    FROM b
+    ORDER BY array_distance(a.a_vec, b.b_vec)
+    LIMIT 2
+) nearest
+ORDER BY a_id, b_str;
+----
+1	a	1	A
+1	b	4	B
+2	a	1	A
+2	b	4	B

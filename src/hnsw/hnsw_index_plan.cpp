@@ -1,7 +1,9 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/execution/operator/filter/physical_filter.hpp"
 #include "duckdb/parser/parsed_data/create_index_info.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/operator/logical_create_index.hpp"
@@ -83,7 +85,7 @@ PhysicalOperator &HNSWIndex::CreatePlan(PlanIndexInput &input) {
 	if (create_index.expressions.size() != 1) {
 		throw BinderException("HNSW indexes can only be created over a single column of keys.");
 	}
-	auto &arr_type = create_index.expressions[0]->return_type;
+	auto &arr_type = create_index.expressions[0]->GetReturnType();
 	if (arr_type.id() != LogicalTypeId::ARRAY) {
 		throw BinderException("HNSW index keys must be of type FLOAT[N]");
 	}
@@ -103,7 +105,7 @@ PhysicalOperator &HNSWIndex::CreatePlan(PlanIndexInput &input) {
 	vector<LogicalType> new_column_types;
 	vector<unique_ptr<Expression>> select_list;
 	for (auto &expression : create_index.expressions) {
-		new_column_types.push_back(expression->return_type);
+		new_column_types.push_back(expression->GetReturnType());
 		select_list.push_back(std::move(expression));
 	}
 	new_column_types.emplace_back(LogicalType::ROW_TYPE);
@@ -123,7 +125,7 @@ PhysicalOperator &HNSWIndex::CreatePlan(PlanIndexInput &input) {
 		auto is_not_null_expr =
 		    make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NOT_NULL, LogicalType::BOOLEAN);
 		auto bound_ref = make_uniq<BoundReferenceExpression>(new_column_types[i], i);
-		is_not_null_expr->children.push_back(std::move(bound_ref));
+		is_not_null_expr->GetChildrenMutable().push_back(std::move(bound_ref));
 		filter_select_list.push_back(std::move(is_not_null_expr));
 	}
 

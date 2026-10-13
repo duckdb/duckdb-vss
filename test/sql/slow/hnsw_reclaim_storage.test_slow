@@ -3,7 +3,9 @@
 
 require vss
 
-load __TEST_DIR__/hnsw_reclaim_space.db
+require notmusl
+
+load {TEST_DIR}/hnsw_reclaim_space.db
 
 statement ok
 SET hnsw_enable_experimental_persistence = true;

@@ -6,7 +6,7 @@ require vss
 require noforcestorage
 
 # Step 0: Open a database
-load __TEST_DIR__/temp_index_hnsw_storage.db
+load {TEST_DIR}/temp_index_hnsw_storage.db
 
 statement ok
 CREATE TABLE t1 (vec FLOAT[3]);

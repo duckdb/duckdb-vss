@@ -6,6 +6,9 @@ require vss
 require noforcestorage
 
 statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+statement ok
 CREATE TABLE t1 (vec FLOAT[3]);
 
 statement ok

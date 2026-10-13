@@ -1,5 +1,6 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
@@ -46,14 +47,14 @@ unique_ptr<Expression> CosineDistanceRule::Apply(LogicalOperator &op, vector<ref
 	const auto &const_expr = bindings[1].get().Cast<BoundConstantExpression>();
 	auto &similarity_expr = bindings[2].get().Cast<BoundFunctionExpression>();
 
-	if (!const_expr.value.IsNull() && const_expr.value.GetValue<float>() == 1.0) {
+	if (!const_expr.GetValue().IsNull() && const_expr.GetValue().GetValue<float>() == 1.0) {
 		// Create the new array_cosine_distance function
 		vector<unique_ptr<Expression>> args;
 		vector<LogicalType> arg_types;
-		arg_types.push_back(similarity_expr.children[0]->return_type);
-		arg_types.push_back(similarity_expr.children[1]->return_type);
-		args.push_back(std::move(similarity_expr.children[0]));
-		args.push_back(std::move(similarity_expr.children[1]));
+		arg_types.push_back(similarity_expr.GetChildrenMutable()[0]->GetReturnType());
+		arg_types.push_back(similarity_expr.GetChildrenMutable()[1]->GetReturnType());
+		args.push_back(std::move(similarity_expr.GetChildrenMutable()[0]));
+		args.push_back(std::move(similarity_expr.GetChildrenMutable()[1]));
 
 		auto &context = GetContext();
 		auto func_entry = Catalog::GetEntry<ScalarFunctionCatalogEntry>(context, "", "", "array_cosine_distance",
@@ -64,8 +65,8 @@ unique_ptr<Expression> CosineDistanceRule::Apply(LogicalOperator &op, vector<ref
 		}
 
 		changes_made = true;
-		auto func = func_entry->functions.GetFunctionByArguments(context, arg_types);
-		return make_uniq<BoundFunctionExpression>(similarity_expr.return_type, func, std::move(args), nullptr);
+		const auto &func = *func_entry->functions.GetFunctionByArguments(context, arg_types);
+		return func.Bind(context, std::move(args));
 	}
 	return nullptr;
 }
@@ -87,7 +88,6 @@ public:
 };
 
 void HNSWModule::RegisterExprOptimizer(DatabaseInstance &db) {
-	// Register the TopKOptimizer
 	OptimizerExtension::Register(db.config, HNSWExprOptimizer());
 }
 

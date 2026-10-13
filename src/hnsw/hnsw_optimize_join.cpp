@@ -1,10 +1,14 @@
+#include "duckdb/common/vector/array_vector.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
+#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
+#include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_cross_product.hpp"
 #include "duckdb/planner/operator/logical_delim_get.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
@@ -13,10 +17,13 @@
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_window.hpp"
-#include "duckdb/storage/storage_index.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
+#include "duckdb/storage/storage_index.hpp"
 #include "duckdb/storage/table/data_table_info.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
+
 #include "hnsw/hnsw.hpp"
 #include "hnsw/hnsw_index.hpp"
 
@@ -31,10 +38,10 @@ public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXTENSION;
 
 	PhysicalHNSWIndexJoin(PhysicalPlan &physical_plan, const vector<LogicalType> &types_p,
-	                      const idx_t estimated_cardinality, DuckTableEntry &table_p, HNSWIndex &hnsw_index_p,
-	                      const idx_t limit_p)
+	                      const idx_t estimated_cardinality, DuckTableEntry &table_p,
+	                      shared_ptr<IndexEntry> index_entry_p, const idx_t limit_p)
 	    : PhysicalOperator(physical_plan, TYPE, types_p, estimated_cardinality), table(table_p),
-	      hnsw_index(hnsw_index_p), limit(limit_p) {
+	      index_entry(std::move(index_entry_p)), index_name(index_entry->GetName()), limit(limit_p) {
 	}
 
 public:
@@ -47,11 +54,12 @@ public:
 
 public:
 	DuckTableEntry &table;
-	HNSWIndex &hnsw_index;
+	shared_ptr<IndexEntry> index_entry;
+	Identifier index_name;
 	idx_t limit;
 
 	vector<column_t> inner_column_ids;
-	vector<idx_t> inner_projection_ids;
+	vector<ProjectionIndex> inner_projection_ids;
 
 	idx_t outer_vector_column;
 	idx_t inner_vector_column;
@@ -102,7 +110,10 @@ unique_ptr<OperatorState> PhysicalHNSWIndexJoin::GetOperatorState(ExecutionConte
 	local_storage.InitializeScan(table.GetStorage(), result->local_storage_state.local_state, nullptr);
 
 	// Initialize the index scan state
-	result->index_state = hnsw_index.InitializeMultiScan(context.client);
+	{
+		auto index = index_entry->GetReadHandle<HNSWIndex>();
+		result->index_state = index->InitializeMultiScan(context.client);
+	}
 
 	return std::move(result);
 }
@@ -121,36 +132,39 @@ OperatorResultType PhysicalHNSWIndexJoin::Execute(ExecutionContext &context, Dat
 	// The rest of the columns are the outer table columns
 
 	auto &rhs_vector_vector = input.data[outer_vector_column];
-	auto &rhs_vector_child = ArrayVector::GetEntry(rhs_vector_vector);
+	auto &rhs_vector_child = ArrayVector::GetChildMutable(rhs_vector_vector);
 	const auto rhs_vector_size = ArrayType::GetSize(rhs_vector_vector.GetType());
-	const auto rhs_vector_ptr = FlatVector::GetData<float>(rhs_vector_child);
+	const auto rhs_vector_ptr = FlatVector::GetDataMutable<float>(rhs_vector_child);
 
 	// We mimic the window row_number() operator here and output the row number in each batch, basically.
-	const auto row_number_vector = FlatVector::GetData<int64_t>(chunk.data[MATCH_COLUMN_OFFSET]);
+	const auto row_number_vector = FlatVector::GetDataMutable<int64_t>(chunk.data[MATCH_COLUMN_OFFSET]);
 
-	hnsw_index.ResetMultiScan(*state.index_state);
-
-	// How many batches are we going to process?
-	const auto batch_count = MinValue(input.size() - state.input_idx, STANDARD_VECTOR_SIZE / limit);
 	idx_t output_idx = 0;
-	for (idx_t batch_idx = 0; batch_idx < batch_count; batch_idx++, state.input_idx++) {
+	optional_ptr<const Vector> row_ids;
+	{
+		auto index = index_entry->GetReadHandle<HNSWIndex>();
+		index->ResetMultiScan(*state.index_state);
 
-		// Get the next batch
-		const auto rhs_vector_data = rhs_vector_ptr + state.input_idx * rhs_vector_size;
+		// How many batches are we going to process?
+		const auto batch_count = MinValue(input.size() - state.input_idx, STANDARD_VECTOR_SIZE / limit);
+		for (idx_t batch_idx = 0; batch_idx < batch_count; batch_idx++, state.input_idx++) {
 
-		// Scan the index for row ids
-		const auto match_count = hnsw_index.ExecuteMultiScan(*state.index_state, rhs_vector_data, limit);
-		for (idx_t i = 0; i < match_count; i++) {
-			state.match_sel.set_index(output_idx, state.input_idx);
-			row_number_vector[output_idx] = i + 1; // Note: 1-indexed!
-			output_idx++;
+			// Get the next batch
+			const auto rhs_vector_data = rhs_vector_ptr + state.input_idx * rhs_vector_size;
+
+			// Scan the index for row ids
+			const auto match_count = index->ExecuteMultiScan(*state.index_state, rhs_vector_data, limit);
+			for (idx_t i = 0; i < match_count; i++) {
+				state.match_sel.set_index(output_idx, state.input_idx);
+				row_number_vector[output_idx] = i + 1; // Note: 1-indexed!
+				output_idx++;
+			}
 		}
+		row_ids = index->GetMultiScanResult(*state.index_state);
 	}
 
-	const auto &row_ids = hnsw_index.GetMultiScanResult(*state.index_state);
-
 	// Execute one big fetch for the LHS
-	table.GetStorage().Fetch(transcation, chunk, state.physical_column_ids, row_ids, output_idx, state.fetch_state);
+	table.GetStorage().Fetch(transcation, chunk, state.physical_column_ids, *row_ids, output_idx, state.fetch_state);
 
 	// Now slice the chunk so that we include the rhs too
 	chunk.Slice(input, state.match_sel, output_idx, OUTER_COLUMN_OFFSET);
@@ -168,10 +182,9 @@ OperatorResultType PhysicalHNSWIndexJoin::Execute(ExecutionContext &context, Dat
 
 InsertionOrderPreservingMap<string> PhysicalHNSWIndexJoin::ParamsToString() const {
 	InsertionOrderPreservingMap<string> result;
-	auto table_name = table.name;
-	auto index_name = hnsw_index.name;
+	auto table_name = table.name.GetIdentifierName();
 	result.insert("table", table_name);
-	result.insert("index", index_name);
+	result.insert("index", index_name.GetIdentifierName());
 	result.insert("limit", to_string(limit));
 	SetEstimatedCardinality(result, estimated_cardinality);
 	return result;
@@ -183,9 +196,9 @@ InsertionOrderPreservingMap<string> PhysicalHNSWIndexJoin::ParamsToString() cons
 
 class LogicalHNSWIndexJoin final : public LogicalExtensionOperator {
 public:
-	explicit LogicalHNSWIndexJoin(const idx_t table_index_p, DuckTableEntry &table_p, HNSWIndex &hnsw_index_p,
-	                              const idx_t limit_p)
-	    : table_index(table_index_p), table(table_p), hnsw_index(hnsw_index_p), limit(limit_p) {
+	explicit LogicalHNSWIndexJoin(const TableIndex table_index_p, DuckTableEntry &table_p,
+	                              shared_ptr<IndexEntry> index_entry_p, const idx_t limit_p)
+	    : table_index(table_index_p), table(table_p), index_entry(std::move(index_entry_p)), limit(limit_p) {
 	}
 
 public:
@@ -198,14 +211,14 @@ public:
 	idx_t EstimateCardinality(ClientContext &context) override;
 
 public:
-	idx_t table_index;
+	TableIndex table_index;
 
 	DuckTableEntry &table;
-	HNSWIndex &hnsw_index;
+	shared_ptr<IndexEntry> index_entry;
 	idx_t limit;
 
 	vector<column_t> inner_column_ids;
-	vector<idx_t> inner_projection_ids;
+	vector<ProjectionIndex> inner_projection_ids;
 	vector<LogicalType> inner_returned_types;
 
 	idx_t outer_vector_column;
@@ -253,7 +266,7 @@ vector<ColumnBinding> LogicalHNSWIndexJoin::GetLeftBindings() {
 	vector<ColumnBinding> result;
 	if (inner_projection_ids.empty()) {
 		for (idx_t col_idx = 0; col_idx < inner_column_ids.size(); col_idx++) {
-			result.emplace_back(table_index, col_idx);
+			result.emplace_back(table_index, ProjectionIndex(col_idx));
 		}
 	} else {
 		for (auto proj_id : inner_projection_ids) {
@@ -262,7 +275,7 @@ vector<ColumnBinding> LogicalHNSWIndexJoin::GetLeftBindings() {
 	}
 
 	// Always add the row number last
-	result.emplace_back(table_index, inner_column_ids.size());
+	result.emplace_back(table_index, ProjectionIndex(inner_column_ids.size()));
 
 	return result;
 }
@@ -286,7 +299,7 @@ vector<ColumnBinding> LogicalHNSWIndexJoin::GetColumnBindings() {
 
 PhysicalOperator &LogicalHNSWIndexJoin::CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) {
 
-	auto &result = planner.Make<PhysicalHNSWIndexJoin>(types, estimated_cardinality, table, hnsw_index, limit);
+	auto &result = planner.Make<PhysicalHNSWIndexJoin>(types, estimated_cardinality, table, index_entry, limit);
 	auto &cast_result = result.Cast<PhysicalHNSWIndexJoin>();
 	cast_result.limit = limit;
 	cast_result.inner_column_ids = inner_column_ids;
@@ -322,6 +335,16 @@ public:
 	HNSWIndexJoinOptimizer();
 	static bool TryOptimize(Binder &binder, ClientContext &context, unique_ptr<LogicalOperator> &root,
 	                        unique_ptr<LogicalOperator> &plan);
+	// DuckDB >= 1.5 rewrites the `ORDER BY distance LIMIT k` window/filter pattern into an
+	// arg_min top-k aggregate (TopNWindowElimination). This matches that plan shape.
+	static bool TryOptimizeArgMin(Binder &binder, ClientContext &context, unique_ptr<LogicalOperator> &root,
+	                              unique_ptr<LogicalOperator> &plan);
+	// DuckDB's `delim_join_as_cte` rewrite (default since the delim-join-as-CTE switch) turns the
+	// dependent join into a materialized CTE: the arg_min top-k subtree then hangs off an INNER
+	// comparison-join, fed by a CTE_SCAN of the correlated keys instead of a DELIM_GET. This matches
+	// that subtree and rewrites it to an HNSW_INDEX_JOIN over the correlated-key source.
+	static bool TryOptimizeArgMinCte(Binder &binder, ClientContext &context, unique_ptr<LogicalOperator> &root,
+	                                 unique_ptr<LogicalOperator> &plan);
 	static void OptimizeRecursive(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &root,
 	                              unique_ptr<LogicalOperator> &plan);
 	static void Optimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan);
@@ -430,7 +453,7 @@ bool HNSWIndexJoinOptimizer::TryOptimize(Binder &binder, ClientContext &context,
 
 	auto &delim_get = (*delim_get_ptr)->Cast<LogicalDelimGet>();
 	auto &inner_get = (*inner_get_ptr)->Cast<LogicalGet>();
-	if (inner_get.function.name != "seq_scan") {
+	if (inner_get.function.GetName() != "seq_scan") {
 		return false;
 	}
 
@@ -442,30 +465,30 @@ bool HNSWIndexJoinOptimizer::TryOptimize(Binder &binder, ClientContext &context,
 	if (filter.expressions.size() != 1) {
 		return false;
 	}
-	if (filter.expressions.back()->type != ExpressionType::COMPARE_LESSTHANOREQUALTO) {
+	if (filter.expressions.back()->GetExpressionType() != ExpressionType::COMPARE_LESSTHANOREQUALTO) {
 		return false;
 	}
-	const auto &compare_expr = filter.expressions.back()->Cast<BoundComparisonExpression>();
-	if (compare_expr.right->type != ExpressionType::VALUE_CONSTANT) {
+	const auto &compare_expr = filter.expressions.back()->Cast<BoundFunctionExpression>();
+	if (BoundComparisonExpression::Right(compare_expr).GetExpressionType() != ExpressionType::VALUE_CONSTANT) {
 		return false;
 	}
-	const auto &constant_expr = compare_expr.right->Cast<BoundConstantExpression>();
-	if (constant_expr.return_type != LogicalType::BIGINT) {
+	const auto &constant_expr = BoundComparisonExpression::Right(compare_expr).Cast<BoundConstantExpression>();
+	if (constant_expr.GetReturnType() != LogicalType::BIGINT) {
 		return false;
 	}
-	auto k_value = constant_expr.value.GetValue<int64_t>();
+	auto k_value = constant_expr.GetValue().GetValue<int64_t>();
 	if (k_value < 0 || k_value >= STANDARD_VECTOR_SIZE) {
 		// Can only optimize up to SVS
 		return false;
 	}
-	if (compare_expr.left->type != ExpressionType::BOUND_COLUMN_REF) {
+	if (BoundComparisonExpression::Left(compare_expr).GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 		return false;
 	}
-	auto &filter_ref_expr = compare_expr.left->Cast<BoundColumnRefExpression>();
-	if (filter_ref_expr.binding.table_index != window.window_index) {
+	auto &filter_ref_expr = BoundComparisonExpression::Left(compare_expr).Cast<BoundColumnRefExpression>();
+	if (filter_ref_expr.Binding().table_index != window.window_index) {
 		return false;
 	}
-	if (filter_ref_expr.binding.column_index != 0) {
+	if (filter_ref_expr.Binding().column_index != ProjectionIndex(0)) {
 		return false;
 	}
 
@@ -473,28 +496,28 @@ bool HNSWIndexJoinOptimizer::TryOptimize(Binder &binder, ClientContext &context,
 	if (window.expressions.size() != 1) {
 		return false;
 	}
-	if (window.expressions.back()->type != ExpressionType::WINDOW_ROW_NUMBER) {
+	if (window.expressions.back()->GetExpressionType() != ExpressionType::WINDOW_ROW_NUMBER) {
 		return false;
 	}
 	auto &window_expr = window.expressions.back()->Cast<BoundWindowExpression>();
-	if (window_expr.orders.size() != 1) {
+	if (window_expr.OrderBy().size() != 1) {
 		return false;
 	}
-	if (window_expr.orders.back().type != OrderType::ASCENDING) {
+	if (window_expr.OrderBy().back().type != OrderType::ASCENDING) {
 		return false;
 	}
-	if (window_expr.orders.back().expression->type != ExpressionType::BOUND_COLUMN_REF) {
+	if (window_expr.OrderBy().back().expression->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 		return false;
 	}
-	const auto &distance_ref_expr = window_expr.orders.back().expression->Cast<BoundColumnRefExpression>();
+	const auto &distance_ref_expr = window_expr.OrderBy().back().expression->Cast<BoundColumnRefExpression>();
 	// Verify that this column ref references the distance expression in the projection
-	if (distance_ref_expr.binding.table_index != inner_proj.table_index) {
+	if (distance_ref_expr.Binding().table_index != inner_proj.table_index) {
 		return false;
 	}
-	if (distance_ref_expr.binding.column_index >= inner_proj.expressions.size()) {
+	if (distance_ref_expr.Binding().column_index >= inner_proj.expressions.size()) {
 		return false;
 	}
-	const auto &distance_expr_ptr = inner_proj.expressions[distance_ref_expr.binding.column_index];
+	auto &distance_expr_ptr = *inner_proj.expressions[distance_ref_expr.Binding().column_index];
 
 	//------------------------------------------------------------------------------
 	// Match the index
@@ -507,32 +530,33 @@ bool HNSWIndexJoinOptimizer::TryOptimize(Binder &binder, ClientContext &context,
 	auto &duck_table = table.Cast<DuckTableEntry>();
 	auto &table_info = *table.GetStorage().GetDataTableInfo();
 
-	HNSWIndex *index_ptr = nullptr;
+	shared_ptr<IndexEntry> found_entry;
 	vector<reference<Expression>> bindings;
 
 	table_info.BindIndexes(context, HNSWIndex::TYPE_NAME);
-	for(auto &index : table_info.GetIndexes().Indexes()) {
-		if (!index.IsBound() || HNSWIndex::TYPE_NAME != index.GetIndexType()) {
+	for (auto index_entry : table_info.GetIndexes().IndexEntries()) {
+		if (index_entry->GetBindState() != IndexBindState::BOUND ||
+		    HNSWIndex::TYPE_NAME != index_entry->GetIndexType()) {
 			continue;
 		}
-		auto &cast_index = index.Cast<HNSWIndex>();
+		auto guard = index_entry->GetReadHandle<HNSWIndex>();
 
 		// Reset the bindings
 		bindings.clear();
-		if (!cast_index.TryMatchDistanceFunction(distance_expr_ptr, bindings)) {
+		if (!guard->TryMatchDistanceFunction(distance_expr_ptr, bindings)) {
 			continue;
 		}
 		unique_ptr<Expression> bound_index_expr = nullptr;
-		if (!cast_index.TryBindIndexExpression(inner_get, bound_index_expr)) {
+		if (!guard->TryBindIndexExpression(inner_get, bound_index_expr)) {
 			continue;
 		}
 
 		// We also have to replace the outer table index here with the delim_get table index
 		ExpressionIterator::EnumerateExpression(bound_index_expr, [&](Expression &child) {
-			if (child.type == ExpressionType::BOUND_COLUMN_REF) {
+			if (child.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
 				auto &bound_colref_expr = child.Cast<BoundColumnRefExpression>();
-				if (bound_colref_expr.binding.table_index == outer_get.table_index) {
-					bound_colref_expr.binding.table_index = delim_get.table_index;
+				if (bound_colref_expr.Binding().table_index == outer_get.table_index) {
+					bound_colref_expr.BindingMutable().table_index = delim_get.table_index;
 				}
 			}
 		});
@@ -546,30 +570,30 @@ bool HNSWIndexJoinOptimizer::TryOptimize(Binder &binder, ClientContext &context,
 			if (!rhs_dist_expr.get().Equals(*bound_index_expr)) {
 				std::swap(lhs_dist_expr, rhs_dist_expr);
 			} else {
-				continue;
+				return false;
 			}
 		}
 
 		// Save the pointer to the index
-		index_ptr = &cast_index;
+		found_entry = index_entry;
 		break;
 	}
-	if (!index_ptr) {
+	if (!found_entry) {
 		return false;
 	}
 
 	// Fuck it, for now dont allow expressions on the index
-	if (bindings[1].get().type != ExpressionType::BOUND_COLUMN_REF) {
+	if (bindings[1].get().GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 		return false;
 	}
-	if (bindings[2].get().type != ExpressionType::BOUND_COLUMN_REF) {
+	if (bindings[2].get().GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 		return false;
 	}
 	const auto &outer_ref_expr = bindings[1].get().Cast<BoundColumnRefExpression>();
 	const auto &inner_ref_expr = bindings[2].get().Cast<BoundColumnRefExpression>();
 
 	// Sanity check
-	if (inner_ref_expr.binding.table_index != inner_get.table_index) {
+	if (inner_ref_expr.Binding().table_index != inner_get.table_index) {
 		// Well, we have to reference the rhs
 		return false;
 	}
@@ -578,7 +602,7 @@ bool HNSWIndexJoinOptimizer::TryOptimize(Binder &binder, ClientContext &context,
 	// Now create the HNSWIndexJoin operator
 	//------------------------------------------------------------------------------
 
-	auto index_join = make_uniq<LogicalHNSWIndexJoin>(binder.GenerateTableIndex(), duck_table, *index_ptr, k_value);
+	auto index_join = make_uniq<LogicalHNSWIndexJoin>(binder.GenerateTableIndex(), duck_table, found_entry, k_value);
 	for (auto &column_id : inner_get.GetColumnIds()) {
 		index_join->inner_column_ids.emplace_back(column_id.GetPrimaryIndex());
 	}
@@ -586,8 +610,8 @@ bool HNSWIndexJoinOptimizer::TryOptimize(Binder &binder, ClientContext &context,
 	index_join->inner_returned_types = inner_get.returned_types;
 
 	// TODO: this is kind of unsafe, column_index != physical index
-	index_join->outer_vector_column = outer_ref_expr.binding.column_index;
-	index_join->inner_vector_column = inner_ref_expr.binding.column_index;
+	index_join->outer_vector_column = outer_ref_expr.Binding().column_index;
+	index_join->inner_vector_column = inner_ref_expr.Binding().column_index;
 
 	ColumnBindingReplacer replacer;
 
@@ -598,7 +622,7 @@ bool HNSWIndexJoinOptimizer::TryOptimize(Binder &binder, ClientContext &context,
 	auto delim_bindings = delim_join.GetColumnBindings();
 	auto delim_types = delim_join.types;
 
-	idx_t new_binding_idx = 0;
+	ProjectionIndex new_binding_idx(0);
 	for (idx_t i = 0; i < delim_bindings.size(); i++) {
 		auto &old_binding = delim_bindings[i];
 
@@ -616,7 +640,7 @@ bool HNSWIndexJoinOptimizer::TryOptimize(Binder &binder, ClientContext &context,
 
 	// Also add the window expression to the projection last. We will replace this with a reference to the index join
 	// in the next inlining step
-	ColumnBinding window_binding(window.window_index, 0);
+	ColumnBinding window_binding(window.window_index, ProjectionIndex(0));
 	projection_expressions.push_back(make_uniq<BoundColumnRefExpression>(LogicalType::BIGINT, window_binding));
 	replacer.replacement_bindings.emplace_back(window_binding,
 	                                           ColumnBinding(projection_table_index, new_binding_idx++));
@@ -632,33 +656,34 @@ bool HNSWIndexJoinOptimizer::TryOptimize(Binder &binder, ClientContext &context,
 		auto &ref = expr->Cast<BoundColumnRefExpression>();
 
 		// If this references the inner table scan, reference the index join instead
-		if (ref.binding.table_index == inner_get.table_index) {
-			ref.binding.table_index = index_join->table_index;
+		if (ref.Binding().table_index == inner_get.table_index) {
+			ref.BindingMutable().table_index = index_join->table_index;
 		}
 
 		// If this references the outer proj, replace it with the inner proj
 		if (outer_proj_ptr) {
 			auto &outer_proj = outer_proj_ptr->get()->Cast<LogicalProjection>();
-			if (ref.binding.table_index == outer_proj.table_index) {
+			if (ref.Binding().table_index == outer_proj.table_index) {
 				// assert that this can only be bound column ref
-				const auto &outer_expr = outer_proj.expressions[ref.binding.column_index];
-				const auto &outer_ref = outer_expr->Cast<BoundColumnRefExpression>();
+				const auto &outer_expr = outer_proj.GetExpression(ref.Binding());
+				const auto &outer_ref = outer_expr.Cast<BoundColumnRefExpression>();
 
-				ref.binding = outer_ref.binding;
+				ref.BindingMutable() = outer_ref.Binding();
 			}
 		}
 
 		// If this references the inner proj, replace it with the actual expression
-		if (ref.binding.table_index == inner_proj.table_index) {
-			const auto &inner_expr = inner_proj.expressions[ref.binding.column_index];
-			expr = inner_expr->Copy();
+		if (ref.Binding().table_index == inner_proj.table_index) {
+			const auto &inner_expr = inner_proj.GetExpression(ref.Binding());
+			expr = inner_expr.Copy();
 			// These can still reference the delim_get, but we replace them in the next step.
 		}
 
 		// Special case: the window row number expression. Forward this to the index join
-		else if (ref.binding.table_index == window.window_index) {
+		else if (ref.Binding().table_index == window.window_index) {
 			// The special "row_number" expression is always the last column of the index_join itself
-			ColumnBinding index_row_number_binding(index_join->table_index, index_join->inner_column_ids.size());
+			ColumnBinding index_row_number_binding(index_join->table_index,
+			                                       ProjectionIndex(index_join->inner_column_ids.size()));
 			expr = make_uniq<BoundColumnRefExpression>(LogicalType::BIGINT, index_row_number_binding);
 		}
 	}
@@ -695,9 +720,780 @@ bool HNSWIndexJoinOptimizer::TryOptimize(Binder &binder, ClientContext &context,
 	return true;
 }
 
+// Origin of a column produced by the correlated subtree, traced back to the
+// physical relation the HNSW index join will expose.
+namespace {
+struct ArgMinOrigin {
+	enum class Kind { INNER, DELIM, OUTER, DISTANCE, UNKNOWN };
+	Kind kind = Kind::UNKNOWN;
+	ColumnBinding binding;
+};
+} // namespace
+
+bool HNSWIndexJoinOptimizer::TryOptimizeArgMin(Binder &binder, ClientContext &context,
+                                               unique_ptr<LogicalOperator> &root, unique_ptr<LogicalOperator> &plan) {
+	//------------------------------------------------------------------------------
+	// Match the DuckDB >= 1.5 plan produced by TopNWindowElimination:
+	//
+	// delim_join
+	//   -> get (outer/lhs)                              [either child]
+	//   -> projection(s)
+	//        -> [unnest]                                (only when k > 1)
+	//          -> aggregate  arg_min(payload, distance, [k]) group by <corr>
+	//            -> projection "inner" (computes the distance)
+	//              -> cross_product
+	//                -> delim_get
+	//                -> get (rhs, seq_scan, indexed)
+	//------------------------------------------------------------------------------
+
+	if (plan->type != LogicalOperatorType::LOGICAL_DELIM_JOIN || plan->children.size() != 2) {
+		return false;
+	}
+	auto &delim_join = plan->Cast<LogicalJoin>();
+
+	// The outer side is a bare GET; the other side is the correlated subtree. In
+	// DuckDB <= 1.4 the GET was children[1]; in >= 1.5 it is children[0].
+	unique_ptr<LogicalOperator> *outer_get_ptr = nullptr;
+	unique_ptr<LogicalOperator> *corr_ptr = nullptr;
+	for (idx_t i = 0; i < 2; i++) {
+		if (delim_join.children[i]->type == LogicalOperatorType::LOGICAL_GET &&
+		    delim_join.children[i]->children.empty()) {
+			outer_get_ptr = &delim_join.children[i];
+			corr_ptr = &delim_join.children[1 - i];
+			break;
+		}
+	}
+	if (!outer_get_ptr) {
+		return false;
+	}
+	auto &outer_get = (*outer_get_ptr)->Cast<LogicalGet>();
+
+	// Walk down the correlated side, collecting the projection/unnest chain until
+	// we reach the aggregate.
+	vector<reference<LogicalOperator>> corr_chain;
+	LogicalOperator *cursor = corr_ptr->get();
+	while (cursor && cursor->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		if ((cursor->type != LogicalOperatorType::LOGICAL_PROJECTION &&
+		     cursor->type != LogicalOperatorType::LOGICAL_UNNEST) ||
+		    cursor->children.size() != 1) {
+			return false;
+		}
+		corr_chain.push_back(*cursor);
+		cursor = cursor->children[0].get();
+	}
+	if (!cursor) {
+		return false;
+	}
+	auto &aggregate = cursor->Cast<LogicalAggregate>();
+
+	// A single arg_min aggregate over a single group (the correlation key).
+	if (aggregate.expressions.size() != 1 || aggregate.groups.size() != 1) {
+		return false;
+	}
+	if (aggregate.expressions[0]->GetExpressionType() != ExpressionType::BOUND_AGGREGATE) {
+		return false;
+	}
+	auto &agg_expr = aggregate.expressions[0]->Cast<BoundAggregateExpression>();
+	const auto agg_name = agg_expr.Function().GetName();
+	// Only the "min" variants give nearest-neighbours (ascending distance).
+	if (agg_name != "arg_min_nulls_last" && agg_name != "arg_min" && agg_name != "min_by") {
+		return false;
+	}
+	if (agg_expr.GetChildren().size() < 2 || agg_expr.GetChildren().size() > 3) {
+		return false;
+	}
+
+	// k is the optional 3rd argument; absent means LIMIT 1.
+	int64_t k_value = 1;
+	if (agg_expr.GetChildren().size() == 3) {
+		if (agg_expr.GetChildren()[2]->GetExpressionType() != ExpressionType::VALUE_CONSTANT) {
+			return false;
+		}
+		k_value = agg_expr.GetChildren()[2]->Cast<BoundConstantExpression>().GetValue().GetValue<int64_t>();
+	}
+	if (k_value <= 0 || k_value >= STANDARD_VECTOR_SIZE) {
+		return false;
+	}
+
+	// The order argument (children[1]) is a reference to the distance column in inner_proj.
+	if (agg_expr.GetChildren()[1]->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+		return false;
+	}
+	auto &order_ref = agg_expr.GetChildren()[1]->Cast<BoundColumnRefExpression>();
+
+	// inner_proj -> cross_product -> {delim_get, get}
+	if (aggregate.children.size() != 1 || aggregate.children[0]->type != LogicalOperatorType::LOGICAL_PROJECTION) {
+		return false;
+	}
+	auto &inner_proj = aggregate.children[0]->Cast<LogicalProjection>();
+	if (inner_proj.children.size() != 1 || inner_proj.children[0]->type != LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
+		return false;
+	}
+	auto &cross_product = inner_proj.children[0]->Cast<LogicalCrossProduct>();
+
+	unique_ptr<LogicalOperator> *delim_get_ptr = nullptr;
+	unique_ptr<LogicalOperator> *inner_get_ptr = nullptr;
+	auto &cp_lhs = cross_product.children[0];
+	auto &cp_rhs = cross_product.children[1];
+	if (cp_lhs->type == LogicalOperatorType::LOGICAL_DELIM_GET && cp_rhs->type == LogicalOperatorType::LOGICAL_GET) {
+		delim_get_ptr = &cp_lhs;
+		inner_get_ptr = &cp_rhs;
+	} else if (cp_rhs->type == LogicalOperatorType::LOGICAL_DELIM_GET &&
+	           cp_lhs->type == LogicalOperatorType::LOGICAL_GET) {
+		delim_get_ptr = &cp_rhs;
+		inner_get_ptr = &cp_lhs;
+	} else {
+		return false;
+	}
+	auto &delim_get = (*delim_get_ptr)->Cast<LogicalDelimGet>();
+	auto &inner_get = (*inner_get_ptr)->Cast<LogicalGet>();
+	if (inner_get.function.GetName() != "seq_scan") {
+		return false;
+	}
+
+	// The distance expression lives in inner_proj, referenced by the order argument.
+	const auto inner_proj_bindings = inner_proj.GetColumnBindings();
+	bool order_in_inner_proj = false;
+	for (auto &b : inner_proj_bindings) {
+		if (b == order_ref.Binding()) {
+			order_in_inner_proj = true;
+			break;
+		}
+	}
+	if (!order_in_inner_proj || order_ref.Binding().column_index >= inner_proj.expressions.size()) {
+		return false;
+	}
+	auto &distance_expr_ptr = *inner_proj.expressions[order_ref.Binding().column_index];
+
+	//------------------------------------------------------------------------------
+	// Match the index (identical to the window-plan matcher).
+	//------------------------------------------------------------------------------
+	auto &table = *inner_get.GetTable();
+	if (!table.IsDuckTable()) {
+		return false;
+	}
+	auto &duck_table = table.Cast<DuckTableEntry>();
+	auto &table_info = *table.GetStorage().GetDataTableInfo();
+
+	shared_ptr<IndexEntry> found_entry;
+	vector<reference<Expression>> bindings;
+
+	table_info.BindIndexes(context, HNSWIndex::TYPE_NAME);
+	for (auto index_entry : table_info.GetIndexes().IndexEntries()) {
+		if (index_entry->GetBindState() != IndexBindState::BOUND ||
+		    HNSWIndex::TYPE_NAME != index_entry->GetIndexType()) {
+			continue;
+		}
+		auto guard = index_entry->GetReadHandle<HNSWIndex>();
+		bindings.clear();
+		if (!guard->TryMatchDistanceFunction(distance_expr_ptr, bindings)) {
+			continue;
+		}
+		unique_ptr<Expression> bound_index_expr = nullptr;
+		if (!guard->TryBindIndexExpression(inner_get, bound_index_expr)) {
+			continue;
+		}
+		ExpressionIterator::EnumerateExpression(bound_index_expr, [&](Expression &child) {
+			if (child.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
+				auto &bound_colref_expr = child.Cast<BoundColumnRefExpression>();
+				if (bound_colref_expr.Binding().table_index == outer_get.table_index) {
+					bound_colref_expr.BindingMutable().table_index = delim_get.table_index;
+				}
+			}
+		});
+		auto &lhs_dist_expr = bindings[1];
+		auto &rhs_dist_expr = bindings[2];
+		if (lhs_dist_expr.get().Equals(*bound_index_expr)) {
+			if (!rhs_dist_expr.get().Equals(*bound_index_expr)) {
+				std::swap(lhs_dist_expr, rhs_dist_expr);
+			} else {
+				return false;
+			}
+		}
+		found_entry = index_entry;
+		break;
+	}
+	if (!found_entry) {
+		return false;
+	}
+	if (bindings[1].get().GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+		return false;
+	}
+	if (bindings[2].get().GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+		return false;
+	}
+	const auto &outer_ref_expr = bindings[1].get().Cast<BoundColumnRefExpression>();
+	const auto &inner_ref_expr = bindings[2].get().Cast<BoundColumnRefExpression>();
+	if (inner_ref_expr.Binding().table_index != inner_get.table_index) {
+		return false;
+	}
+
+	//------------------------------------------------------------------------------
+	// Resolver: trace a column produced by the correlated subtree down to the
+	// inner table column (INNER), the correlation column (DELIM), the outer table
+	// (OUTER) or the distance expression (DISTANCE).
+	//------------------------------------------------------------------------------
+	const auto inner_get_bindings = inner_get.GetColumnBindings();
+	const auto delim_get_bindings = delim_get.GetColumnBindings();
+	const auto outer_get_bindings = outer_get.GetColumnBindings();
+	const auto agg_bindings = aggregate.GetColumnBindings();
+
+	std::function<ArgMinOrigin(const ColumnBinding &)> resolve;
+	std::function<ArgMinOrigin(Expression &)> resolve_expr;
+
+	resolve_expr = [&](Expression &e) -> ArgMinOrigin {
+		if (e.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
+			return resolve(e.Cast<BoundColumnRefExpression>().Binding());
+		}
+		if (e.GetExpressionType() == ExpressionType::BOUND_FUNCTION) {
+			auto &fexpr = e.Cast<BoundFunctionExpression>();
+			if (fexpr.Function().GetName() == "struct_extract" && fexpr.GetChildren().size() == 2 &&
+			    fexpr.GetChildren()[1]->GetExpressionType() == ExpressionType::VALUE_CONSTANT) {
+				const auto field = fexpr.GetChildren()[1]->Cast<BoundConstantExpression>().GetValue().ToString();
+				// The payload is a struct_pack; match the extracted field to a packed argument by name.
+				if (agg_expr.GetChildren()[0]->GetExpressionType() == ExpressionType::BOUND_FUNCTION) {
+					auto &pack = agg_expr.GetChildren()[0]->Cast<BoundFunctionExpression>();
+					if (pack.Function().GetName() == "struct_pack") {
+						for (auto &arg : pack.GetChildren()) {
+							if (arg->ToString() == field) {
+								return resolve_expr(*arg);
+							}
+						}
+					}
+				}
+				return {ArgMinOrigin::Kind::UNKNOWN, {}};
+			}
+			// Any other function (e.g. array_distance) is treated as the distance.
+			return {ArgMinOrigin::Kind::DISTANCE, {}};
+		}
+		return {ArgMinOrigin::Kind::UNKNOWN, {}};
+	};
+
+	resolve = [&](const ColumnBinding &b) -> ArgMinOrigin {
+		for (auto &ib : inner_get_bindings) {
+			if (ib == b) {
+				return {ArgMinOrigin::Kind::INNER, b};
+			}
+		}
+		for (auto &db : delim_get_bindings) {
+			if (db == b) {
+				return {ArgMinOrigin::Kind::DELIM, b};
+			}
+		}
+		for (auto &ob : outer_get_bindings) {
+			if (ob == b) {
+				return {ArgMinOrigin::Kind::OUTER, b};
+			}
+		}
+		// inner_proj
+		for (idx_t i = 0; i < inner_proj_bindings.size(); i++) {
+			if (inner_proj_bindings[i] == b) {
+				return resolve_expr(*inner_proj.expressions[i]);
+			}
+		}
+		// aggregate: group columns first, then the (single) aggregate result.
+		for (idx_t i = 0; i < aggregate.groups.size() && i < agg_bindings.size(); i++) {
+			if (agg_bindings[i] == b) {
+				return resolve_expr(*aggregate.groups[i]);
+			}
+		}
+		for (idx_t i = aggregate.groups.size(); i < agg_bindings.size(); i++) {
+			if (agg_bindings[i] == b) {
+				// Single-column payload: resolve the packed expression directly.
+				return resolve_expr(*agg_expr.GetChildren()[0]);
+			}
+		}
+		// projections / unnest along the correlated chain.
+		for (auto &op_ref : corr_chain) {
+			auto &op = op_ref.get();
+			if (op.type == LogicalOperatorType::LOGICAL_PROJECTION) {
+				auto &proj = op.Cast<LogicalProjection>();
+				auto pbindings = proj.GetColumnBindings();
+				for (idx_t i = 0; i < pbindings.size(); i++) {
+					if (pbindings[i] == b) {
+						return resolve_expr(*proj.expressions[i]);
+					}
+				}
+			} else if (op.type == LogicalOperatorType::LOGICAL_UNNEST) {
+				// The UNNEST flattens the arg_min top-k list. Passthrough columns are
+				// resolved via the aggregate above; the newly produced (unnested) column
+				// is one element of the list, i.e. the aggregate payload.
+				auto ubindings = op.GetColumnBindings();
+				auto child_bindings = op.children[0]->GetColumnBindings();
+				for (auto &ub : ubindings) {
+					if (!(ub == b)) {
+						continue;
+					}
+					bool passthrough = false;
+					for (auto &cb : child_bindings) {
+						if (cb == b) {
+							passthrough = true;
+							break;
+						}
+					}
+					if (!passthrough) {
+						// Single-column payload: the element is the packed expression.
+						// Struct payload is only ever read through struct_extract.
+						return resolve_expr(*agg_expr.GetChildren()[0]);
+					}
+				}
+			}
+		}
+		return {ArgMinOrigin::Kind::UNKNOWN, {}};
+	};
+
+	//------------------------------------------------------------------------------
+	// Build the HNSW index join (identical shape to the window-plan matcher).
+	//------------------------------------------------------------------------------
+	auto index_join = make_uniq<LogicalHNSWIndexJoin>(binder.GenerateTableIndex(), duck_table, found_entry, k_value);
+	for (auto &column_id : inner_get.GetColumnIds()) {
+		index_join->inner_column_ids.emplace_back(column_id.GetPrimaryIndex());
+	}
+	index_join->inner_projection_ids = inner_get.projection_ids;
+	index_join->inner_returned_types = inner_get.returned_types;
+	index_join->outer_vector_column = outer_ref_expr.Binding().column_index;
+	index_join->inner_vector_column = inner_ref_expr.Binding().column_index;
+
+	ColumnBindingReplacer replacer;
+
+	auto delim_bindings = delim_join.GetColumnBindings();
+	auto delim_types = delim_join.types;
+
+	// Resolve every delim_join output column to a physical origin BEFORE mutating the
+	// plan, so that hitting an unaccountable column leaves the plan untouched.
+	vector<ArgMinOrigin> origins;
+	origins.reserve(delim_bindings.size());
+	for (auto &db : delim_bindings) {
+		auto origin = resolve(db);
+		if (origin.kind == ArgMinOrigin::Kind::UNKNOWN) {
+			return false;
+		}
+		origins.push_back(origin);
+	}
+
+	// Top projection reproducing the delim_join output columns, expressed in terms of
+	// the index join / outer get (recomputing the distance where it is still needed).
+	vector<unique_ptr<Expression>> projection_expressions;
+	auto projection_table_index = binder.GenerateTableIndex();
+	ProjectionIndex new_binding_idx(0);
+	for (idx_t i = 0; i < delim_bindings.size(); i++) {
+		if (origins[i].kind == ArgMinOrigin::Kind::DISTANCE) {
+			// The index join does not materialise the distance; recompute it. The copy
+			// references the delim_get / inner_get and is remapped below.
+			projection_expressions.push_back(distance_expr_ptr.Copy());
+		} else {
+			projection_expressions.push_back(make_uniq<BoundColumnRefExpression>(delim_types[i], origins[i].binding));
+		}
+		replacer.replacement_bindings.emplace_back(delim_bindings[i],
+		                                           ColumnBinding(projection_table_index, new_binding_idx++));
+	}
+	auto new_projection = make_uniq<LogicalProjection>(projection_table_index, std::move(projection_expressions));
+
+	// Redirect all references to the delim_join outputs to the new projection.
+	replacer.VisitOperator(*root);
+	replacer.replacement_bindings.clear();
+
+	// Everything that used to reference the delim_get now references the outer get.
+	for (const auto &old_binding : delim_get.GetColumnBindings()) {
+		replacer.replacement_bindings.emplace_back(old_binding,
+		                                           ColumnBinding(outer_get.table_index, old_binding.column_index));
+	}
+	// Everything that used to reference the inner get now references the index join.
+	for (const auto &old_binding : inner_get.GetColumnBindings()) {
+		replacer.replacement_bindings.emplace_back(old_binding,
+		                                           ColumnBinding(index_join->table_index, old_binding.column_index));
+	}
+	replacer.VisitOperator(*new_projection);
+
+	// Assemble: index join takes the outer get as its (only) child, new projection on top.
+	index_join->children.emplace_back(std::move(*outer_get_ptr));
+	new_projection->children.emplace_back(std::move(index_join));
+	new_projection->EstimateCardinality(context);
+
+	plan = std::move(new_projection);
+
+	CardinalityResetter cardinality_resetter(context);
+	cardinality_resetter.VisitOperator(*root);
+
+	return true;
+}
+
+bool HNSWIndexJoinOptimizer::TryOptimizeArgMinCte(Binder &binder, ClientContext &context,
+                                                  unique_ptr<LogicalOperator> &root,
+                                                  unique_ptr<LogicalOperator> &plan) {
+	//------------------------------------------------------------------------------
+	// Match the DuckDB delim_join_as_cte plan. The dependent join is materialised as
+	// a CTE, and the arg_min top-k subtree appears as one side of an INNER comparison
+	// join, with the correlated keys arriving through a CTE_SCAN instead of a
+	// DELIM_GET:
+	//
+	//   projection(s) / [unnest]                          <- `plan` (anchor)
+	//     -> aggregate  arg_min(payload, distance, [k]) group by <corr>
+	//       -> projection "inner" (computes the distance)
+	//         -> cross_product
+	//           -> get (rhs, seq_scan, indexed)
+	//           -> corr_source (... -> cte_ref)            (correlated keys)
+	//
+	// We replace this subtree with an HNSW_INDEX_JOIN whose child is corr_source. The
+	// surrounding CTE / comparison-join (which re-attaches the per-key result to the
+	// outer rows) is left intact. The plain DELIM_JOIN shape is handled higher up by
+	// TryOptimizeArgMin, so this only ever fires on the CTE rewrite.
+	//------------------------------------------------------------------------------
+
+	// Walk down the projection/unnest chain to the aggregate.
+	vector<reference<LogicalOperator>> corr_chain;
+	LogicalOperator *cursor = plan.get();
+	while (cursor && cursor->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		if ((cursor->type != LogicalOperatorType::LOGICAL_PROJECTION &&
+		     cursor->type != LogicalOperatorType::LOGICAL_UNNEST) ||
+		    cursor->children.size() != 1) {
+			return false;
+		}
+		corr_chain.push_back(*cursor);
+		cursor = cursor->children[0].get();
+	}
+	if (!cursor) {
+		return false;
+	}
+	auto &aggregate = cursor->Cast<LogicalAggregate>();
+
+	// A single arg_min aggregate over a single group (the correlation key).
+	if (aggregate.expressions.size() != 1 || aggregate.groups.size() != 1) {
+		return false;
+	}
+	if (aggregate.expressions[0]->GetExpressionType() != ExpressionType::BOUND_AGGREGATE) {
+		return false;
+	}
+	auto &agg_expr = aggregate.expressions[0]->Cast<BoundAggregateExpression>();
+	const auto agg_name = agg_expr.Function().GetName();
+	if (agg_name != "arg_min_nulls_last" && agg_name != "arg_min" && agg_name != "min_by") {
+		return false;
+	}
+	if (agg_expr.GetChildren().size() < 2 || agg_expr.GetChildren().size() > 3) {
+		return false;
+	}
+
+	int64_t k_value = 1;
+	if (agg_expr.GetChildren().size() == 3) {
+		if (agg_expr.GetChildren()[2]->GetExpressionType() != ExpressionType::VALUE_CONSTANT) {
+			return false;
+		}
+		k_value = agg_expr.GetChildren()[2]->Cast<BoundConstantExpression>().GetValue().GetValue<int64_t>();
+	}
+	if (k_value <= 0 || k_value >= STANDARD_VECTOR_SIZE) {
+		return false;
+	}
+
+	if (agg_expr.GetChildren()[1]->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+		return false;
+	}
+	auto &order_ref = agg_expr.GetChildren()[1]->Cast<BoundColumnRefExpression>();
+
+	// inner_proj -> cross_product -> {get (seq_scan), corr_source}
+	if (aggregate.children.size() != 1 || aggregate.children[0]->type != LogicalOperatorType::LOGICAL_PROJECTION) {
+		return false;
+	}
+	auto &inner_proj = aggregate.children[0]->Cast<LogicalProjection>();
+	if (inner_proj.children.size() != 1 || inner_proj.children[0]->type != LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
+		return false;
+	}
+	auto &cross_product = inner_proj.children[0]->Cast<LogicalCrossProduct>();
+
+	// One side of the cross product is the indexed seq_scan, the other is the
+	// correlated-key source (a CTE_SCAN-rooted subtree, not a DELIM_GET).
+	auto &cp_lhs = cross_product.children[0];
+	auto &cp_rhs = cross_product.children[1];
+	unique_ptr<LogicalOperator> *corr_source_ptr = nullptr;
+	unique_ptr<LogicalOperator> *inner_get_ptr = nullptr;
+	if (cp_lhs->type == LogicalOperatorType::LOGICAL_GET && cp_lhs->Cast<LogicalGet>().function.GetName() == "seq_scan") {
+		inner_get_ptr = &cp_lhs;
+		corr_source_ptr = &cp_rhs;
+	} else if (cp_rhs->type == LogicalOperatorType::LOGICAL_GET &&
+	           cp_rhs->Cast<LogicalGet>().function.GetName() == "seq_scan") {
+		inner_get_ptr = &cp_rhs;
+		corr_source_ptr = &cp_lhs;
+	} else {
+		return false;
+	}
+	auto &inner_get = (*inner_get_ptr)->Cast<LogicalGet>();
+	auto &corr_source = **corr_source_ptr;
+	// The DELIM_GET shape belongs to TryOptimizeArgMin; only fire for the CTE rewrite.
+	if (corr_source.type == LogicalOperatorType::LOGICAL_DELIM_GET) {
+		return false;
+	}
+	std::function<bool(LogicalOperator &)> has_cte_ref = [&](LogicalOperator &op) -> bool {
+		if (op.type == LogicalOperatorType::LOGICAL_CTE_REF) {
+			return true;
+		}
+		for (auto &c : op.children) {
+			if (has_cte_ref(*c)) {
+				return true;
+			}
+		}
+		return false;
+	};
+	if (!has_cte_ref(corr_source)) {
+		return false;
+	}
+
+	// The distance expression lives in inner_proj, referenced by the order argument.
+	const auto inner_proj_bindings = inner_proj.GetColumnBindings();
+	bool order_in_inner_proj = false;
+	for (auto &b : inner_proj_bindings) {
+		if (b == order_ref.Binding()) {
+			order_in_inner_proj = true;
+			break;
+		}
+	}
+	if (!order_in_inner_proj || order_ref.Binding().column_index >= inner_proj.expressions.size()) {
+		return false;
+	}
+	auto &distance_expr_ptr = *inner_proj.expressions[order_ref.Binding().column_index];
+
+	//------------------------------------------------------------------------------
+	// Match the index (identical to the other matchers).
+	//------------------------------------------------------------------------------
+	auto &table = *inner_get.GetTable();
+	if (!table.IsDuckTable()) {
+		return false;
+	}
+	auto &duck_table = table.Cast<DuckTableEntry>();
+	auto &table_info = *table.GetStorage().GetDataTableInfo();
+
+	shared_ptr<IndexEntry> found_entry;
+	vector<reference<Expression>> bindings;
+
+	table_info.BindIndexes(context, HNSWIndex::TYPE_NAME);
+	for (auto index_entry : table_info.GetIndexes().IndexEntries()) {
+		if (index_entry->GetBindState() != IndexBindState::BOUND ||
+		    HNSWIndex::TYPE_NAME != index_entry->GetIndexType()) {
+			continue;
+		}
+		auto guard = index_entry->GetReadHandle<HNSWIndex>();
+		bindings.clear();
+		if (!guard->TryMatchDistanceFunction(distance_expr_ptr, bindings)) {
+			continue;
+		}
+		unique_ptr<Expression> bound_index_expr = nullptr;
+		if (!guard->TryBindIndexExpression(inner_get, bound_index_expr)) {
+			continue;
+		}
+		auto &lhs_dist_expr = bindings[1];
+		auto &rhs_dist_expr = bindings[2];
+		if (lhs_dist_expr.get().Equals(*bound_index_expr)) {
+			if (!rhs_dist_expr.get().Equals(*bound_index_expr)) {
+				std::swap(lhs_dist_expr, rhs_dist_expr);
+			} else {
+				return false;
+			}
+		}
+		found_entry = index_entry;
+		break;
+	}
+	if (!found_entry) {
+		return false;
+	}
+	if (bindings[1].get().GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+		return false;
+	}
+	if (bindings[2].get().GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+		return false;
+	}
+	const auto &outer_ref_expr = bindings[1].get().Cast<BoundColumnRefExpression>();
+	const auto &inner_ref_expr = bindings[2].get().Cast<BoundColumnRefExpression>();
+	if (inner_ref_expr.Binding().table_index != inner_get.table_index) {
+		return false;
+	}
+
+	// The query vector must be a column of corr_source (the index join's child).
+	const auto corr_bindings = corr_source.GetColumnBindings();
+	bool outer_in_corr = false;
+	for (auto &b : corr_bindings) {
+		if (b == outer_ref_expr.Binding()) {
+			outer_in_corr = true;
+			break;
+		}
+	}
+	if (!outer_in_corr) {
+		return false;
+	}
+
+	//------------------------------------------------------------------------------
+	// Build the HNSW index join, child = corr_source (correlated keys), and
+	// resolve the old subtree outputs to exact replacement expressions.
+	//------------------------------------------------------------------------------
+	auto index_join = make_uniq<LogicalHNSWIndexJoin>(binder.GenerateTableIndex(), duck_table, found_entry, k_value);
+	for (auto &column_id : inner_get.GetColumnIds()) {
+		index_join->inner_column_ids.emplace_back(column_id.GetPrimaryIndex());
+	}
+	index_join->inner_projection_ids = inner_get.projection_ids;
+	index_join->inner_returned_types = inner_get.returned_types;
+	index_join->outer_vector_column = outer_ref_expr.Binding().column_index;
+	index_join->inner_vector_column = inner_ref_expr.Binding().column_index;
+
+	const auto inner_get_bindings = inner_get.GetColumnBindings();
+	const auto agg_bindings = aggregate.GetColumnBindings();
+
+	std::function<unique_ptr<Expression>(const ColumnBinding &)> resolve_binding;
+	std::function<unique_ptr<Expression>(const Expression &)> resolve_expression;
+
+	resolve_expression = [&](const Expression &expression) -> unique_ptr<Expression> {
+		auto result = expression.Copy();
+		bool success = true;
+		ExpressionIterator::VisitExpressionMutable<BoundColumnRefExpression>(
+		    result, [&](BoundColumnRefExpression &ref, unique_ptr<Expression> &expr_ptr) {
+			    if (ref.Depth() != 0) {
+				    success = false;
+				    return;
+			    }
+			    auto replacement = resolve_binding(ref.Binding());
+			    if (!replacement || replacement->GetReturnType() != ref.GetReturnType()) {
+				    success = false;
+				    return;
+			    }
+			    expr_ptr = std::move(replacement);
+		    });
+		if (!success) {
+			return nullptr;
+		}
+		return result;
+	};
+
+	resolve_binding = [&](const ColumnBinding &binding) -> unique_ptr<Expression> {
+		// Indexed-table columns are produced by the HNSW index join.
+		for (idx_t i = 0; i < inner_get_bindings.size(); i++) {
+			if (inner_get_bindings[i] == binding) {
+				if (i >= inner_get.types.size()) {
+					return nullptr;
+				}
+				return make_uniq<BoundColumnRefExpression>(
+				    inner_get.types[i], ColumnBinding(index_join->table_index, binding.column_index));
+			}
+		}
+
+		// The complete corr_source remains the index join's child, so all of its
+		// outputs pass through with their original bindings and types.
+		for (idx_t i = 0; i < corr_bindings.size(); i++) {
+			if (corr_bindings[i] == binding) {
+				if (i >= corr_source.types.size()) {
+					return nullptr;
+				}
+				return make_uniq<BoundColumnRefExpression>(corr_source.types[i], binding);
+			}
+		}
+
+		// Inline the projection that computes the distance and payload columns.
+		for (idx_t i = 0; i < inner_proj_bindings.size(); i++) {
+			if (inner_proj_bindings[i] == binding) {
+				if (i >= inner_proj.expressions.size()) {
+					return nullptr;
+				}
+				return resolve_expression(*inner_proj.expressions[i]);
+			}
+		}
+
+		// Aggregate group outputs resolve to their group expressions. The sole
+		// aggregate output resolves to the exact arg_min payload expression.
+		for (idx_t i = 0; i < aggregate.groups.size() && i < agg_bindings.size(); i++) {
+			if (agg_bindings[i] == binding) {
+				return resolve_expression(*aggregate.groups[i]);
+			}
+		}
+		for (idx_t i = aggregate.groups.size(); i < agg_bindings.size(); i++) {
+			if (agg_bindings[i] == binding) {
+				return resolve_expression(*agg_expr.GetChildren()[0]);
+			}
+		}
+
+		// Inline each projection above the aggregate. For top-k arg_min, UNNEST
+		// contributes one payload element per row; passthrough bindings are
+		// resolved by the lower projection/aggregate entries in the chain.
+		for (auto &op_ref : corr_chain) {
+			auto &op = op_ref.get();
+			if (op.type == LogicalOperatorType::LOGICAL_PROJECTION) {
+				auto &projection = op.Cast<LogicalProjection>();
+				auto projection_bindings = projection.GetColumnBindings();
+				for (idx_t i = 0; i < projection_bindings.size(); i++) {
+					if (projection_bindings[i] == binding) {
+						if (i >= projection.expressions.size()) {
+							return nullptr;
+						}
+						return resolve_expression(*projection.expressions[i]);
+					}
+				}
+			} else if (op.type == LogicalOperatorType::LOGICAL_UNNEST) {
+				auto unnest_bindings = op.GetColumnBindings();
+				auto child_bindings = op.children[0]->GetColumnBindings();
+				for (auto &unnest_binding : unnest_bindings) {
+					if (!(unnest_binding == binding)) {
+						continue;
+					}
+					bool passthrough = false;
+					for (auto &child_binding : child_bindings) {
+						if (child_binding == binding) {
+							passthrough = true;
+							break;
+						}
+					}
+					if (!passthrough) {
+						return resolve_expression(*agg_expr.GetChildren()[0]);
+					}
+				}
+			}
+		}
+		return nullptr;
+	};
+
+	ColumnBindingReplacer replacer;
+
+	// Reproduce the subtree's output columns in terms of the index join and its
+	// corr_source child. Resolve and type-check every expression before mutating
+	// the existing plan so an unrecognised shape leaves it untouched.
+	auto output_bindings = plan->GetColumnBindings();
+	auto output_types = plan->types;
+	if (output_bindings.size() != output_types.size()) {
+		return false;
+	}
+	vector<unique_ptr<Expression>> projection_expressions;
+	projection_expressions.reserve(output_bindings.size());
+	for (idx_t i = 0; i < output_bindings.size(); i++) {
+		auto replacement = resolve_binding(output_bindings[i]);
+		if (!replacement || replacement->GetReturnType() != output_types[i]) {
+			return false;
+		}
+		projection_expressions.push_back(std::move(replacement));
+	}
+
+	auto projection_table_index = binder.GenerateTableIndex();
+	ProjectionIndex new_binding_idx(0);
+	for (idx_t i = 0; i < output_bindings.size(); i++) {
+		replacer.replacement_bindings.emplace_back(output_bindings[i],
+		                                           ColumnBinding(projection_table_index, new_binding_idx++));
+	}
+	auto new_projection = make_uniq<LogicalProjection>(projection_table_index, std::move(projection_expressions));
+
+	// Redirect all references to the subtree's outputs to the new projection.
+	replacer.VisitOperator(*root);
+	replacer.replacement_bindings.clear();
+
+	// Assemble: index join takes corr_source as its (only) child, new projection on top.
+	index_join->children.emplace_back(std::move(*corr_source_ptr));
+	new_projection->children.emplace_back(std::move(index_join));
+	new_projection->EstimateCardinality(context);
+
+	plan = std::move(new_projection);
+
+	CardinalityResetter cardinality_resetter(context);
+	cardinality_resetter.VisitOperator(*root);
+
+	return true;
+}
+
 void HNSWIndexJoinOptimizer::OptimizeRecursive(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &root,
                                                unique_ptr<LogicalOperator> &plan) {
-	if (!TryOptimize(input.optimizer.binder, input.context, root, plan)) {
+	if (!TryOptimize(input.optimizer.binder, input.context, root, plan) &&
+	    !TryOptimizeArgMin(input.optimizer.binder, input.context, root, plan) &&
+	    !TryOptimizeArgMinCte(input.optimizer.binder, input.context, root, plan)) {
 		// Recursively optimize the children
 		for (auto &child : plan->children) {
 			OptimizeRecursive(input, root, child);
@@ -714,7 +1510,6 @@ void HNSWIndexJoinOptimizer::Optimize(OptimizerExtensionInput &input, unique_ptr
 //------------------------------------------------------------------------------
 
 void HNSWModule::RegisterJoinOptimizer(DatabaseInstance &db) {
-	// Register the JoinOptimizer
 	OptimizerExtension::Register(db.config, HNSWIndexJoinOptimizer());
 }
 

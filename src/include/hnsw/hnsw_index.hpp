@@ -4,9 +4,12 @@
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/typedefs.hpp"
+#include "duckdb/common/unordered_set.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/execution/index/bound_index.hpp"
+#include "duckdb/execution/index/index_type.hpp"
 #include "duckdb/execution/index/index_pointer.hpp"
 #include "duckdb/execution/index/fixed_size_allocator.hpp"
 #include "duckdb/optimizer/matcher/expression_matcher.hpp"
@@ -15,7 +18,7 @@
 #include "duckdb/storage/storage_lock.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 
-#include "usearch/index_dense.hpp"
+#include "usearch/duckdb_usearch.hpp"
 
 namespace duckdb {
 
@@ -27,6 +30,36 @@ struct HNSWIndexStats {
 	vector<unum::usearch::index_dense_gt<row_t>::stats_t> level_stats;
 };
 
+struct HNSWFilterBitmap {
+	void Set(row_t row_id) {
+		D_ASSERT(row_id >= 0);
+		if (row_id >= MAX_ROW_ID) {
+			local_row_ids.insert(row_id);
+			return;
+		}
+		auto bitmap_index = static_cast<idx_t>(row_id);
+		if (bitmap_index >= base_row_ids.size()) {
+			base_row_ids.resize(bitmap_index + 1);
+		}
+		base_row_ids[bitmap_index] = true;
+	}
+
+	bool Contains(row_t row_id) const {
+		if (row_id < 0) {
+			return false;
+		}
+		if (row_id >= MAX_ROW_ID) {
+			return local_row_ids.find(row_id) != local_row_ids.end();
+		}
+		auto bitmap_index = static_cast<idx_t>(row_id);
+		return bitmap_index < base_row_ids.size() && base_row_ids[bitmap_index];
+	}
+
+private:
+	vector<bool> base_row_ids;
+	unordered_set<row_t> local_row_ids;
+};
+
 class HNSWIndex : public BoundIndex {
 public:
 	// The type name of the HNSWIndex
@@ -34,7 +67,7 @@ public:
 	using USearchIndexType = unum::usearch::index_dense_gt<row_t>;
 
 public:
-	HNSWIndex(const string &name, IndexConstraintType index_constraint_type, const vector<column_t> &column_ids,
+	HNSWIndex(const Identifier &name, IndexConstraintType index_constraint_type, const vector<column_t> &column_ids,
 	          TableIOManager &table_io_manager, const vector<unique_ptr<Expression>> &unbound_expressions,
 	          AttachedDatabase &db, const case_insensitive_map_t<Value> &options,
 	          const IndexStorageInfo &info = IndexStorageInfo(), idx_t estimated_cardinality = 0);
@@ -50,13 +83,14 @@ public:
 	//! The allocator used to persist linked blocks
 	unique_ptr<FixedSizeAllocator> linked_block_allocator;
 
-	unique_ptr<IndexScanState> InitializeMultiScan(ClientContext &context);
-	idx_t ExecuteMultiScan(IndexScanState &state, float *query_vector, idx_t limit);
-	const Vector &GetMultiScanResult(IndexScanState &state);
-	void ResetMultiScan(IndexScanState &state);
+	unique_ptr<IndexScanState> InitializeMultiScan(ClientContext &context) const;
+	idx_t ExecuteMultiScan(IndexScanState &state, float *query_vector, idx_t limit) const;
+	const Vector &GetMultiScanResult(IndexScanState &state) const;
+	void ResetMultiScan(IndexScanState &state) const;
 
-	unique_ptr<IndexScanState> InitializeScan(float *query_vector, idx_t limit, ClientContext &context);
-	idx_t Scan(IndexScanState &state, Vector &result, idx_t result_offset = 0);
+	unique_ptr<IndexScanState> InitializeScan(float *query_vector, idx_t limit, ClientContext &context,
+	                                          optional_ptr<const HNSWFilterBitmap> filter = nullptr) const;
+	static idx_t Scan(IndexScanState &state, Vector &result, idx_t result_offset = 0);
 	idx_t GetVectorSize() const;
 	string GetMetric() const;
 
@@ -64,14 +98,14 @@ public:
 	void PersistToDisk();
 	void Compact();
 
-	unique_ptr<HNSWIndexStats> GetStats();
+	unique_ptr<HNSWIndexStats> GetStats() const;
 
 	void VerifyBuffers(IndexLock &lock) override;
 
 	static const case_insensitive_map_t<unum::usearch::metric_kind_t> METRIC_KIND_MAP;
 	static const unordered_map<uint8_t, unum::usearch::scalar_kind_t> SCALAR_KIND_MAP;
 
-	bool TryMatchDistanceFunction(const unique_ptr<Expression> &expr, vector<reference<Expression>> &bindings) const;
+	bool TryMatchDistanceFunction(Expression &expr, vector<reference<Expression>> &bindings) const;
 	bool TryBindIndexExpression(LogicalGet &get, unique_ptr<Expression> &result) const;
 
 public:
@@ -90,7 +124,7 @@ public:
 	//! Serializes HNSW memory to the WAL and returns the index storage information.
 	IndexStorageInfo SerializeToWAL(const case_insensitive_map_t<Value> &options) override;
 
-	idx_t GetInMemorySize(IndexLock &state) override;
+	idx_t GetInMemorySize(IndexLock &state) const override;
 
 	//! Merge another index into this index. The lock obtained from InitializeLock must be held, and the other
 	//! index must also be locked during the merge
@@ -100,18 +134,14 @@ public:
 	void Vacuum(IndexLock &state) override;
 
 	//! Traverses and verifies the index.
-	//! Currently not implemented.
-	void Verify(IndexLock &l) override;
-
-	//! Returns the string representation of an index.
-	//! Currently not implemented.
-	string ToString(IndexLock &l, bool display_ascii) override;
-
+	void Verify(IndexLock &state) override;
+	//! Returns the string representation of the index.
+	string ToString(IndexLock &state, bool display_ascii = false) override;
 	//! Ensures that the node allocation counts match the node counts.
 	void VerifyAllocations(IndexLock &state) override;
 
 	string GetConstraintViolationMessage(VerifyExistenceType verify_type, idx_t failed_index,
-	                                     DataChunk &input) override {
+	                                     DataChunk &input) const override {
 		return "Constraint violation in HNSW index";
 	}
 
@@ -124,7 +154,7 @@ public:
 
 private:
 	bool is_dirty = false;
-	StorageLock rwlock;
+	mutable StorageLock rwlock;
 	atomic<idx_t> index_size = {0};
 	unique_ptr<ExpressionMatcher> function_matcher;
 	unique_ptr<ExpressionMatcher> MakeFunctionMatcher() const;

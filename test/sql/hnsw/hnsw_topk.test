@@ -6,6 +6,9 @@ require vss
 require noforcestorage
 
 statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+statement ok
 CREATE TABLE t1 (vec FLOAT[3]);
 
 statement ok
@@ -29,4 +32,3 @@ query I
 SELECT list_sum(flatten(min_by(vec, array_distance(vec, [5,5,5]::FLOAT[3]), 3))) BETWEEN 45 AND 50 FROM t1;
 ----
 true
-

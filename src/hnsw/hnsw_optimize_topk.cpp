@@ -1,21 +1,23 @@
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
-#include "duckdb/planner/expression/bound_constant_expression.hpp"
-#include "duckdb/planner/operator/logical_aggregate.hpp"
-#include "duckdb/planner/operator/logical_get.hpp"
-#include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/planner/operator/logical_filter.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/index.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
 #include "duckdb/storage/table/data_table_info.hpp"
 #include "duckdb/storage/table/table_index_list.hpp"
-
 #include "hnsw/hnsw.hpp"
 #include "hnsw/hnsw_index.hpp"
 #include "hnsw/hnsw_index_scan.hpp"
+#include "hnsw/hnsw_optimize_filter.hpp"
 
 namespace duckdb {
 
@@ -32,19 +34,17 @@ static unique_ptr<Expression> CreateListOrderByExpr(ClientContext &context, uniq
 		return nullptr;
 	}
 
-	auto func = func_entry->functions.GetFunctionByOffset(0);
+	const auto &func = *func_entry->functions.GetFunctionByOffset(0);
 	vector<unique_ptr<Expression>> arguments;
 	arguments.push_back(std::move(elem_expr));
 
-	auto agg_bind_data = func.bind(context, func, arguments);
-	auto new_agg_expr =
-	    make_uniq<BoundAggregateExpression>(func, std::move(arguments), std::move(std::move(filter_expr)),
-	                                        std::move(agg_bind_data), AggregateType::NON_DISTINCT);
+	auto new_agg_expr = func.Bind(context, std::move(arguments));
 
 	// We also need to order the list items by the distance
 	BoundOrderByNode order_by_node(OrderType::ASCENDING, OrderByNullType::NULLS_LAST, std::move(order_expr));
-	new_agg_expr->order_bys = make_uniq<BoundOrderModifier>();
-	new_agg_expr->order_bys->orders.push_back(std::move(order_by_node));
+	new_agg_expr->GetOrderBysMutable() = make_uniq<BoundOrderModifier>();
+	new_agg_expr->GetOrderBysMutable()->orders.push_back(std::move(order_by_node));
+	new_agg_expr->GetFilterMutable() = std::move(filter_expr);
 
 	return std::move(new_agg_expr);
 }
@@ -77,36 +77,39 @@ public:
 		}
 
 		auto &agg_expr = agg.expressions[0];
-		if (agg_expr->type != ExpressionType::BOUND_AGGREGATE) {
+		if (agg_expr->GetExpressionType() != ExpressionType::BOUND_AGGREGATE) {
 			return false;
 		}
 		auto &agg_func_expr = agg_expr->Cast<BoundAggregateExpression>();
-		if (agg_func_expr.function.name != "min_by") {
+		if (agg_func_expr.Function().GetName() != "min_by") {
 			return false;
 		}
-		if (agg_func_expr.children.size() != 3) {
+		if (agg_func_expr.GetChildren().size() != 3) {
 			return false;
 		}
-		if (agg_func_expr.children[2]->type != ExpressionType::VALUE_CONSTANT) {
+		if (agg_func_expr.GetChildren()[2]->GetExpressionType() != ExpressionType::VALUE_CONSTANT) {
 			return false;
 		}
-		const auto &col_expr = agg_func_expr.children[0];
-		const auto &dist_expr = agg_func_expr.children[1];
-		const auto &limit_expr = agg_func_expr.children[2];
+		const auto &col_expr = agg_func_expr.GetChildren()[0];
+		auto &dist_expr = *agg_func_expr.GetChildren()[1];
+		const auto &limit_expr = agg_func_expr.GetChildren()[2];
 
 		// we need the aggregate to be on top of a projection
 		if (agg.children.size() != 1) {
 			return false;
 		}
 
-		// we also need the projection to be directly on top of a table scan that has a hnsw index
-		if (agg.children[0]->type != LogicalOperatorType::LOGICAL_GET) {
-			return false;
+		auto *get_ptr = &agg.children[0];
+		unique_ptr<HNSWConstantInFilter> constant_in_filter;
+		if ((*get_ptr)->type != LogicalOperatorType::LOGICAL_GET) {
+			constant_in_filter = HNSWTryExtractConstantInFilter(agg.children[0], get_ptr);
+			if (!constant_in_filter) {
+				return false;
+			}
 		}
 
-		auto &get_ptr = agg.children[0];
-		auto &get = get_ptr->Cast<LogicalGet>();
-		if (get.function.name != "seq_scan") {
+		auto &get = (*get_ptr)->Cast<LogicalGet>();
+		if (get.function.GetName() != "seq_scan") {
 			return false;
 		}
 
@@ -126,24 +129,29 @@ public:
 
 		unique_ptr<HNSWIndexScanBindData> bind_data = nullptr;
 		vector<reference<Expression>> bindings;
+		const auto prefilter = HNSWIndexScanFunction::PrefilterEnabled(context);
+		if (constant_in_filter && !prefilter) {
+			return false;
+		}
 
 		table_info.BindIndexes(context, HNSWIndex::TYPE_NAME);
-		for(auto &index : table_info.GetIndexes().Indexes()) {
-			if (!index.IsBound() || HNSWIndex::TYPE_NAME != index.GetIndexType()) {
+		for (auto index_entry : table_info.GetIndexes().IndexEntries()) {
+			if (index_entry->GetBindState() != IndexBindState::BOUND ||
+			    HNSWIndex::TYPE_NAME != index_entry->GetIndexType()) {
 				continue;
 			}
-			auto &cast_index = index.Cast<HNSWIndex>();
+			auto guard = index_entry->GetReadHandle<HNSWIndex>();
 
 			// Reset the bindings
 			bindings.clear();
 
 			// Check that the projection expression is a distance function that matches the index
-			if (!cast_index.TryMatchDistanceFunction(dist_expr, bindings)) {
+			if (!guard->TryMatchDistanceFunction(dist_expr, bindings)) {
 				continue;
 			}
 			// Check that the HNSW index actually indexes the expression
 			unique_ptr<Expression> index_expr;
-			if (!cast_index.TryBindIndexExpression(get, index_expr)) {
+			if (!guard->TryBindIndexExpression(get, index_expr)) {
 				continue;
 			}
 
@@ -151,29 +159,32 @@ public:
 			auto &const_expr_ref = bindings[1];
 			auto &index_expr_ref = bindings[2];
 
-			if (const_expr_ref.get().type != ExpressionType::VALUE_CONSTANT || !index_expr->Equals(index_expr_ref)) {
+			if (const_expr_ref.get().GetExpressionType() != ExpressionType::VALUE_CONSTANT ||
+			    !index_expr->Equals(index_expr_ref)) {
 				// Swap the bindings and try again
 				std::swap(const_expr_ref, index_expr_ref);
-				if (const_expr_ref.get().type != ExpressionType::VALUE_CONSTANT ||
+				if (const_expr_ref.get().GetExpressionType() != ExpressionType::VALUE_CONSTANT ||
 				    !index_expr->Equals(index_expr_ref)) {
 					// Nope, not a match, we can't optimize.
 					continue;
 				}
 			}
 
-			const auto vector_size = cast_index.GetVectorSize();
-			const auto &matched_vector = const_expr_ref.get().Cast<BoundConstantExpression>().value;
+			const auto vector_size = guard->GetVectorSize();
+			const auto &matched_vector = const_expr_ref.get().Cast<BoundConstantExpression>().GetValue();
 
 			auto query_vector = make_unsafe_uniq_array<float>(vector_size);
 			auto vector_elements = ArrayValue::GetChildren(matched_vector);
 			for (idx_t i = 0; i < vector_size; i++) {
 				query_vector[i] = vector_elements[i].GetValue<float>();
 			}
-			const auto k_limit = limit_expr->Cast<BoundConstantExpression>().value.GetValue<int32_t>();
+			const auto k_limit = limit_expr->Cast<BoundConstantExpression>().GetValue().GetValue<int32_t>();
 			if (k_limit <= 0 || k_limit >= STANDARD_VECTOR_SIZE) {
 				continue;
 			}
-			bind_data = make_uniq<HNSWIndexScanBindData>(duck_table, cast_index, k_limit, std::move(query_vector));
+			bind_data =
+			    make_uniq<HNSWIndexScanBindData>(duck_table, index_entry, guard->GetIndexName(), k_limit,
+			                                     std::move(query_vector), prefilter, std::move(constant_in_filter));
 			break;
 		}
 
@@ -183,47 +194,35 @@ public:
 		}
 
 		// Replace the aggregate with a index scan + projection
-		get.function = HNSWIndexScanFunction::GetFunction();
+		get.function = BoundTableFunction(HNSWIndexScanFunction::GetFunction());
 		const auto cardinality = get.function.cardinality(context, bind_data.get());
 		get.has_estimated_cardinality = cardinality->has_estimated_cardinality;
 		get.estimated_cardinality = cardinality->estimated_cardinality;
 		get.bind_data = std::move(bind_data);
 
 		// Replace the aggregate with a list() aggregate function ordered by the distance
-		agg.expressions[0] = CreateListOrderByExpr(context, col_expr->Copy(), dist_expr->Copy(),
-		                                           agg_func_expr.filter ? agg_func_expr.filter->Copy() : nullptr);
+		agg.expressions[0] =
+		    CreateListOrderByExpr(context, col_expr->Copy(), dist_expr.Copy(),
+		                          agg_func_expr.GetFilter() ? agg_func_expr.GetFilter()->Copy() : nullptr);
 
-		if (get.table_filters.filters.empty()) {
-			return true;
-		}
+		if (!prefilter && get.table_filters.HasFilters()) {
+			// Restore the post-filter plan when pre-filtering is explicitly disabled.
+			get.projection_ids.clear();
+			get.types.clear();
 
-		// We need to pullup the filters from the table scan as our index scan does not support regular filter pushdown.
-		get.projection_ids.clear();
-		get.types.clear();
-
-		auto new_filter = make_uniq<LogicalFilter>();
-		auto &column_ids = get.GetColumnIds();
-		for (const auto &entry : get.table_filters.filters) {
-			idx_t column_id = entry.first;
-			auto &type = get.returned_types[column_id];
-			bool found = false;
-			for (idx_t i = 0; i < column_ids.size(); i++) {
-				if (column_ids[i].GetPrimaryIndex() == column_id) {
-					column_id = i;
-					found = true;
-					break;
-				}
+			auto new_filter = make_uniq<LogicalFilter>();
+			for (const auto &entry : get.table_filters) {
+				auto filter_idx = entry.GetIndex();
+				auto &column_id = get.GetColumnIndex(filter_idx);
+				auto &type = get.returned_types[column_id.GetPrimaryIndex()];
+				auto column = make_uniq<BoundColumnRefExpression>(type, ColumnBinding(get.table_index, filter_idx));
+				new_filter->expressions.push_back(entry.Filter().ToExpression(*column));
 			}
-			if (!found) {
-				throw InternalException("Could not find column id for filter");
-			}
-			auto column = make_uniq<BoundColumnRefExpression>(type, ColumnBinding(get.table_index, column_id));
-			new_filter->expressions.push_back(entry.second->ToExpression(*column));
-		}
 
-		new_filter->children.push_back(std::move(get_ptr));
-		new_filter->ResolveOperatorTypes();
-		get_ptr = std::move(new_filter);
+			new_filter->children.push_back(std::move(*get_ptr));
+			new_filter->ResolveOperatorTypes();
+			*get_ptr = std::move(new_filter);
+		}
 
 		return true;
 	}
@@ -239,7 +238,6 @@ public:
 };
 
 void HNSWModule::RegisterTopKOptimizer(DatabaseInstance &db) {
-	// Register the TopKOptimizer
 	OptimizerExtension::Register(db.config, HNSWTopKOptimizer());
 }
 

@@ -1,8 +1,9 @@
 #include "duckdb/function/table_macro_function.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
-#include "hnsw/hnsw.hpp"
-#include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parsed_data/create_macro_info.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "hnsw/hnsw.hpp"
 
 namespace duckdb {
 
@@ -79,24 +80,25 @@ FROM
 static void RegisterTableMacro(ExtensionLoader &loader, const string &name, const string &query,
                                const vector<string> &params, const child_list_t<Value> &named_params) {
 
-	Parser parser;
+	auto parser = Parser::GetBuiltinParser();
 	parser.ParseQuery(query);
 	const auto &stmt = parser.statements.back();
 	auto &node = stmt->Cast<SelectStatement>().node;
 
 	auto func = make_uniq<TableMacroFunction>(std::move(node));
 	for (auto &param : params) {
-		func->parameters.push_back(make_uniq<ColumnRefExpression>(param));
+		func->parameters.push_back(make_uniq<ColumnRefExpression>(Identifier(param)));
 	}
 
 	for (auto &param : named_params) {
 		func->parameters.push_back(make_uniq<ColumnRefExpression>(param.first));
-		func->default_parameters[param.first] = make_uniq<ConstantExpression>(param.second);
+		func->default_parameters[Identifier(param.first)] = ConstantExpression::FromValue(Value(param.second));
 	}
 
 	CreateMacroInfo info(CatalogType::TABLE_MACRO_ENTRY);
-	info.schema = DEFAULT_SCHEMA;
-	info.name = name;
+	info.SetQualifiedName(
+	    QualifiedName(info.GetQualifiedName().Catalog(), Identifier::DefaultSchema(), info.GetQualifiedName().Name()));
+	info.SetFunctionName(Identifier(name));
 	info.temporary = true;
 	info.internal = true;
 	info.macros.push_back(std::move(func));

@@ -1,3 +1,4 @@
+#include "duckdb/common/vector/array_vector.hpp"
 #include "hnsw/hnsw_index.hpp"
 
 #include "duckdb/common/allocator.hpp"
@@ -18,6 +19,7 @@
 #include "duckdb/execution/index/fixed_size_allocator.hpp"
 #include "duckdb/execution/index/index_type.hpp"
 #include "duckdb/execution/index/index_type_set.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database.hpp"
@@ -148,9 +150,10 @@ public:
 //------------------------------------------------------------------------------
 
 // Constructor
-HNSWIndex::HNSWIndex(const string &name, IndexConstraintType index_constraint_type, const vector<column_t> &column_ids,
-                     TableIOManager &table_io_manager, const vector<unique_ptr<Expression>> &unbound_expressions,
-                     AttachedDatabase &db, const case_insensitive_map_t<Value> &options, const IndexStorageInfo &info,
+HNSWIndex::HNSWIndex(const Identifier &name, IndexConstraintType index_constraint_type,
+                     const vector<column_t> &column_ids, TableIOManager &table_io_manager,
+                     const vector<unique_ptr<Expression>> &unbound_expressions, AttachedDatabase &db,
+                     const case_insensitive_map_t<Value> &options, const IndexStorageInfo &info,
                      idx_t estimated_cardinality)
     : BoundIndex(name, TYPE_NAME, index_constraint_type, column_ids, table_io_manager, unbound_expressions, db) {
 
@@ -192,8 +195,9 @@ HNSWIndex::HNSWIndex(const string &name, IndexConstraintType index_constraint_ty
 	unum::usearch::metric_punned_t metric(vector_size, metric_kind, scalar_kind);
 	unum::usearch::index_dense_config_t config = {};
 
-	// We dont need to do key lookups (id -> vector) in the index, DuckDB stores the vectors separately
-	config.enable_key_lookups = false;
+	// Deletions address entries by row ID and require USearch's key-to-slot lookup.
+	// Read-only databases cannot delete entries, so avoid the additional lookup table there.
+	config.enable_key_lookups = !db.IsReadOnly();
 
 	auto ef_construction_opt = options.find("ef_construction");
 	if (ef_construction_opt != options.end()) {
@@ -289,7 +293,7 @@ const unordered_map<uint8_t, unum::usearch::scalar_kind_t> HNSWIndex::SCALAR_KIN
     */
 };
 
-unique_ptr<HNSWIndexStats> HNSWIndex::GetStats() {
+unique_ptr<HNSWIndexStats> HNSWIndex::GetStats() const {
 	auto lock = rwlock.GetExclusiveLock();
 	auto result = make_uniq<HNSWIndexStats>();
 
@@ -312,7 +316,8 @@ struct HNSWIndexScanState : public IndexScanState {
 	unique_array<row_t> row_ids = nullptr;
 };
 
-unique_ptr<IndexScanState> HNSWIndex::InitializeScan(float *query_vector, idx_t limit, ClientContext &context) {
+unique_ptr<IndexScanState> HNSWIndex::InitializeScan(float *query_vector, idx_t limit, ClientContext &context,
+                                                     optional_ptr<const HNSWFilterBitmap> filter) const {
 	auto state = make_uniq<HNSWIndexScanState>();
 
 	// Try to get the ef_search parameter from the database or use the default value
@@ -330,13 +335,36 @@ unique_ptr<IndexScanState> HNSWIndex::InitializeScan(float *query_vector, idx_t 
 
 	// Acquire a shared lock to search the index
 	auto lock = rwlock.GetSharedLock();
-	auto search_result = index.ef_search(query_vector, limit, ef_search);
+	auto search_result = [&]() {
+		if (!filter) {
+			return index.ef_search(query_vector, limit, ef_search);
+		}
+		auto predicate = [&](row_t key) {
+			return filter->Contains(key);
+		};
+		return index.filtered_ef_search(query_vector, limit, ef_search, predicate);
+	}();
 
 	state->current_row = 0;
-	state->total_rows = search_result.size();
 	state->row_ids = make_uniq_array<row_t>(search_result.size());
-
 	search_result.dump_to(state->row_ids.get());
+
+	// The filtered search is expected to return only keys accepted by the
+	// predicate. Check the bitmap again before exposing row IDs to DuckDB so a
+	// regression in the search library can underfill, but can never leak a row
+	// that does not satisfy the pushed-down filters.
+	if (filter) {
+		idx_t eligible_count = 0;
+		for (idx_t result_idx = 0; result_idx < search_result.size(); result_idx++) {
+			auto row_id = state->row_ids[result_idx];
+			if (filter->Contains(row_id)) {
+				state->row_ids[eligible_count++] = row_id;
+			}
+		}
+		state->total_rows = eligible_count;
+	} else {
+		state->total_rows = search_result.size();
+	}
 	return std::move(state);
 }
 
@@ -344,7 +372,7 @@ idx_t HNSWIndex::Scan(IndexScanState &state, Vector &result, idx_t result_offset
 	auto &scan_state = state.Cast<HNSWIndexScanState>();
 
 	idx_t count = 0;
-	auto row_ids = FlatVector::GetData<row_t>(result) + result_offset;
+	auto row_ids = FlatVector::GetDataMutable<row_t>(result) + result_offset;
 
 	// Push the row ids into the result vector, up to STANDARD_VECTOR_SIZE or the
 	// end of the result set
@@ -359,11 +387,13 @@ struct MultiScanState final : IndexScanState {
 	Vector vec;
 	vector<row_t> row_ids;
 	size_t ef_search;
-	MultiScanState(size_t ef_search_p) : vec(LogicalType::ROW_TYPE, nullptr), ef_search(ef_search_p) {
+	// NOTE: the vector must own a buffer: FlatVector::SetData (used in GetMultiScanResult)
+	// reads the existing buffer's validity mask, so a null-buffer vector crashes.
+	MultiScanState(size_t ef_search_p) : vec(LogicalType::ROW_TYPE), ef_search(ef_search_p) {
 	}
 };
 
-unique_ptr<IndexScanState> HNSWIndex::InitializeMultiScan(ClientContext &context) {
+unique_ptr<IndexScanState> HNSWIndex::InitializeMultiScan(ClientContext &context) const {
 	// Try to get the ef_search parameter from the database or use the default value
 	auto ef_search = index.expansion_search();
 
@@ -380,14 +410,13 @@ unique_ptr<IndexScanState> HNSWIndex::InitializeMultiScan(ClientContext &context
 	return make_uniq<MultiScanState>(ef_search);
 }
 
-idx_t HNSWIndex::ExecuteMultiScan(IndexScanState &state_p, float *query_vector, idx_t limit) {
+idx_t HNSWIndex::ExecuteMultiScan(IndexScanState &state_p, float *query_vector, idx_t limit) const {
 	auto &state = state_p.Cast<MultiScanState>();
 
-	USearchIndexType::search_result_t search_result;
-	{
+	auto search_result = [&]() {
 		auto lock = rwlock.GetSharedLock();
-		search_result = index.ef_search(query_vector, limit, state.ef_search);
-	}
+		return index.ef_search(query_vector, limit, state.ef_search);
+	}();
 
 	const auto offset = state.row_ids.size();
 	state.row_ids.resize(state.row_ids.size() + search_result.size());
@@ -396,13 +425,13 @@ idx_t HNSWIndex::ExecuteMultiScan(IndexScanState &state_p, float *query_vector, 
 	return search_result.size();
 }
 
-const Vector &HNSWIndex::GetMultiScanResult(IndexScanState &state) {
+const Vector &HNSWIndex::GetMultiScanResult(IndexScanState &state) const {
 	auto &scan_state = state.Cast<MultiScanState>();
-	FlatVector::SetData(scan_state.vec, (data_ptr_t)scan_state.row_ids.data());
+	FlatVector::SetData(scan_state.vec, (data_ptr_t)scan_state.row_ids.data(), count_t(scan_state.row_ids.size()));
 	return scan_state.vec;
 }
 
-void HNSWIndex::ResetMultiScan(IndexScanState &state) {
+void HNSWIndex::ResetMultiScan(IndexScanState &state) const {
 	auto &scan_state = state.Cast<MultiScanState>();
 	scan_state.row_ids.clear();
 }
@@ -429,7 +458,7 @@ void HNSWIndex::Construct(DataChunk &input, Vector &row_ids, idx_t thread_idx) {
 	input.Flatten();
 
 	auto &vec_vec = input.data[0];
-	auto &vec_child_vec = ArrayVector::GetEntry(vec_vec);
+	auto &vec_child_vec = ArrayVector::GetChild(vec_vec);
 	auto array_size = ArrayType::GetSize(vec_vec.GetType());
 
 	auto vec_child_data = FlatVector::GetData<float>(vec_child_vec);
@@ -494,21 +523,44 @@ void HNSWIndex::Compact() {
 }
 
 void HNSWIndex::Delete(IndexLock &lock, DataChunk &input, Vector &rowid_vec) {
-	// Mark this index as dirty so we checkpoint it properly
-	is_dirty = true;
+	DataChunk expression_result;
+	expression_result.Initialize(Allocator::DefaultAllocator(), logical_types);
+	ExecuteExpressions(input, expression_result);
+	expression_result.Flatten();
 
-	auto count = input.size();
-	rowid_vec.Flatten(count);
+	rowid_vec.Flatten();
 	auto row_id_data = FlatVector::GetData<row_t>(rowid_vec);
+	auto &indexed_vector = expression_result.data[0];
+
+	vector<row_t> row_ids_to_remove;
+	row_ids_to_remove.reserve(input.size());
+	for (idx_t i = 0; i < input.size(); i++) {
+		// NULL values are not inserted into the HNSW index.
+		if (!FlatVector::IsNull(indexed_vector, i)) {
+			row_ids_to_remove.push_back(row_id_data[i]);
+		}
+	}
+	if (row_ids_to_remove.empty()) {
+		return;
+	}
 
 	// For deleting from the index, we need an exclusive lock
 	auto _lock = rwlock.GetExclusiveLock();
-
-	for (idx_t i = 0; i < input.size(); i++) {
-		auto result = index.remove(row_id_data[i]);
+	auto result = index.remove(row_ids_to_remove.begin(), row_ids_to_remove.end());
+	if (!result) {
+		throw InternalException("Failed to delete from the HNSW index: %s", result.error.what());
 	}
 
-	index_size = index.size();
+	if (result.completed > 0) {
+		// Keep the cached state synchronized even if a partial deletion is detected below.
+		is_dirty = true;
+		index_size = index.size();
+	}
+
+	if (result.completed != row_ids_to_remove.size()) {
+		throw InternalException("Failed to delete all rows from the HNSW index. Only deleted %d out of %d indexed rows",
+		                        result.completed, row_ids_to_remove.size());
+	}
 }
 
 ErrorData HNSWIndex::Insert(IndexLock &lock, DataChunk &input, Vector &rowid_vec) {
@@ -584,7 +636,7 @@ IndexStorageInfo HNSWIndex::SerializeToWAL(const case_insensitive_map_t<Value> &
 	return info;
 }
 
-idx_t HNSWIndex::GetInMemorySize(IndexLock &state) {
+idx_t HNSWIndex::GetInMemorySize(IndexLock &state) const {
 	// TODO: This is not correct: its a lower bound, but it's a start
 	return index.memory_usage();
 }
@@ -596,15 +648,13 @@ bool HNSWIndex::MergeIndexes(IndexLock &state, BoundIndex &other_index) {
 void HNSWIndex::Vacuum(IndexLock &state) {
 }
 
-void HNSWIndex::Verify(IndexLock &l) {
+void HNSWIndex::Verify(IndexLock &state) {
 	throw NotImplementedException("HNSWIndex::Verify() not implemented");
 }
 
-string HNSWIndex::ToString(IndexLock &l, bool display_ascii) {
+string HNSWIndex::ToString(IndexLock &state, bool display_ascii) {
 	throw NotImplementedException("HNSWIndex::ToString() not implemented");
 }
-
-//! Ensures that the
 
 void HNSWIndex::VerifyAllocations(IndexLock &state) {
 	throw NotImplementedException("HNSWIndex::VerifyAllocations() not implemented");
@@ -613,20 +663,21 @@ void HNSWIndex::VerifyAllocations(IndexLock &state) {
 //------------------------------------------------------------------------------
 // Can rewrite index expression?
 //------------------------------------------------------------------------------
-static void TryBindIndexExpressionInternal(Expression &expr, idx_t table_idx, const vector<column_t> &index_columns,
+static void TryBindIndexExpressionInternal(Expression &expr, TableIndex table_idx,
+                                           const vector<column_t> &index_columns,
                                            const vector<ColumnIndex> &table_columns, bool &success, bool &found) {
 
-	if (expr.type == ExpressionType::BOUND_COLUMN_REF) {
+	if (expr.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
 		found = true;
 		auto &ref = expr.Cast<BoundColumnRefExpression>();
 
 		// Rewrite the column reference to fit in the current set of bound column ids
-		ref.binding.table_index = table_idx;
+		ref.BindingMutable().table_index = table_idx;
 
-		const auto referenced_column = index_columns[ref.binding.column_index];
+		const auto referenced_column = index_columns[ref.Binding().column_index];
 		for (idx_t i = 0; i < table_columns.size(); i++) {
 			if (table_columns[i].GetPrimaryIndex() == referenced_column) {
-				ref.binding.column_index = i;
+				ref.BindingMutable().column_index = ProjectionIndex(i);
 				return;
 			}
 		}
@@ -657,13 +708,12 @@ bool HNSWIndex::TryBindIndexExpression(LogicalGet &get, unique_ptr<Expression> &
 	return false;
 }
 
-bool HNSWIndex::TryMatchDistanceFunction(const unique_ptr<Expression> &expr,
-                                         vector<reference<Expression>> &bindings) const {
-	return function_matcher->Match(*expr, bindings);
+bool HNSWIndex::TryMatchDistanceFunction(Expression &expr, vector<reference<Expression>> &bindings) const {
+	return function_matcher->Match(expr, bindings);
 }
 
 unique_ptr<ExpressionMatcher> HNSWIndex::MakeFunctionMatcher() const {
-	unordered_set<string> distance_functions;
+	identifier_set_t distance_functions;
 	switch (index.metric().metric_kind()) {
 	case unum::usearch::metric_kind_t::l2sq_k:
 		distance_functions = {"array_distance", "<->"};
@@ -699,7 +749,6 @@ void HNSWIndex::VerifyBuffers(IndexLock &lock) {
 	linked_block_allocator->VerifyBuffers();
 }
 
-
 //------------------------------------------------------------------------------
 // Register Index Type
 //------------------------------------------------------------------------------
@@ -724,6 +773,9 @@ void HNSWModule::RegisterIndex(DatabaseInstance &db) {
 	db.config.AddExtensionOption("hnsw_ef_search",
 	                             "experimental: override the ef_search parameter when scanning HNSW indexes",
 	                             LogicalType::BIGINT);
+	db.config.AddExtensionOption("hnsw_prefilter",
+	                             "experimental: apply static table filters before searching HNSW indexes",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
 
 	// Register the index type
 	db.config.GetIndexTypes().RegisterIndexType(index_type);

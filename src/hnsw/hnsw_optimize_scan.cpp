@@ -1,22 +1,114 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
+#include "duckdb/common/types/column/column_data_scan_states.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
+#include "duckdb/planner/column_binding_map.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/operator/logical_column_data_get.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
-#include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/index.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
 #include "duckdb/storage/table/data_table_info.hpp"
 #include "duckdb/storage/table/table_index_list.hpp"
-
 #include "hnsw/hnsw.hpp"
 #include "hnsw/hnsw_index.hpp"
 #include "hnsw/hnsw_index_scan.hpp"
+#include "hnsw/hnsw_optimize_filter.hpp"
 
 namespace duckdb {
+
+static bool IsMarkerFilter(const LogicalFilter &filter, TableIndex mark_index) {
+	if (filter.expressions.size() != 1 ||
+	    filter.expressions[0]->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+		return false;
+	}
+	auto &marker = filter.expressions[0]->Cast<BoundColumnRefExpression>();
+	return marker.Binding() == ColumnBinding(mark_index, ProjectionIndex(0));
+}
+
+unique_ptr<HNSWConstantInFilter> HNSWTryExtractConstantInFilter(unique_ptr<LogicalOperator> &root,
+                                                                unique_ptr<LogicalOperator> *&get_ptr) {
+	if (root->type != LogicalOperatorType::LOGICAL_FILTER) {
+		return nullptr;
+	}
+	auto &filter = root->Cast<LogicalFilter>();
+	if (filter.children.size() != 1 || filter.children[0]->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		return nullptr;
+	}
+
+	auto &join = filter.children[0]->Cast<LogicalComparisonJoin>();
+	if (join.join_type != JoinType::MARK || !IsMarkerFilter(filter, join.mark_index)) {
+		return nullptr;
+	}
+	if (join.children.size() != 2 || join.conditions.size() != 1) {
+		return nullptr;
+	}
+
+	auto &condition = join.conditions[0];
+	if (!condition.IsComparison() || condition.GetComparisonType() != ExpressionType::COMPARE_EQUAL) {
+		return nullptr;
+	}
+	if (join.children[0]->type != LogicalOperatorType::LOGICAL_GET ||
+	    join.children[1]->type != LogicalOperatorType::LOGICAL_CHUNK_GET) {
+		return nullptr;
+	}
+
+	auto &get = join.children[0]->Cast<LogicalGet>();
+	auto &chunk_get = join.children[1]->Cast<LogicalColumnDataGet>();
+	if (condition.GetLHS().GetExpressionType() != ExpressionType::BOUND_COLUMN_REF ||
+	    condition.GetRHS().GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+		return nullptr;
+	}
+	if (!chunk_get.collection || chunk_get.collection->ColumnCount() != 1) {
+		return nullptr;
+	}
+	if (chunk_get.GetColumnIds().size() != 1 || chunk_get.GetColumnIds()[0] != 0) {
+		return nullptr;
+	}
+
+	auto &probe = condition.GetLHS().Cast<BoundColumnRefExpression>();
+	auto &constant = condition.GetRHS().Cast<BoundColumnRefExpression>();
+	if (probe.Binding().table_index != get.table_index) {
+		return nullptr;
+	}
+	if (constant.Binding().table_index != chunk_get.table_index ||
+	    constant.Binding().column_index != ProjectionIndex(0)) {
+		return nullptr;
+	}
+	if (probe.GetReturnType() != constant.GetReturnType() ||
+	    chunk_get.collection->Types()[0] != constant.GetReturnType()) {
+		return nullptr;
+	}
+
+	auto column_index = get.GetColumnIndex(probe.Binding());
+	if (!column_index.HasPrimaryIndex() || column_index.HasChildren() || column_index.IsVirtualColumn()) {
+		return nullptr;
+	}
+
+	value_set_t values;
+	ColumnDataScanState scan_state;
+	DataChunk chunk;
+	chunk_get.collection->InitializeScan(scan_state);
+	chunk_get.collection->InitializeScanChunk(scan_state, chunk);
+	while (chunk_get.collection->Scan(scan_state, chunk)) {
+		for (idx_t row_idx = 0; row_idx < chunk.size(); row_idx++) {
+			auto value = chunk.GetValue(0, row_idx);
+			if (!value.IsNull()) {
+				values.insert(std::move(value));
+			}
+		}
+	}
+
+	get_ptr = &join.children[0];
+	return make_uniq<HNSWConstantInFilter>(std::move(column_index), std::move(values));
+}
 
 //-----------------------------------------------------------------------------
 // Plan rewriter
@@ -49,7 +141,7 @@ public:
 			return false;
 		}
 
-		if (order.expression->type != ExpressionType::BOUND_COLUMN_REF) {
+		if (order.expression->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 			// The expression has to reference the child operator (a projection with the distance function)
 			return false;
 		}
@@ -64,18 +156,26 @@ public:
 		auto &projection = top_n.children.front()->Cast<LogicalProjection>();
 
 		// This the expression that is referenced by the order by expression
-		const auto projection_index = bound_column_ref.binding.column_index;
-		const auto &projection_expr = projection.expressions[projection_index];
+		auto &projection_expr = *projection.expressions[bound_column_ref.Binding().column_index];
 
-		// The projection must sit on top of a get
-		if (projection.children.size() != 1 || projection.children.front()->type != LogicalOperatorType::LOGICAL_GET) {
+		if (projection.children.size() != 1) {
 			return false;
 		}
 
-		auto &get_ptr = projection.children.front();
-		auto &get = get_ptr->Cast<LogicalGet>();
+		auto *get_ptr = &projection.children.front();
+		unique_ptr<HNSWConstantInFilter> constant_in_filter;
+		bool keep_top_n = false;
+		if ((*get_ptr)->type != LogicalOperatorType::LOGICAL_GET) {
+			constant_in_filter = HNSWTryExtractConstantInFilter(projection.children.front(), get_ptr);
+			if (!constant_in_filter) {
+				return false;
+			}
+			keep_top_n = true;
+		}
+
+		auto &get = (*get_ptr)->Cast<LogicalGet>();
 		// Check if the get is a table scan
-		if (get.function.name != "seq_scan") {
+		if (get.function.GetName() != "seq_scan") {
 			return false;
 		}
 
@@ -100,24 +200,29 @@ public:
 		// Find the index
 		unique_ptr<HNSWIndexScanBindData> bind_data = nullptr;
 		vector<reference<Expression>> bindings;
+		const auto prefilter = HNSWIndexScanFunction::PrefilterEnabled(context);
+		if (constant_in_filter && !prefilter) {
+			return false;
+		}
 
 		table_info.BindIndexes(context, HNSWIndex::TYPE_NAME);
-		for(auto &index : table_info.GetIndexes().Indexes()) {
-			if (!index.IsBound() || HNSWIndex::TYPE_NAME != index.GetIndexType()) {
+		for (auto index_entry : table_info.GetIndexes().IndexEntries()) {
+			if (index_entry->GetBindState() != IndexBindState::BOUND ||
+			    HNSWIndex::TYPE_NAME != index_entry->GetIndexType()) {
 				continue;
 			}
-			auto &cast_index = index.Cast<HNSWIndex>();
+			auto guard = index_entry->GetReadHandle<HNSWIndex>();
 
 			// Reset the bindings
 			bindings.clear();
 
 			// Check that the projection expression is a distance function that matches the index
-			if (!cast_index.TryMatchDistanceFunction(projection_expr, bindings)) {
+			if (!guard->TryMatchDistanceFunction(projection_expr, bindings)) {
 				continue;
 			}
 			// Check that the HNSW index actually indexes the expression
 			unique_ptr<Expression> index_expr;
-			if (!cast_index.TryBindIndexExpression(get, index_expr)) {
+			if (!guard->TryBindIndexExpression(get, index_expr)) {
 				continue;
 			}
 
@@ -125,25 +230,28 @@ public:
 			auto &const_expr_ref = bindings[1];
 			auto &index_expr_ref = bindings[2];
 
-			if (const_expr_ref.get().type != ExpressionType::VALUE_CONSTANT || !index_expr->Equals(index_expr_ref)) {
+			if (const_expr_ref.get().GetExpressionType() != ExpressionType::VALUE_CONSTANT ||
+			    !index_expr->Equals(index_expr_ref)) {
 				// Swap the bindings and try again
 				std::swap(const_expr_ref, index_expr_ref);
-				if (const_expr_ref.get().type != ExpressionType::VALUE_CONSTANT ||
+				if (const_expr_ref.get().GetExpressionType() != ExpressionType::VALUE_CONSTANT ||
 				    !index_expr->Equals(index_expr_ref)) {
 					// Nope, not a match, we can't optimize.
 					continue;
 				}
 			}
 
-			const auto vector_size = cast_index.GetVectorSize();
-			const auto &matched_vector = const_expr_ref.get().Cast<BoundConstantExpression>().value;
+			const auto vector_size = guard->GetVectorSize();
+			const auto &matched_vector = const_expr_ref.get().Cast<BoundConstantExpression>().GetValue();
 			auto query_vector = make_unsafe_uniq_array<float>(vector_size);
 			auto vector_elements = ArrayValue::GetChildren(matched_vector);
 			for (idx_t i = 0; i < vector_size; i++) {
 				query_vector[i] = vector_elements[i].GetValue<float>();
 			}
 
-			bind_data = make_uniq<HNSWIndexScanBindData>(duck_table, cast_index, top_n.limit, std::move(query_vector));
+			bind_data =
+			    make_uniq<HNSWIndexScanBindData>(duck_table, index_entry, guard->GetIndexName(), top_n.limit,
+			                                     std::move(query_vector), prefilter, std::move(constant_in_filter));
 			break;
 		}
 
@@ -152,49 +260,35 @@ public:
 			return false;
 		}
 
-		// If there are no table filters pushed down into the get, we can just replace the get with the index scan
 		const auto cardinality = get.function.cardinality(context, bind_data.get());
-		get.function = HNSWIndexScanFunction::GetFunction();
+		get.function = BoundTableFunction(HNSWIndexScanFunction::GetFunction());
 		get.has_estimated_cardinality = cardinality->has_estimated_cardinality;
 		get.estimated_cardinality = cardinality->estimated_cardinality;
 		get.bind_data = std::move(bind_data);
-		if (get.table_filters.filters.empty()) {
+		if (!prefilter && get.table_filters.HasFilters()) {
+			// Restore the post-filter plan when pre-filtering is explicitly disabled.
+			get.projection_ids.clear();
+			get.types.clear();
 
-			// Remove the TopN operator
+			auto new_filter = make_uniq<LogicalFilter>();
+			for (const auto &entry : get.table_filters) {
+				auto filter_idx = entry.GetIndex();
+				auto &column_id = get.GetColumnIndex(filter_idx);
+				auto &type = get.returned_types[column_id.GetPrimaryIndex()];
+				auto &filter = entry.Filter();
+				auto column = make_uniq<BoundColumnRefExpression>(type, ColumnBinding(get.table_index, filter_idx));
+				new_filter->expressions.push_back(filter.ToExpression(*column));
+			}
+			new_filter->children.push_back(std::move(*get_ptr));
+			new_filter->ResolveOperatorTypes();
+			*get_ptr = std::move(new_filter);
+		}
+
+		// A retained MARK join rechecks the extracted IN predicate, and the TopN
+		// preserves ordering after that join. Both operate on at most `limit` rows.
+		if (!keep_top_n) {
 			plan = std::move(top_n.children[0]);
-			return true;
 		}
-
-		// Otherwise, things get more complicated. We need to pullup the filters from the table scan as our index scan
-		// does not support regular filter pushdown.
-		get.projection_ids.clear();
-		get.types.clear();
-
-		auto new_filter = make_uniq<LogicalFilter>();
-		auto &column_ids = get.GetColumnIds();
-		for (const auto &entry : get.table_filters.filters) {
-			idx_t column_id = entry.first;
-			auto &type = get.returned_types[column_id];
-			bool found = false;
-			for (idx_t i = 0; i < column_ids.size(); i++) {
-				if (column_ids[i].GetPrimaryIndex() == column_id) {
-					column_id = i;
-					found = true;
-					break;
-				}
-			}
-			if (!found) {
-				throw InternalException("Could not find column id for filter");
-			}
-			auto column = make_uniq<BoundColumnRefExpression>(type, ColumnBinding(get.table_index, column_id));
-			new_filter->expressions.push_back(entry.second->ToExpression(*column));
-		}
-		new_filter->children.push_back(std::move(get_ptr));
-		new_filter->ResolveOperatorTypes();
-		get_ptr = std::move(new_filter);
-
-		// Remove the TopN operator
-		plan = std::move(top_n.children[0]);
 		return true;
 	}
 
@@ -214,16 +308,16 @@ public:
 				auto &child = plan->children[0];
 
 				if (child->children[0]->type == LogicalOperatorType::LOGICAL_GET &&
-				    child->children[0]->Cast<LogicalGet>().function.name == "hnsw_index_scan") {
+				    child->children[0]->Cast<LogicalGet>().function.GetName() == "hnsw_index_scan") {
 					auto &parent_projection = plan->Cast<LogicalProjection>();
 					auto &child_projection = child->Cast<LogicalProjection>();
 
 					column_binding_set_t referenced_bindings;
 					for (auto &expr : parent_projection.expressions) {
 						ExpressionIterator::EnumerateExpression(expr, [&](Expression &expr_ref) {
-							if (expr_ref.type == ExpressionType::BOUND_COLUMN_REF) {
+							if (expr_ref.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
 								auto &bound_column_ref = expr_ref.Cast<BoundColumnRefExpression>();
-								referenced_bindings.insert(bound_column_ref.binding);
+								referenced_bindings.insert(bound_column_ref.Binding());
 							}
 						});
 					}
@@ -260,7 +354,6 @@ public:
 // Register
 //-----------------------------------------------------------------------------
 void HNSWModule::RegisterScanOptimizer(DatabaseInstance &db) {
-	// Register the optimizer extension
 	OptimizerExtension::Register(db.config, HNSWIndexScanOptimizer());
 }
 

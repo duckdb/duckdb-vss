@@ -1,9 +1,11 @@
+#include "duckdb/common/vector/array_vector.hpp"
 #include "hnsw/hnsw_index_physical_create.hpp"
 
 #include "duckdb/catalog/catalog_entry/duck_index_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/exception/transaction_exception.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/storage/data_table.hpp"
@@ -61,7 +63,7 @@ public:
 unique_ptr<GlobalSinkState> PhysicalCreateHNSWIndex::GetGlobalSinkState(ClientContext &context) const {
 	auto gstate = make_uniq<CreateHNSWIndexGlobalState>(*this);
 
-	vector<LogicalType> data_types = {unbound_expressions[0]->return_type, LogicalType::ROW_TYPE};
+	vector<LogicalType> data_types = {unbound_expressions[0]->GetReturnType(), LogicalType::ROW_TYPE};
 	gstate->collection = make_uniq<ColumnDataCollection>(BufferManager::GetBufferManager(context), data_types);
 	gstate->context = context.shared_from_this();
 
@@ -71,7 +73,7 @@ unique_ptr<GlobalSinkState> PhysicalCreateHNSWIndex::GetGlobalSinkState(ClientCo
 	auto &constraint_type = info->constraint_type;
 	auto &db = storage.db;
 	gstate->global_index =
-	    make_uniq<HNSWIndex>(info->index_name, constraint_type, storage_ids, table_manager, unbound_expressions, db,
+	    make_uniq<HNSWIndex>(info->GetIndexName(), constraint_type, storage_ids, table_manager, unbound_expressions, db,
 	                         info->options, IndexStorageInfo(), estimated_cardinality);
 
 	return std::move(gstate);
@@ -89,7 +91,7 @@ public:
 unique_ptr<LocalSinkState> PhysicalCreateHNSWIndex::GetLocalSinkState(ExecutionContext &context) const {
 	auto state = make_uniq<CreateHNSWIndexLocalState>();
 
-	vector<LogicalType> data_types = {unbound_expressions[0]->return_type, LogicalType::ROW_TYPE};
+	vector<LogicalType> data_types = {unbound_expressions[0]->GetReturnType(), LogicalType::ROW_TYPE};
 	state->collection = make_uniq<ColumnDataCollection>(BufferManager::GetBufferManager(context.client), data_types);
 	state->collection->InitializeAppend(state->append_state);
 	return std::move(state);
@@ -157,16 +159,16 @@ public:
 
 			const auto count = scan_chunk.size();
 			auto &vec_vec = scan_chunk.data[0];
-			auto &data_vec = ArrayVector::GetEntry(vec_vec);
+			auto &data_vec = ArrayVector::GetChild(vec_vec);
 			auto &rowid_vec = scan_chunk.data[1];
 
 			UnifiedVectorFormat vec_format;
 			UnifiedVectorFormat data_format;
 			UnifiedVectorFormat rowid_format;
 
-			vec_vec.ToUnifiedFormat(count, vec_format);
-			data_vec.ToUnifiedFormat(count * array_size, data_format);
-			rowid_vec.ToUnifiedFormat(count, rowid_format);
+			vec_vec.ToUnifiedFormat(vec_format);
+			data_vec.ToUnifiedFormat(data_format);
+			rowid_vec.ToUnifiedFormat(rowid_format);
 
 			const auto row_ptr = UnifiedVectorFormat::GetData<row_t>(rowid_format);
 			const auto data_ptr = UnifiedVectorFormat::GetData<float>(data_format);
@@ -268,9 +270,10 @@ public:
 		auto &schema = table.schema;
 		info.column_ids = storage_ids;
 
-		if (schema.GetEntry(schema.GetCatalogTransaction(*gstate.context), CatalogType::INDEX_ENTRY, info.index_name)) {
+		if (schema.GetEntry(schema.GetCatalogTransaction(*gstate.context), CatalogType::INDEX_ENTRY,
+		                    info.GetIndexName())) {
 			if (info.on_conflict != OnCreateConflict::IGNORE_ON_CONFLICT) {
-				throw CatalogException("Index with name \"%s\" already exists", info.index_name);
+				throw CatalogException("Index with name \"%s\" already exists", info.GetIndexName());
 			}
 		}
 
@@ -280,7 +283,7 @@ public:
 		duck_index.initial_index_size = gstate.global_index->Cast<BoundIndex>().GetInMemorySize();
 
 		// Finally add it to storage
-		storage.AddIndex(std::move(gstate.global_index));
+		storage.AddIndex(std::move(gstate.global_index), duck_index.oid);
 	}
 };
 
