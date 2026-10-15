@@ -15,6 +15,7 @@
 #include "duckdb/common/types/validity_mask.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector/vector_iterator.hpp"
 #include "duckdb/common/vector_size.hpp"
 #include "duckdb/execution/index/fixed_size_allocator.hpp"
 #include "duckdb/execution/index/index_type.hpp"
@@ -462,7 +463,7 @@ void HNSWIndex::Construct(DataChunk &input, Vector &row_ids, idx_t thread_idx) {
 	auto array_size = ArrayType::GetSize(vec_vec.GetType());
 
 	auto vec_child_data = FlatVector::GetData<float>(vec_child_vec);
-	auto rowid_data = FlatVector::GetData<row_t>(row_ids);
+	auto rowid_values = row_ids.Values<row_t>();
 
 	auto to_add_count = FlatVector::Validity(vec_vec).CountValid(count);
 
@@ -498,7 +499,7 @@ void HNSWIndex::Construct(DataChunk &input, Vector &row_ids, idx_t thread_idx) {
 				continue;
 			}
 
-			auto rowid = rowid_data[out_idx];
+			auto rowid = rowid_values[out_idx].GetValue();
 			auto result = index.add(rowid, vec_child_data + (out_idx * array_size), thread_idx);
 			if (!result) {
 				throw InternalException("Failed to add to the HNSW index: %s", result.error.what());
