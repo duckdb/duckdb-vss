@@ -1,82 +1,128 @@
 # name: test/sql/hnsw/hnsw_insert_wal.test
+# description: Recover HNSW inserts and interleaved deletes from the WAL
 # group: [hnsw]
 
 require vss
 
-# TODO: This doesnt actually test the WAL because of issues upstream. Fix this once WAL playback is fixed for extension indexes
 require noforcestorage
 
-# Step 0: Open a database
-load {TEST_DIR}/hnsw_checkpoint_create.db
+load {TEST_DIR}/hnsw_insert_wal.db
 
 statement ok
 SET hnsw_enable_experimental_persistence = true;
 
-# this test does not work with vsize = 2 because a low vector size changes the WAL threshold
-require vector_size 2048
-
-# TODO: this currently throws a serialization exception
-# statement ok
-# PRAGMA enable_verification;
-
-# TODO: Enable this once the WAL playback is fixed for extension indexes
-#statement ok
-#PRAGMA disable_checkpoint_on_shutdown;
+statement ok
+PRAGMA disable_checkpoint_on_shutdown;
 
 statement ok
-CREATE TABLE t1 (vec FLOAT[3]);
+SET checkpoint_threshold = '1TB';
 
-# Step 1: Create a new indexl
 statement ok
-CREATE INDEX my_idx ON t1 USING HNSW (vec);
+CREATE TABLE items (id INTEGER, vec FLOAT[3]);
 
-query I
-SELECT count FROM pragma_hnsw_index_info();
-----
-0
+statement ok
+INSERT INTO items SELECT i, [i + 10, 0, 0] FROM range(64) t(i);
+
+statement ok
+CREATE INDEX items_idx ON items USING HNSW (vec);
 
 statement ok
 CHECKPOINT;
 
-# Step 3: Restart the database
+# Leave inserts in the WAL, including a NULL that is not stored in HNSW.
+statement ok
+INSERT INTO items VALUES (100, [0, 0, 0]), (101, NULL), (102, [1000, 0, 0]);
+
 restart
 
-# Step 4: Insert data after restart
 statement ok
-INSERT INTO t1 VALUES (array_value(1.0, 2.0, 3.0));
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
 
-statement ok
-INSERT INTO t1 VALUES (array_value(4.0, 5.0, 6.0));
+query I
+SELECT count(*) FROM items;
+----
+67
+
+query II
+EXPLAIN SELECT id FROM items ORDER BY array_distance(vec, [0, 0, 0]::FLOAT[3]) LIMIT 1;
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_SCAN.*
+
+query I
+SELECT id FROM items ORDER BY array_distance(vec, [0, 0, 0]::FLOAT[3]) LIMIT 1;
+----
+100
 
 query I
 SELECT count FROM pragma_hnsw_index_info();
 ----
-2
+66
 
-# Step 6: Restart the database
+statement ok
+CHECKPOINT;
+
+# Replay inserts and deletes against the checkpointed index.
+statement ok
+INSERT INTO items VALUES (103, [1, 0, 0]), (104, [2000, 0, 0]);
+
+statement ok
+DELETE FROM items WHERE id IN (100, 101, 104);
+
+statement ok
+INSERT INTO items VALUES (105, [3000, 0, 0]);
+
+query I
+SELECT id FROM items ORDER BY array_distance(vec, [0, 0, 0]::FLOAT[3]) LIMIT 1;
+----
+103
+
 restart
 
-# Step 7: Check that the data is still there
-query I
-SELECT count FROM pragma_hnsw_index_info();
-----
-2
-
-# Step 8: Insert more data
 statement ok
-INSERT INTO t1 VALUES (array_value(7.0, 8.0, 9.0));
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
 
-# Step 9: Check that the data is still there
+query I
+SELECT count(*) FROM items;
+----
+67
+
+query II
+EXPLAIN SELECT id FROM items ORDER BY array_distance(vec, [0, 0, 0]::FLOAT[3]) LIMIT 1;
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_SCAN.*
+
+query I
+SELECT id FROM items ORDER BY array_distance(vec, [0, 0, 0]::FLOAT[3]) LIMIT 1;
+----
+103
+
+query I
+SELECT id FROM items ORDER BY array_distance(vec, [3000, 0, 0]::FLOAT[3]) LIMIT 1;
+----
+105
+
 query I
 SELECT count FROM pragma_hnsw_index_info();
 ----
-3
+67
 
-# Step 10: Restart the database
+# Recovered changes also survive a checkpoint and another restart.
+statement ok
+CHECKPOINT;
+
 restart
 
-# Step 11: Check that the data is still there
+query I
+SELECT id FROM items ORDER BY array_distance(vec, [0, 0, 0]::FLOAT[3]) LIMIT 1;
+----
+103
+
+query I
+SELECT id FROM items ORDER BY array_distance(vec, [3000, 0, 0]::FLOAT[3]) LIMIT 1;
+----
+105
+
 query I
 SELECT count FROM pragma_hnsw_index_info();
 ----
-3
+67
