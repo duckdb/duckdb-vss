@@ -1,0 +1,47 @@
+# name: test/sql/hnsw/hnsw_index_info.test
+# description: Test that pragma_hnsw_index_info reports stats for every level of the index
+# group: [hnsw]
+
+require vss
+
+statement ok
+CREATE TABLE t1 (vec FLOAT[3]);
+
+statement ok
+CREATE INDEX empty_idx ON t1 USING HNSW (vec);
+
+# An empty index has no levels
+query III
+SELECT count, levels, len(levels_stats) FROM pragma_hnsw_index_info() WHERE index_name = 'empty_idx';
+----
+0	0	0
+
+statement ok
+DROP INDEX empty_idx;
+
+statement ok
+INSERT INTO t1 VALUES ([1, 2, 3]);
+
+statement ok
+CREATE INDEX single_idx ON t1 USING HNSW (vec);
+
+# Levels are zero-based, so there is one entry per level from 0 to `levels`,
+# and the base level contains every node
+query II
+SELECT len(levels_stats) = levels + 1, levels_stats[1].nodes FROM pragma_hnsw_index_info() WHERE index_name = 'single_idx';
+----
+true	1
+
+statement ok
+DROP INDEX single_idx;
+
+statement ok
+INSERT INTO t1 SELECT array_value(a, b, c) FROM range(1, 10) ra(a), range(1, 10) rb(b), range(1, 10) rc(c);
+
+statement ok
+CREATE INDEX my_idx ON t1 USING HNSW (vec);
+
+query III
+SELECT count, len(levels_stats) = levels + 1, levels_stats[1].nodes FROM pragma_hnsw_index_info() WHERE index_name = 'my_idx';
+----
+730	true	730
