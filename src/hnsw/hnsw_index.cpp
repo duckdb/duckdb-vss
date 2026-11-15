@@ -302,8 +302,11 @@ unique_ptr<HNSWIndexStats> HNSWIndex::GetStats() const {
 	result->capacity = index.capacity();
 	result->approx_size = index.memory_usage();
 
-	for (idx_t i = 0; i < index.max_level(); i++) {
-		result->level_stats.push_back(index.stats(i));
+	// Levels are zero-based: a non-empty index has levels 0 through max_level (inclusive)
+	if (index.size() > 0) {
+		for (idx_t i = 0; i <= index.max_level(); i++) {
+			result->level_stats.push_back(index.stats(i));
+		}
 	}
 
 	return result;
