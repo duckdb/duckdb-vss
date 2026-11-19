@@ -9,7 +9,10 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 project(${TARGET_NAME})
 include_directories(src/include)
 
-set(EXTENSION_SOURCES src/vss_extension.cpp)
+set(EXTENSION_SOURCES
+    src/vss_extension.cpp
+    src/aggregate/array_avg.cpp
+)
 add_subdirectory(src/hnsw)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
