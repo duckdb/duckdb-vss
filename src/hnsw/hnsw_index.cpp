@@ -195,9 +195,8 @@ HNSWIndex::HNSWIndex(const Identifier &name, IndexConstraintType index_constrain
 	unum::usearch::metric_punned_t metric(vector_size, metric_kind, scalar_kind);
 	unum::usearch::index_dense_config_t config = {};
 
-	// Deletions address entries by row ID and require USearch's key-to-slot lookup.
-	// Read-only databases cannot delete entries, so avoid the additional lookup table there.
-	config.enable_key_lookups = !db.IsReadOnly();
+	// WAL recovery needs key lookups to replay deletes, even in read-only databases.
+	config.enable_key_lookups = true;
 
 	auto ef_construction_opt = options.find("ef_construction");
 	if (ef_construction_opt != options.end()) {
